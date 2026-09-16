@@ -31,8 +31,12 @@ class BlfSliceModelTests(unittest.TestCase):
         self.assertEqual((models.MIN_SLICE_SECONDS, models.MAX_SLICE_SECONDS), (0, 300))
         self.assertEqual(models.BLF_VOLUME_GAP_THRESHOLD_SECONDS, 5)
         self.assertEqual(models.DEFAULT_UTC_OFFSET, timedelta(hours=8))
+        self.assertEqual(models.MIN_UTC_OFFSET, timedelta(hours=-12))
+        self.assertEqual(models.MAX_UTC_OFFSET, timedelta(hours=14))
+        self.assertEqual(models.UTC_OFFSET_STEP, timedelta(minutes=15))
         self.assertEqual((models.HEADER_MIN_YEAR, models.HEADER_MAX_YEAR), (2000, 2100))
         self.assertEqual(models.MAX_OUTPUT_BLF_FILENAME_LENGTH, 180)
+        self.assertEqual(models.WINDOWS_MAX_PATH_CHARACTERS, 259)
 
     def test_status_enums_are_complete(self):
         self.assertEqual({item.value for item in models.InputMode}, {"file", "folder"})
