@@ -2,8 +2,13 @@
 
 from pathlib import Path
 
-from PyQt6.QtWidgets import QFileDialog, QLabel, QMessageBox
+from PyQt6.QtWidgets import QFileDialog, QLabel, QMessageBox, QPushButton
 
+from .blf_slice_dialog import BlfSliceDialog
+from .blf_slice_progress import (
+    BlfSliceProgressDialog, BlfSliceWorker, request_duplicate_selection,
+    show_task_result,
+)
 from .collapsible import CollapsiblePanelsMixin
 from .legacy import baseline
 from .math_channel import SearchableMathChannelDialog  # installs baseline override
@@ -18,8 +23,91 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         super().__init__()
         self.setWindowTitle("VET_DATA merged modular")
         self._data_load_worker = None; self._data_load_dialog = None
-        self._close_after_load = False
+        self._blf_slice_dialog = None; self._blf_slice_worker = None; self._blf_slice_progress = None
+        self._close_after_load = False; self._close_after_blf_slice = False
         self._setup_signal_panel(); self._setup_plot_panel(); self._setup_collapsible_panels()
+        self._setup_blf_slice_entry()
+
+    def _setup_blf_slice_entry(self):
+        self.blf_slice_button = QPushButton("BLF 工况切片")
+        self.blf_slice_button.setToolTip("独立选择 BLF 和工况表并执行自动切片")
+        self.blf_slice_button.clicked.connect(self.open_blf_slice_dialog)
+        layout = self._find_layout_containing(self.layout(), self.save_data_button)
+        if layout is None:
+            raise RuntimeError("无法定位主窗口底部操作区")
+        layout.addWidget(self.blf_slice_button)
+
+    @classmethod
+    def _find_layout_containing(cls, layout, widget):
+        if layout is None:
+            return None
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            if item.widget() is widget:
+                return layout
+            nested = item.layout()
+            found = cls._find_layout_containing(nested, widget) if nested else None
+            if found is not None:
+                return found
+            child = item.widget()
+            found = cls._find_layout_containing(child.layout(), widget) if child else None
+            if found is not None:
+                return found
+        return None
+
+    def open_blf_slice_dialog(self):
+        if self._blf_slice_worker is not None and self._blf_slice_worker.isRunning():
+            return
+        if self._blf_slice_dialog is not None and self._blf_slice_dialog.isVisible():
+            self._blf_slice_dialog.raise_()
+            self._blf_slice_dialog.activateWindow()
+            return
+        self.blf_slice_button.setEnabled(False)
+        dialog = BlfSliceDialog(self)
+        self._blf_slice_dialog = dialog
+        dialog.task_confirmed.connect(self._start_blf_slice)
+        dialog.finished.connect(self._blf_slice_input_closed)
+        dialog.show()
+
+    def _blf_slice_input_closed(self):
+        self._blf_slice_dialog = None
+        if self._blf_slice_worker is None:
+            self.blf_slice_button.setEnabled(True)
+
+    def _start_blf_slice(self, task, table_result):
+        worker = BlfSliceWorker(task, table_result, self)
+        progress = BlfSliceProgressDialog(worker, self)
+        self._blf_slice_worker, self._blf_slice_progress = worker, progress
+        worker.duplicate_found.connect(lambda result: request_duplicate_selection(worker, result, self))
+        worker.completed.connect(self._finish_blf_slice)
+        worker.cancelled.connect(self._finish_blf_slice)
+        worker.failed.connect(self._fail_blf_slice)
+        worker.finished.connect(self._cleanup_blf_slice)
+        progress.show()
+        worker.start()
+
+    def _finish_blf_slice(self, result):
+        if self._blf_slice_progress is not None:
+            self._blf_slice_progress.hide()
+        show_task_result(result, self)
+
+    def _fail_blf_slice(self, message, _partial):
+        if self._blf_slice_progress is not None:
+            self._blf_slice_progress.hide()
+        QMessageBox.critical(self, "BLF 工况切片失败", message)
+
+    def _cleanup_blf_slice(self):
+        worker = self._blf_slice_worker
+        self._blf_slice_worker = None
+        if self._blf_slice_progress is not None:
+            self._blf_slice_progress.deleteLater()
+            self._blf_slice_progress = None
+        self.blf_slice_button.setEnabled(True)
+        if worker is not None:
+            worker.deleteLater()
+        if self._close_after_blf_slice:
+            self._close_after_blf_slice = False
+            self.close()
 
     def load_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择数据文件", "", "支持的数据文件 (*.mdf *.mf4 *.blf *.asc *.trc *.csv *.vbo);;所有文件 (*)")
@@ -63,6 +151,13 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             self._data_load_dialog.close(); self._data_load_dialog.deleteLater(); self._data_load_dialog = None
 
     def closeEvent(self, event):
+        if self._blf_slice_worker is not None and self._blf_slice_worker.isRunning():
+            self._blf_slice_worker.cancel()
+            self._close_after_blf_slice = True
+            if self._blf_slice_progress is not None:
+                self._blf_slice_progress.phase_label.setText("正在安全停止 BLF 切片…")
+            event.ignore()
+            return
         if self._data_load_worker is not None and self._data_load_worker.isRunning():
             # MDF constructors cannot be interrupted safely.  Keep the window
             # alive until the worker exits instead of destroying a live QThread.
