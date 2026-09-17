@@ -34,20 +34,39 @@ class InputMode(str, Enum):
     FOLDER = "folder"
 
 
-class BlfFileStatus(str, Enum):
-    """Current indexing/read state of one BLF file."""
+class BlfHeaderStatus(str, Enum):
+    """Readability and structural validity of a BLF Header."""
 
     PENDING = "pending"
-    HEADER_VALID = "header_valid"
-    SCAN_RECOVERED = "scan_recovered"
-    EMPTY = "empty"
-    CORRUPT = "corrupt"
+    VALID = "valid"
+    UNTRUSTED = "untrusted"
     READ_FAILED = "read_failed"
+
+
+class BlfTimeRangeStatus(str, Enum):
+    """Whether a physical BLF's effective data-frame range is known."""
+
+    UNCONFIRMED = "unconfirmed"
+    CONFIRMED = "confirmed"
+    EMPTY = "empty"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class DuplicateFileStatus(str, Enum):
+    """Per-file result of staged exact-duplicate detection."""
+
+    PENDING = "pending"
+    SIZE_UNIQUE = "size_unique"
+    QUICK_DIGEST_UNIQUE = "quick_digest_unique"
+    FULL_DIGEST_UNIQUE = "full_digest_unique"
+    DUPLICATE = "duplicate"
+    FAILED = "failed"
     CANCELLED = "cancelled"
 
 
 class ConditionStatus(str, Enum):
-    """Final processing state defined by V1.3 for one condition."""
+    """Final processing state defined for one condition."""
 
     COMPLETE = "complete"
     PARTIAL = "partial"
@@ -104,18 +123,31 @@ class SliceTask:
 
 @dataclass(frozen=True, slots=True)
 class BlfIndexEntry:
-    """Indexed time range and read state for one BLF file."""
+    """Header evidence and independently confirmed effective range for one BLF."""
 
     path: Path
-    status: BlfFileStatus = BlfFileStatus.PENDING
-    start_timestamp: float | None = None
-    stop_timestamp: float | None = None
+    header_status: BlfHeaderStatus = BlfHeaderStatus.PENDING
+    header_start_timestamp_raw: float | None = None
+    header_stop_timestamp_raw: float | None = None
+    header_start_timestamp: float | None = None
+    header_stop_timestamp: float | None = None
+    header_untrusted_reasons: tuple[str, ...] = field(default_factory=tuple)
+    time_range_status: BlfTimeRangeStatus = BlfTimeRangeStatus.UNCONFIRMED
+    effective_start_timestamp: float | None = None
+    effective_stop_timestamp: float | None = None
+    scanned_message_count: int = 0
+    valid_frame_count: int = 0
+    ignored_remote_frames: int = 0
+    ignored_error_frames: int = 0
+    invalid_timestamp_count: int = 0
+    timestamp_inversion_count: int = 0
     warnings: tuple[str, ...] = field(default_factory=tuple)
     error: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", Path(self.path))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "header_untrusted_reasons", tuple(self.header_untrusted_reasons))
 
 
 @dataclass(frozen=True, slots=True)

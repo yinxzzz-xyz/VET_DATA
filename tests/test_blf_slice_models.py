@@ -45,8 +45,12 @@ class BlfSliceModelTests(unittest.TestCase):
             {"complete", "partial", "no_data", "failed", "cancelled", "not_processed", "not_selected"},
         )
         self.assertEqual(
-            {item.value for item in models.BlfFileStatus},
-            {"pending", "header_valid", "scan_recovered", "empty", "corrupt", "read_failed", "cancelled"},
+            {item.value for item in models.BlfHeaderStatus},
+            {"pending", "valid", "untrusted", "read_failed"},
+        )
+        self.assertEqual(
+            {item.value for item in models.BlfTimeRangeStatus},
+            {"unconfirmed", "confirmed", "empty", "failed", "cancelled"},
         )
         self.assertEqual(
             {item.value for item in models.TaskStatus},
@@ -61,8 +65,13 @@ class BlfSliceModelTests(unittest.TestCase):
         self.assertEqual(self.task.table_utc_offset, timedelta(hours=8))
 
         index = models.BlfIndexEntry(path="source.blf")
-        self.assertEqual(index.status, models.BlfFileStatus.PENDING)
-        self.assertIsNone(index.start_timestamp)
+        self.assertEqual(index.header_status, models.BlfHeaderStatus.PENDING)
+        self.assertIsNone(index.header_start_timestamp_raw)
+        self.assertIsNone(index.header_start_timestamp)
+        self.assertEqual(index.header_untrusted_reasons, ())
+        self.assertEqual(index.time_range_status, models.BlfTimeRangeStatus.UNCONFIRMED)
+        self.assertIsNone(index.effective_start_timestamp)
+        self.assertIsNone(index.effective_stop_timestamp)
 
         condition_result = models.ConditionResult(condition=self.condition)
         self.assertEqual(condition_result.status, models.ConditionStatus.NOT_PROCESSED)
@@ -73,6 +82,28 @@ class BlfSliceModelTests(unittest.TestCase):
         self.assertEqual(task_result.status, models.TaskStatus.PENDING)
         self.assertEqual(task_result.condition_results, ())
         self.assertIsNone(task_result.finished_at)
+
+    def test_header_evidence_and_confirmed_effective_range_are_independent(self):
+        index = models.BlfIndexEntry(
+            path="source.blf",
+            header_status=models.BlfHeaderStatus.VALID,
+            header_start_timestamp_raw=1000.0,
+            header_stop_timestamp_raw=2000.0,
+            header_start_timestamp=900.0,
+            header_stop_timestamp=1900.0,
+            time_range_status=models.BlfTimeRangeStatus.CONFIRMED,
+            effective_start_timestamp=1200.0,
+            effective_stop_timestamp=1800.0,
+        )
+
+        self.assertEqual(
+            (index.header_start_timestamp, index.header_stop_timestamp),
+            (900.0, 1900.0),
+        )
+        self.assertEqual(
+            (index.effective_start_timestamp, index.effective_stop_timestamp),
+            (1200.0, 1800.0),
+        )
 
     def test_slice_task_is_an_immutable_snapshot(self):
         source_conditions = [self.condition]
