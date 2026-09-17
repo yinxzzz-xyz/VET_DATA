@@ -5,10 +5,16 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from .blf_slice_models import MAX_OUTPUT_BLF_FILENAME_LENGTH, WINDOWS_MAX_PATH_CHARACTERS
+from .blf_slice_models import (
+    MAX_OUTPUT_BLF_FILENAME_LENGTH,
+    WINDOWS_MAX_PATH_CHARACTERS,
+    ConditionStatus,
+    TaskResult,
+)
+from .blf_slice_time import build_condition_time_window
 
 
 _WINDOWS_ILLEGAL_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -408,3 +414,119 @@ def _error(
         cleaned_name=cleaned_name,
         issue=OutputNameIssue(code, message, field_name),
     )
+
+
+def write_report(task_result: TaskResult, output_dir: str | Path) -> Path:
+    """Write a traceable V1.4 Markdown report without replacing an old report."""
+    directory = Path(output_dir)
+    timestamp = task_result.task.started_at.strftime("%Y%m%d-%H%M%S")
+    base = f"BLF切片报告-{timestamp}"
+    index = 0
+    while True:
+        suffix = "" if index == 0 else f"-{index}"
+        path = directory / f"{base}{suffix}.md"
+        try:
+            with path.open("x", encoding="utf-8", newline="\n") as handle:
+                handle.write(build_report_markdown(task_result))
+        except FileExistsError:
+            index += 1
+            continue
+        return path
+
+
+def build_report_markdown(task_result: TaskResult) -> str:
+    """Render report values only from the immutable task/result evidence."""
+    task = task_result.task
+    finished = task_result.finished_at.isoformat(sep=" ") if task_result.finished_at else "未结束"
+    lines = [
+        "# BLF 工况切片报告",
+        "",
+        "## 任务汇总",
+        "",
+        f"- 任务状态：{task_result.status.value}",
+        f"- 开始时间：{task.started_at.isoformat(sep=' ')}",
+        f"- 结束时间：{finished}",
+        f"- BLF 输入：`{task.input_path}`",
+        f"- 工况表：`{task.table_path}`",
+        f"- 输出目录：`{task.output_dir}`",
+        f"- BLF 时区：{_format_offset(task.blf_utc_offset)}",
+        f"- 工况表时区：{_format_offset(task.table_utc_offset)}",
+        f"- Header/范围索引耗时：{task_result.index_duration_seconds:.3f} 秒",
+        f"- 工况表有效行：{task_result.table_valid_rows}",
+        f"- 工况表舍弃行：{task_result.table_discarded_rows}",
+        "",
+        "### 状态数量",
+        "",
+    ]
+    counts = {status: 0 for status in ConditionStatus}
+    for result in task_result.condition_results:
+        counts[result.status] += 1
+    lines.extend(f"- {status.value}：{counts[status]}" for status in ConditionStatus)
+
+    lines.extend(["", "## BLF 索引与实际范围", ""])
+    if not task_result.blf_index:
+        lines.append("- 无索引记录")
+    for entry in task_result.blf_index:
+        lines.extend(
+            [
+                f"### `{entry.path}`",
+                "",
+                f"- Header 状态：{entry.header_status.value}",
+                f"- Header UTC 范围：{_format_timestamp(entry.header_start_timestamp)} ～ {_format_timestamp(entry.header_stop_timestamp)}",
+                f"- Effective range 状态：{entry.time_range_status.value}",
+                f"- 实际 UTC 范围：{_format_timestamp(entry.effective_start_timestamp)} ～ {_format_timestamp(entry.effective_stop_timestamp)}",
+                f"- 扫描对象数：{entry.scanned_message_count}",
+                f"- 普通 CAN/CAN FD 帧：{entry.valid_frame_count}",
+                f"- 忽略 Remote/RTR：{entry.ignored_remote_frames}",
+                f"- 忽略 Error Frame：{entry.ignored_error_frames}",
+                f"- 错误：{entry.error or '无'}",
+                "",
+            ]
+        )
+
+    lines.extend(["## 重复检测与最终输入", ""])
+    lines.extend(f"- {item}" for item in task_result.duplicate_summary or ("无重复检测记录",))
+    lines.extend(f"- 保留：`{path}`" for path in task_result.retained_input_files)
+    lines.extend(["", "## 逐工况结果", ""])
+    for result in task_result.condition_results:
+        condition = result.condition
+        window = build_condition_time_window(condition, task.table_utc_offset)
+        lines.extend(
+            [
+                f"### 行 {condition.original_row_number}：{condition.name}",
+                "",
+                f"- 原始名称：{condition.original_name}",
+                f"- 工况时间：{condition.recorded_at.isoformat(sep=' ')}",
+                f"- 前/后窗口：{condition.before_seconds} / {condition.after_seconds} 秒",
+                f"- 目标 UTC 窗口：{_format_timestamp(window.start)} ～ {_format_timestamp(window.end)}",
+                f"- 状态：{result.status.value}",
+                f"- 有效帧数量：{result.message_count}",
+                f"- 实际首末 UTC 报文：{_format_timestamp(result.actual_first_timestamp)} ～ {_format_timestamp(result.actual_last_timestamp)}",
+                f"- 忽略 Remote/RTR：{result.ignored_remote_frames}",
+                f"- 忽略 Error Frame：{result.ignored_error_frames}",
+                f"- 忽略其他对象：{result.ignored_other_objects}",
+                f"- 来源：{', '.join(f'`{path}`' for path in result.source_files) or '无'}",
+                f"- 输出：{', '.join(f'`{path}`' for path in result.output_files) or '无'}",
+                f"- 断点/缺失：{'; '.join(result.gaps) or '无'}",
+                f"- 警告：{'; '.join(result.warnings) or '无'}",
+                f"- 错误：{'; '.join(result.errors) or '无'}",
+                "",
+            ]
+        )
+    lines.extend(["## 任务级警告与错误", ""])
+    lines.append(f"- 警告：{'; '.join(task_result.warnings) or '无'}")
+    lines.append(f"- 错误：{'; '.join(task_result.errors) or '无'}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_timestamp(value: float | None) -> str:
+    if value is None:
+        return "无"
+    return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
+
+def _format_offset(value) -> str:
+    total_minutes = int(value.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    hours, minutes = divmod(abs(total_minutes), 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"

@@ -192,6 +192,8 @@ class TaskResult:
     table_discard_reasons: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
     errors: tuple[str, ...] = field(default_factory=tuple)
+    duplicate_summary: tuple[str, ...] = field(default_factory=tuple)
+    retained_input_files: tuple[Path, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "condition_results", tuple(self.condition_results))
@@ -199,5 +201,9 @@ class TaskResult:
         object.__setattr__(self, "table_discard_reasons", tuple(self.table_discard_reasons))
         object.__setattr__(self, "warnings", tuple(self.warnings))
         object.__setattr__(self, "errors", tuple(self.errors))
+        object.__setattr__(self, "duplicate_summary", tuple(self.duplicate_summary))
+        object.__setattr__(
+            self, "retained_input_files", tuple(Path(path) for path in self.retained_input_files)
+        )
         if self.report_path is not None:
             object.__setattr__(self, "report_path", Path(self.report_path))
