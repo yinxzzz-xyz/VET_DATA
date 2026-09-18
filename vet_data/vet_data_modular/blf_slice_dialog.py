@@ -19,6 +19,12 @@ from .blf_slice_service import resolve_output_directory, validate_task
 from .blf_slice_table import TableParseError, TableParseResult, parse_condition_table
 
 
+OTHER_OFFSET = "other"
+SPECIAL_UTC_OFFSET_MINUTES = (
+    -570, -210, 210, 270, 330, 345, 390, 525, 570, 630, 765, 825,
+)
+
+
 def offset_label(offset: timedelta) -> str:
     minutes = int(offset.total_seconds() // 60)
     sign = "+" if minutes >= 0 else "-"
@@ -26,11 +32,39 @@ def offset_label(offset: timedelta) -> str:
     return f"UTC{sign}{hours:02d}:{remainder:02d}"
 
 
-def populate_offset_combo(combo: QComboBox, default: timedelta = timedelta(hours=8)) -> None:
-    for minutes in range(-720, 841, 15):
+def populate_special_offset_combo(combo: QComboBox) -> None:
+    combo.clear()
+    for minutes in SPECIAL_UTC_OFFSET_MINUTES:
         value = timedelta(minutes=minutes)
         combo.addItem(offset_label(value), minutes)
-    combo.setCurrentIndex(combo.findData(int(default.total_seconds() // 60)))
+
+
+def populate_offset_combo(
+    combo: QComboBox,
+    special_combo: QComboBox | None = None,
+    default: timedelta = timedelta(hours=8),
+) -> None:
+    """Populate whole-hour offsets plus one gateway to real fractional offsets."""
+    combo.clear()
+    for minutes in range(-720, 841, 60):
+        combo.addItem(offset_label(timedelta(minutes=minutes)), minutes)
+    combo.addItem("其他...", OTHER_OFFSET)
+    default_minutes = int(default.total_seconds() // 60)
+    index = combo.findData(default_minutes)
+    if index >= 0:
+        combo.setCurrentIndex(index)
+    elif special_combo is not None and default_minutes in SPECIAL_UTC_OFFSET_MINUTES:
+        combo.setCurrentIndex(combo.findData(OTHER_OFFSET))
+        special_combo.setCurrentIndex(special_combo.findData(default_minutes))
+    else:
+        raise ValueError("default UTC offset is not available in the GUI selector")
+
+
+def selected_offset(combo: QComboBox, special_combo: QComboBox) -> timedelta:
+    minutes = combo.currentData()
+    if minutes == OTHER_OFFSET:
+        minutes = special_combo.currentData()
+    return timedelta(minutes=int(minutes))
 
 
 def retain_duplicate_choices(files, groups, choices: dict[int, Path]) -> tuple[Path, ...]:
@@ -114,13 +148,39 @@ class BlfSliceDialog(QDialog):
         settings, settings_layout = QGroupBox("任务级设置"), QHBoxLayout()
         settings.setLayout(settings_layout)
         self.blf_offset_combo, self.table_offset_combo = QComboBox(), QComboBox()
-        populate_offset_combo(self.blf_offset_combo)
-        populate_offset_combo(self.table_offset_combo)
+        self.blf_special_offset_combo, self.table_special_offset_combo = QComboBox(), QComboBox()
+        populate_special_offset_combo(self.blf_special_offset_combo)
+        populate_special_offset_combo(self.table_special_offset_combo)
+        populate_offset_combo(self.blf_offset_combo, self.blf_special_offset_combo)
+        populate_offset_combo(self.table_offset_combo, self.table_special_offset_combo)
+        self.blf_offset_combo.currentIndexChanged.connect(
+            lambda: self._sync_special_offset_visibility(self.blf_offset_combo, self.blf_special_offset_combo)
+        )
+        self.table_offset_combo.currentIndexChanged.connect(
+            lambda: self._sync_special_offset_visibility(self.table_offset_combo, self.table_special_offset_combo)
+        )
         settings_layout.addWidget(QLabel("BLF 时区"))
         settings_layout.addWidget(self.blf_offset_combo)
+        settings_layout.addWidget(self.blf_special_offset_combo)
         settings_layout.addWidget(QLabel("工况表时区"))
         settings_layout.addWidget(self.table_offset_combo)
+        settings_layout.addWidget(self.table_special_offset_combo)
+        settings_layout.addSpacing(20)
+        settings_layout.addWidget(QLabel("批量设置：向前"))
+        self.batch_before_spin, self.batch_after_spin = QSpinBox(), QSpinBox()
+        for spin in (self.batch_before_spin, self.batch_after_spin):
+            spin.setRange(0, 300)
+            spin.setValue(60)
+            spin.setSuffix(" 秒")
+        settings_layout.addWidget(self.batch_before_spin)
+        settings_layout.addWidget(QLabel("向后"))
+        settings_layout.addWidget(self.batch_after_spin)
+        self.apply_batch_button = QPushButton("应用到全部工况")
+        self.apply_batch_button.clicked.connect(self._apply_batch_windows)
+        settings_layout.addWidget(self.apply_batch_button)
         settings_layout.addStretch()
+        self._sync_special_offset_visibility(self.blf_offset_combo, self.blf_special_offset_combo)
+        self._sync_special_offset_visibility(self.table_offset_combo, self.table_special_offset_combo)
         root.addWidget(settings)
         self.condition_table = QTableWidget(0, len(self.COLUMNS))
         self.condition_table.setHorizontalHeaderLabels(self.COLUMNS)
@@ -207,6 +267,16 @@ class BlfSliceDialog(QDialog):
         for row in range(self.condition_table.rowCount()):
             self.condition_table.item(row, 0).setCheckState(state)
 
+    @staticmethod
+    def _sync_special_offset_visibility(combo, special_combo):
+        special_combo.setVisible(combo.currentData() == OTHER_OFFSET)
+
+    def _apply_batch_windows(self):
+        before, after = self.batch_before_spin.value(), self.batch_after_spin.value()
+        for row in range(self.condition_table.rowCount()):
+            self.condition_table.cellWidget(row, 4).setValue(before)
+            self.condition_table.cellWidget(row, 5).setValue(after)
+
     def build_task_snapshot(self, now=None):
         table_path = Path(self.table_edit.text().strip())
         if self._table_result is None or table_path != self._table_result.source_path:
@@ -234,8 +304,8 @@ class BlfSliceDialog(QDialog):
             mode, input_path, table_path,
             resolve_output_directory(mode, input_path, output or None),
             tuple(conditions), now or datetime.now(),
-            timedelta(minutes=self.blf_offset_combo.currentData()),
-            timedelta(minutes=self.table_offset_combo.currentData()),
+            selected_offset(self.blf_offset_combo, self.blf_special_offset_combo),
+            selected_offset(self.table_offset_combo, self.table_special_offset_combo),
         )
 
     def _mark_invalid(self, row, column, message):
