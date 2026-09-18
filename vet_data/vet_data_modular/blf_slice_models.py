@@ -194,6 +194,7 @@ class TaskResult:
     errors: tuple[str, ...] = field(default_factory=tuple)
     duplicate_summary: tuple[str, ...] = field(default_factory=tuple)
     retained_input_files: tuple[Path, ...] = field(default_factory=tuple)
+    log_events: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "condition_results", tuple(self.condition_results))
@@ -202,6 +203,7 @@ class TaskResult:
         object.__setattr__(self, "warnings", tuple(self.warnings))
         object.__setattr__(self, "errors", tuple(self.errors))
         object.__setattr__(self, "duplicate_summary", tuple(self.duplicate_summary))
+        object.__setattr__(self, "log_events", tuple(self.log_events))
         object.__setattr__(
             self, "retained_input_files", tuple(Path(path) for path in self.retained_input_files)
         )

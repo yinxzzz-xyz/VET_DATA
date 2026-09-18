@@ -1,0 +1,11 @@
+PyQt6==6.11.0
+PyQt6-WebEngine==6.11.0
+python-can==4.6.1
+openpyxl==3.1.5
+pandas==3.0.1
+numpy==2.4.2
+asammdf==8.8.24
+pyqtgraph==0.14.0
+cantools==43.0.0
+canmatrix==1.2
+pyinstaller==6.21.0

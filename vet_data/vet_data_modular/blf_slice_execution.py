@@ -233,12 +233,13 @@ def execute_slice(
             reader = reader_factory(scan.path)
             for message in reader:
                 scanned += 1
+                if token.is_set():
+                    for state in relevant:
+                        if state.committed_path is None:
+                            state.cancelled = True
+                    break
                 if scanned % progress_interval == 0:
                     _emit_progress(progress_callback, scan.path, file_index, len(plan.source_scans), scanned)
-                    if token.is_set():
-                        for state in relevant:
-                            state.cancelled = True
-                        break
                 _dispatch_message(task, message, relevant, writer_factory, owned, allocator)
         except Exception as exc:
             detail = f"source_read_or_process_error:{scan.path}:{type(exc).__name__}: {exc}"
@@ -254,33 +255,26 @@ def execute_slice(
                         state.failed = True
                         state.errors.append(f"source_close_error:{scan.path}:{type(exc).__name__}: {exc}")
         _emit_progress(progress_callback, scan.path, file_index, len(plan.source_scans), scanned)
+        completed_source = scan.path
+        for state in relevant:
+            if (
+                state.committed_path is None
+                and not state.cancelled
+                and state.plan.source_paths
+                and state.plan.source_paths[-1] == completed_source
+            ):
+                _finalize_and_commit_target(state, owned, allocator)
         if token.is_set():
             break
 
     if token.is_set():
         for state in states.values():
-            if state.writer is not None or state.message_count:
+            if state.committed_path is None and (state.writer is not None or state.message_count):
                 state.cancelled = True
 
     for state in states.values():
-        _finalize_writer(state)
-    for state in states.values():
-        if state.failed or state.cancelled or state.message_count == 0:
-            _cleanup_target(state, owned)
-            continue
-        commit = commit_temporary_output(
-            state.paths,
-            allocator,
-            owned,
-            state.plan.condition.recorded_at,
-        )
-        if commit.committed and commit.paths.final_path is not None:
-            state.committed_path = commit.paths.final_path
-            state.paths = commit.paths
-        else:
-            state.failed = True
-            state.errors.append(commit.issue.message if commit.issue else "output_commit_failed")
-            _cleanup_target(state, owned)
+        if state.committed_path is None:
+            _finalize_and_commit_target(state, owned, allocator)
     cleanup_failures = owned.cleanup_all()
     if cleanup_failures:
         for state in states.values():
@@ -369,6 +363,31 @@ def _finalize_writer(state: _TargetState) -> None:
         state.errors.append(f"writer_close_error:{type(exc).__name__}: {exc}")
     finally:
         state.writer = None
+
+
+def _finalize_and_commit_target(
+    state: _TargetState,
+    owned: OwnedTemporaryFiles,
+    allocator: OutputNameAllocator,
+) -> None:
+    """Close and atomically commit one complete target at its last source."""
+    _finalize_writer(state)
+    if state.failed or state.cancelled or state.message_count == 0:
+        _cleanup_target(state, owned)
+        return
+    commit = commit_temporary_output(
+        state.paths,
+        allocator,
+        owned,
+        state.plan.condition.recorded_at,
+    )
+    if commit.committed and commit.paths.final_path is not None:
+        state.committed_path = commit.paths.final_path
+        state.paths = commit.paths
+    else:
+        state.failed = True
+        state.errors.append(commit.issue.message if commit.issue else "output_commit_failed")
+        _cleanup_target(state, owned)
 
 
 def _cleanup_target(state: _TargetState, owned: OwnedTemporaryFiles) -> None:

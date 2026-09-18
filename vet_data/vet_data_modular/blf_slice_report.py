@@ -516,6 +516,8 @@ def build_report_markdown(task_result: TaskResult) -> str:
     lines.extend(["## 任务级警告与错误", ""])
     lines.append(f"- 警告：{'; '.join(task_result.warnings) or '无'}")
     lines.append(f"- 错误：{'; '.join(task_result.errors) or '无'}")
+    lines.extend(["", "## 运行事件", ""])
+    lines.extend(f"- {event}" for event in task_result.log_events or ("无",))
     return "\n".join(lines) + "\n"
 
 

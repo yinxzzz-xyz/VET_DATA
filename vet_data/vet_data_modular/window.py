@@ -6,8 +6,8 @@ from PyQt6.QtWidgets import QFileDialog, QLabel, QMessageBox, QPushButton
 
 from .blf_slice_dialog import BlfSliceDialog
 from .blf_slice_progress import (
-    BlfSliceProgressDialog, BlfSliceWorker, request_duplicate_selection,
-    show_task_result,
+    BlfSliceProgressDialog, BlfSliceResultDialog, BlfSliceWorker,
+    request_duplicate_selection,
 )
 from .collapsible import CollapsiblePanelsMixin
 from .legacy import baseline
@@ -24,6 +24,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.setWindowTitle("VET_DATA merged modular")
         self._data_load_worker = None; self._data_load_dialog = None
         self._blf_slice_dialog = None; self._blf_slice_worker = None; self._blf_slice_progress = None
+        self._blf_slice_result = None
         self._close_after_load = False; self._close_after_blf_slice = False
         self._setup_signal_panel(); self._setup_plot_panel(); self._setup_collapsible_panels()
         self._setup_blf_slice_entry()
@@ -89,12 +90,24 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
     def _finish_blf_slice(self, result):
         if self._blf_slice_progress is not None:
             self._blf_slice_progress.hide()
-        show_task_result(result, self)
+        self._show_blf_slice_result(result)
 
-    def _fail_blf_slice(self, message, _partial):
+    def _fail_blf_slice(self, _message, result):
         if self._blf_slice_progress is not None:
             self._blf_slice_progress.hide()
-        QMessageBox.critical(self, "BLF 工况切片失败", message)
+        self._show_blf_slice_result(result)
+
+    def _show_blf_slice_result(self, result):
+        if self._blf_slice_result is not None:
+            self._blf_slice_result.close()
+            self._blf_slice_result.deleteLater()
+        dialog = BlfSliceResultDialog(result, self)
+        self._blf_slice_result = dialog
+        dialog.finished.connect(self._clear_blf_slice_result)
+        dialog.show()
+
+    def _clear_blf_slice_result(self):
+        self._blf_slice_result = None
 
     def _cleanup_blf_slice(self):
         worker = self._blf_slice_worker
