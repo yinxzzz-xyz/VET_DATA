@@ -74,7 +74,7 @@ class CalculationEngine:
                 )
 
             alignment = align_signals(alignment_inputs)
-            evaluator = _AstEvaluator(alignment.samples_by_key)
+            evaluator = _AstEvaluator(alignment.samples_by_key, alignment.timestamps)
             with np.errstate(all="ignore"):
                 raw_samples = np.asarray(evaluator.evaluate(formula.tree))
             if raw_samples.ndim == 0:
@@ -131,8 +131,9 @@ class CalculationEngine:
 
 
 class _AstEvaluator:
-    def __init__(self, values: Mapping[str, np.ndarray]):
+    def __init__(self, values: Mapping[str, np.ndarray], timestamps: np.ndarray):
         self.values = values
+        self.timestamps = timestamps
         self.diagnostics = {
             "divide_by_zero_count": 0,
             "domain_error_count": 0,
@@ -203,12 +204,34 @@ class _AstEvaluator:
         function = node.func.id
         if function not in ALLOWED_FUNCTIONS:
             raise CalculationEngineError("unsupported_function", f"Engine 不支持函数: {function}")
-        if function in _TIME_FUNCTIONS:
-            raise CalculationEngineError(
-                "unsupported_time_function", f"当前 Calculation Engine 阶段尚不支持 {function}()"
-            )
         value = self.evaluate(node.args[0])
+        if function in _TIME_FUNCTIONS:
+            return self._evaluate_time_function(function, value)
         return self._evaluate_function(function, value)
+
+    def _evaluate_time_function(self, function, value):
+        values = np.asarray(value, dtype=float)
+        if values.ndim == 0:
+            values = np.full(self.timestamps.shape, values.item(), dtype=float)
+        if values.shape != self.timestamps.shape:
+            raise CalculationEngineError(
+                "invalid_time_function_shape",
+                f"{function}() 参数形状与统一时间轴不一致",
+            )
+        if function == "derivative":
+            if self.timestamps.size < 2:
+                raise CalculationEngineError(
+                    "insufficient_derivative_samples", "derivative() 至少需要 2 个时间点"
+                )
+            return np.gradient(values, self.timestamps, edge_order=1)
+        if function == "integral":
+            result = np.zeros(self.timestamps.shape, dtype=float)
+            if self.timestamps.size > 1:
+                dt = self.timestamps[1:] - self.timestamps[:-1]
+                increments = (values[:-1] + values[1:]) * 0.5 * dt
+                result[1:] = np.cumsum(increments)
+            return result
+        raise CalculationEngineError("unsupported_function", f"Engine 不支持函数: {function}")
 
     def _evaluate_function(self, function, value):
         if function == "abs":

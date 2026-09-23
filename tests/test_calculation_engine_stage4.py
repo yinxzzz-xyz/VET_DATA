@@ -219,12 +219,13 @@ class CalculationEngineTests(unittest.TestCase):
         self.assertEqual(no_overlap.status, CalculationStatus.ERROR)
         self.assertEqual(no_overlap.diagnostics["error_code"], "no_overlap")
 
-    def test_derivative_and_integral_are_explicitly_unsupported(self):
-        for formula in ("derivative(S001)", "integral(S001)"):
-            with self.subTest(formula=formula):
-                result = _calculate(formula, {"S001": ([0, 1], [1, 2])})
-                self.assertEqual(result.status, CalculationStatus.ERROR)
-                self.assertEqual(result.diagnostics["error_code"], "unsupported_time_function")
+    def test_derivative_and_integral_are_supported_by_stage5(self):
+        derivative = _calculate("derivative(S001)", {"S001": ([0, 1], [1, 2])})
+        integral = _calculate("integral(S001)", {"S001": ([0, 1], [1, 2])})
+        self.assertEqual(derivative.status, CalculationStatus.SUCCESS)
+        self.assertEqual(integral.status, CalculationStatus.SUCCESS)
+        np.testing.assert_allclose(derivative.samples, [1, 1])
+        np.testing.assert_allclose(integral.samples, [0, 1.5])
 
     def test_defensive_invalid_ast_is_rejected_without_execution(self):
         tree = ast.parse("S001[0]", mode="eval")
