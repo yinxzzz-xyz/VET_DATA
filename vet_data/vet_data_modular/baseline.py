@@ -24,8 +24,6 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 import numpy as np
-from asammdf.blocks.utils import MdfException
-from asammdf import Signal
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from collections import defaultdict
 import warnings
@@ -35,6 +33,8 @@ import re
 from PyQt6.QtGui import QColor
 import time
 import multiprocessing
+
+from .signal_resolver import SignalResolutionError, SignalResolver
 
 # 抑制警告
 warnings.filterwarnings("ignore")
@@ -3962,122 +3962,19 @@ class MDFPlotter(QWidget):
 
     def _get_signal(self, signal_info):
         """获取信号数据，支持文字类型信号"""
-        unique_key = signal_info['name']
-
-        # 数学通道
-        if unique_key in self.custom_math_data:
-            math_item = self.custom_math_data[unique_key]
-            return Signal(samples=math_item['samples'],
-                          timestamps=math_item['timestamps'],
-                          name=unique_key,
-                          unit="Math")
-
-        # CAN解析数据
-        if unique_key in self.can_parsed_data:
-            can_item = self.can_parsed_data[unique_key]
-            return Signal(samples=can_item['samples'],
-                          timestamps=can_item['timestamps'],
-                          name=unique_key,
-                          unit=can_item.get('unit', ''))
-
-        file_extension = os.path.splitext(self.mdf_path)[1].lower()
-        signal = None
-
-        if file_extension in ('.mdf', '.mf4'):
-            try:
-                signal = self.mdf_file.get(signal_info['name'], group=signal_info['group'],
-                                           index=signal_info['channel'])
-            except MdfException as e:
-                print(f"MDF/MF4 获取信号失败: {e}")
-                return None
-
-        elif file_extension in ('.csv', '.vbo'):
-            if isinstance(self.mdf_file, pd.DataFrame) and signal_info['name'] in self.mdf_file.columns:
-                signal_data = self.mdf_file[signal_info['name']]
-                timestamps = self.mdf_file.index.values
-                if len(timestamps) == 0 or len(signal_data) == 0:
-                    return None
-                signal = Signal(samples=signal_data.values,
-                                timestamps=timestamps.astype(float),
-                                name=signal_info['name'],
-                                unit="")
-
-        if signal is not None and len(signal.samples) > 0:
-            # ===== 检查是否为文字类型信号 =====
-            is_text_signal = False
-
-            # 方法1: 检查数据类型
-            if signal.samples.dtype.kind in ('U', 'S', 'O'):
-                is_text_signal = True
-
-            # 方法2: 检查是否为对象类型（可能包含混合类型）
-            if not is_text_signal and signal.samples.dtype == 'object':
-                # 检查前几个样本是否包含字符串
-                sample_count = min(10, len(signal.samples))
-                for j in range(sample_count):
-                    try:
-                        val = signal.samples[j]
-                        if isinstance(val, str) or (isinstance(val, bytes)):
-                            is_text_signal = True
-                            break
-                        # 检查是否为非数字字符串
-                        if isinstance(val, (int, float)):
-                            pass
-                        elif str(val).replace('.', '').replace('-', '').replace('e', '').replace('E', '').strip():
-                            # 包含非数字字符
-                            is_text_signal = True
-                            break
-                    except Exception:
-                        pass
-
-            if is_text_signal:
-                # ===== 文字信号处理 =====
-                # 转换为字符串
-                str_samples = np.array([str(s) for s in signal.samples], dtype=str)
-
-                # 获取唯一值并保持原始顺序（按首次出现顺序）
-                unique_vals = []
-                seen = set()
-                for s in str_samples:
-                    if s not in seen:
-                        seen.add(s)
-                        unique_vals.append(s)
-
-                # 创建数值映射
-                val_map = {val: i for i, val in enumerate(unique_vals)}
-                numeric_samples = np.array([val_map[s] for s in str_samples], dtype=float)
-
-                # 创建新信号
-                new_sig = Signal(samples=numeric_samples,
-                                 timestamps=signal.timestamps.copy(),
-                                 name=signal.name,
-                                 unit=signal.unit if hasattr(signal, 'unit') else "")
-
-                # 保存文字映射信息
-                new_sig.text_mapping = unique_vals
-                new_sig.raw_text_values = str_samples.tolist()
-                new_sig.is_text_signal = True
-
-                return new_sig
-            else:
-                # ===== 数值信号 =====
-                # 转换为浮点数
-                try:
-                    signal.samples = signal.samples.astype(float)
-                except (ValueError, TypeError):
-                    # 如果无法转换，尝试逐个转换
-                    float_samples = []
-                    for s in signal.samples:
-                        try:
-                            float_samples.append(float(s))
-                        except Exception:
-                            float_samples.append(np.nan)
-                    signal.samples = np.array(float_samples, dtype=float)
-
-                signal.is_text_signal = False
-                return signal
-
-        return signal
+        resolver = SignalResolver(
+            self.signals,
+            data_source=self.mdf_file,
+            data_path=self.mdf_path,
+            can_data=self.can_parsed_data,
+            legacy_math_data=self.custom_math_data,
+        )
+        try:
+            return resolver.resolve_info(signal_info).signal
+        except SignalResolutionError as exc:
+            if os.path.splitext(self.mdf_path)[1].lower() in ('.mdf', '.mf4'):
+                print(f"MDF/MF4 获取信号失败: {exc}")
+            return None
 
     def plot_selected_signals(self):
         for widget in self.plot_widgets:
