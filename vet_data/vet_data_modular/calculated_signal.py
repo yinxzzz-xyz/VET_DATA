@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 
-CALCULATED_SIGNAL_SCHEMA_VERSION = 1
+CALCULATED_SIGNAL_SCHEMA_VERSION = 2
 
 
 class CalculationStatus(str, Enum):

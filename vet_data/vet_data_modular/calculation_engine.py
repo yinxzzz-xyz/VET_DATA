@@ -74,7 +74,11 @@ class CalculationEngine:
                 )
 
             alignment = align_signals(alignment_inputs)
-            evaluator = _AstEvaluator(alignment.samples_by_key, alignment.timestamps)
+            evaluator = _AstEvaluator(
+                alignment.samples_by_key,
+                alignment.timestamps,
+                divide_by_zero=definition.numeric_policy.get("divide_by_zero", "nan"),
+            )
             with np.errstate(all="ignore"):
                 raw_samples = np.asarray(evaluator.evaluate(formula.tree))
             if raw_samples.ndim == 0:
@@ -131,9 +135,15 @@ class CalculationEngine:
 
 
 class _AstEvaluator:
-    def __init__(self, values: Mapping[str, np.ndarray], timestamps: np.ndarray):
+    def __init__(
+        self,
+        values: Mapping[str, np.ndarray],
+        timestamps: np.ndarray,
+        divide_by_zero: str = "nan",
+    ):
         self.values = values
         self.timestamps = timestamps
+        self.divide_by_zero = divide_by_zero
         self.diagnostics = {
             "divide_by_zero_count": 0,
             "domain_error_count": 0,
@@ -191,7 +201,8 @@ class _AstEvaluator:
             self.diagnostics["divide_by_zero_count"] += int(np.count_nonzero(near_zero))
             result = np.true_divide(left, right)
             self._record_new_nonfinite(result, left, right)
-            return np.where(near_zero, np.nan, result)
+            replacement = 0.0 if self.divide_by_zero == "zero" else np.nan
+            return np.where(near_zero, replacement, result)
         if isinstance(node.op, ast.Pow):
             result = np.power(left, right)
             self._record_new_nonfinite(result, left, right)
