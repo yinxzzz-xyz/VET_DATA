@@ -1,19 +1,26 @@
 """Merged VET_DATA main window."""
 
 from pathlib import Path
+from uuid import uuid4
 
-from PyQt6.QtWidgets import QFileDialog, QLabel, QMessageBox, QPushButton
+from PyQt6.QtWidgets import QDialog, QFileDialog, QLabel, QMessageBox, QPushButton
 
 from .blf_slice_dialog import BlfSliceDialog
 from .blf_slice_progress import (
     BlfSliceProgressDialog, BlfSliceResultDialog, BlfSliceWorker,
     request_duplicate_selection,
 )
+from .calculated_signal import CalculationStatus
+from .calculation_engine import CalculationEngine
 from .collapsible import CollapsiblePanelsMixin
 from .legacy import baseline
-from .math_channel import SearchableMathChannelDialog  # installs baseline override
+from .formula_editor import FormulaEditorDialog
+from .formula_parser import FormulaError
+from .formula_validator import parse_and_validate_formula
+from .math_channel import SearchableMathChannelDialog  # retains legacy compatibility
 from .plot_panel import PlotPanelMixin
 from .signal_panel import SignalPanelMixin
+from .signal_resolver import SignalResolver
 from .workers import BusyLoadDialog, DataLoadWorker
 
 
@@ -26,8 +33,98 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._blf_slice_dialog = None; self._blf_slice_worker = None; self._blf_slice_progress = None
         self._blf_slice_result = None
         self._close_after_load = False; self._close_after_blf_slice = False
+        self.calculated_signal_definitions = {}
+        self._formula_editor_dialog = None
+        self.math_channel_button.setText("➕ 创建自定义公式计算通道")
+        self.math_channel_button.setToolTip("使用多信号公式、数学函数、导数和积分创建通道")
         self._setup_signal_panel(); self._setup_plot_panel(); self._setup_collapsible_panels()
         self._setup_blf_slice_entry()
+
+    def _formula_resolver(self):
+        return SignalResolver(
+            self.signals,
+            data_source=self.mdf_file,
+            data_path=self.mdf_path,
+            can_data=self.can_parsed_data,
+            legacy_math_data=self.custom_math_data,
+        )
+
+    def _preview_formula_definition(self, definition):
+        validated = parse_and_validate_formula(
+            definition.normalized_formula or definition.user_formula,
+            definition.signal_tokens,
+        )
+        return CalculationEngine().calculate(
+            definition, validated, self._formula_resolver()
+        )
+
+    def create_math_channel(self):
+        """Open the V1 formula editor; the legacy binary dialog stays internal."""
+        if not self.signals:
+            QMessageBox.warning(self, "计算通道", "当前未加载任何有效数据文件。")
+            return
+        dialog = FormulaEditorDialog(
+            self.signals, self, preview_callback=self._preview_formula_definition
+        )
+        self._formula_editor_dialog = dialog
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            display_name = dialog.name_edit.text().strip()
+            if not display_name:
+                QMessageBox.warning(self, "错误", "新信号通道的名称不能为空。")
+                return
+            existing_names = {
+                item.display_name.casefold()
+                for item in self.calculated_signal_definitions.values()
+            }
+            existing_names.update(
+                str(info.get("display_name", key)).removeprefix("🧮 ").casefold()
+                for key, info in self.signals.items()
+                if key.startswith(("CALC_", "MATH_"))
+            )
+            if display_name.casefold() in existing_names:
+                QMessageBox.warning(
+                    self, "错误", f"计算通道名称 '{display_name}' 已存在，请换一个名称。"
+                )
+                return
+            stable_id = f"CALC_{uuid4().hex}"
+            definition = dialog.build_definition(stable_id)
+            if definition is None:
+                QMessageBox.warning(self, "公式错误", dialog.diagnostic_output.toPlainText())
+                return
+            result = self._preview_formula_definition(definition)
+            if result.status is not CalculationStatus.SUCCESS:
+                QMessageBox.critical(
+                    self, "计算失败", result.error or "公式计算失败"
+                )
+                return
+            self.custom_math_data[stable_id] = {
+                "timestamps": result.timestamps,
+                "samples": result.samples,
+                "unit": definition.result_unit,
+            }
+            self.calculated_signal_definitions[stable_id] = definition
+            self.signals[stable_id] = {
+                "name": stable_id,
+                "display_name": f"🧮 {definition.display_name}",
+                "group": -99,
+                "channel": -99,
+                "source": "Calculated",
+                "comment": definition.comment,
+                "calculated_definition": definition.to_dict(),
+            }
+            self.refresh_signal_list_ui()
+            self.signal_widgets[stable_id]["checkbox"].setChecked(True)
+            QMessageBox.information(
+                self, "计算通道", f"公式计算通道 '{definition.display_name}' 创建成功！"
+            )
+        except FormulaError as exc:
+            QMessageBox.warning(self, "公式错误", exc.issue.message)
+        except Exception as exc:
+            QMessageBox.critical(self, "计算失败", str(exc))
+        finally:
+            self._formula_editor_dialog = None
 
     def _setup_blf_slice_entry(self):
         self.blf_slice_button = QPushButton("BLF 工况切片")
@@ -149,6 +246,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.current_file_label.setText(f"当前文件: {Path(result.path).name}")
         self.signals.clear(); self.signals.update(result.signals)
         self.can_parsed_data.clear(); self.bus_signal_map.clear(); self.custom_math_data.clear()
+        self.calculated_signal_definitions.clear()
         self.can_bus_data.clear(); self.db_per_bus.clear(); self.bus_protocols.clear(); self.can_bus_signals.clear()
         self.clear_bus_config(); self._sig_value_cache.clear(); self._user_signal_order.clear()
         self.refresh_signal_list_ui(); self.load_config()

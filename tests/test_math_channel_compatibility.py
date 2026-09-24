@@ -150,7 +150,7 @@ class LegacyMathChannelCompatibilityTests(unittest.TestCase):
         }
         with patch.object(baseline, "MathChannelDialog", _AcceptedMathDialog), \
              patch.object(baseline.QMessageBox, "warning") as warning:
-            self.window.create_math_channel()
+            baseline.MDFPlotter.create_math_channel(self.window)
         warning.assert_called_once()
         self.assertNotIn("MATH_taken", self.window.custom_math_data)
 
@@ -163,7 +163,7 @@ class LegacyMathChannelCompatibilityTests(unittest.TestCase):
         }
         with patch.object(baseline, "MathChannelDialog", _AcceptedMathDialog), \
              patch.object(baseline.QMessageBox, "information"):
-            self.window.create_math_channel()
+            baseline.MDFPlotter.create_math_channel(self.window)
         self.assertIn("MATH_sum", self.window.signals)
         self.assertIn("MATH_sum", self.window.custom_math_data)
         self.assertIn("MATH_sum", self.window.get_selected_signals())
