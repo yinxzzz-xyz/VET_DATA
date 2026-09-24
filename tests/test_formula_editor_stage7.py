@@ -1,4 +1,5 @@
 import os
+import re
 import unittest
 from unittest.mock import patch
 
@@ -82,9 +83,11 @@ class FormulaEditorDialogTests(unittest.TestCase):
         )
         self.dialog.signal_list.setCurrentItem(item)
         self.dialog.insert_signal_button.click()
-        self.assertEqual(self.dialog.formula_edit.toPlainText(), "S001")
+        self.assertEqual(self.dialog.formula_edit.toPlainText(), "Engine RPM")
+        self.assertEqual(self.dialog.internal_formula(), "S001")
         self.dialog.signal_list.itemDoubleClicked.emit(item)
-        self.assertEqual(self.dialog.formula_edit.toPlainText(), "S001S001")
+        self.assertEqual(self.dialog.formula_edit.toPlainText(), "Engine RPMEngine RPM")
+        self.assertEqual(self.dialog.internal_formula(), "S001S001")
 
     def test_insert_occurs_at_cursor_and_same_key_reuses_token(self):
         self.dialog.formula_edit.setPlainText("+ 2")
@@ -97,7 +100,8 @@ class FormulaEditorDialogTests(unittest.TestCase):
         self.dialog.formula_edit.setTextCursor(cursor)
         second = self.dialog.insert_signal_key("speed_G1_C2")
         self.assertEqual(first, second)
-        self.assertEqual(self.dialog.formula_edit.toPlainText(), "S001S001+ 2")
+        self.assertEqual(self.dialog.formula_edit.toPlainText(), "Vehicle SpeedVehicle Speed+ 2")
+        self.assertEqual(self.dialog.internal_formula(), "S001S001+ 2")
         self.assertEqual(self.dialog.binding_list.count(), 1)
 
     def test_distinct_same_name_keys_receive_distinct_tokens(self):
@@ -114,12 +118,16 @@ class FormulaEditorDialogTests(unittest.TestCase):
             with self.subTest(function=function):
                 self.dialog.formula_edit.clear()
                 self.dialog.insert_function(function)
-                self.dialog.formula_edit.insertPlainText("S001")
-                self.assertEqual(self.dialog.formula_edit.toPlainText(), f"{function}(S001)")
+                self.dialog.insert_signal_key("speed_G1_C2")
+                self.assertEqual(
+                    self.dialog.formula_edit.toPlainText(), f"{function}(Vehicle Speed)"
+                )
+                self.assertEqual(self.dialog.internal_formula(), f"{function}(S001)")
 
     def test_validation_success_and_failure_are_user_readable(self):
+        self.dialog.formula_edit.insert_normal_text("sqrt(abs(")
         self.dialog.insert_signal_key("speed_G1_C2")
-        self.dialog.formula_edit.setPlainText("sqrt(abs(S001))")
+        self.dialog.formula_edit.insert_normal_text("))")
         self.assertIsNotNone(self.dialog.validate_formula())
         self.assertIn("公式有效", self.dialog.diagnostic_output.toPlainText())
         self.dialog.formula_edit.setPlainText("(S001+")
@@ -164,9 +172,12 @@ class FormulaEditorMainWindowTests(unittest.TestCase):
         dialog = FormulaEditorDialog(
             self.window.signals, preview_callback=self.window._preview_formula_definition
         )
-        for key in keys:
-            dialog.insert_signal_key(key)
-        dialog.formula_edit.setPlainText(formula)
+        token_keys = {f"S{index + 1:03d}": key for index, key in enumerate(keys)}
+        for part in re.split(r"(S\d{3,})", formula):
+            if part in token_keys:
+                dialog.insert_signal_key(token_keys[part])
+            elif part:
+                dialog.formula_edit.insert_normal_text(part)
         dialog.name_edit.setText(name)
         dialog.unit_edit.setText(unit)
         dialog.exec = lambda: QDialog.DialogCode.Accepted
