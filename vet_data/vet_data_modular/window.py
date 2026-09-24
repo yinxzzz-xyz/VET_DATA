@@ -1,5 +1,7 @@
 """Merged VET_DATA main window."""
 
+import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,6 +13,10 @@ from .blf_slice_progress import (
     request_duplicate_selection,
 )
 from .calculated_signal import CalculationStatus
+from .calculated_signal_config import (
+    CalculatedSignalRestoreService,
+    serialize_calculated_signal_config,
+)
 from .calculation_engine import CalculationEngine
 from .collapsible import CollapsiblePanelsMixin
 from .legacy import baseline
@@ -34,6 +40,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._blf_slice_result = None
         self._close_after_load = False; self._close_after_blf_slice = False
         self.calculated_signal_definitions = {}
+        self._formula_restore_report = None
         self._formula_editor_dialog = None
         self.math_channel_button.setText("➕ 创建自定义公式计算通道")
         self.math_channel_button.setToolTip("使用多信号公式、数学函数、导数和积分创建通道")
@@ -58,6 +65,150 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             definition, validated, self._formula_resolver()
         )
 
+    def _register_calculated_result(self, definition, result):
+        """Publish one calculated result through the existing unified catalog."""
+        stable_id = definition.stable_id
+        self.custom_math_data[stable_id] = {
+            "timestamps": result.timestamps,
+            "samples": result.samples,
+            "unit": definition.result_unit,
+        }
+        self.signals[stable_id] = {
+            "name": stable_id,
+            "display_name": f"🧮 {definition.display_name}",
+            "group": -99,
+            "channel": -99,
+            "source": "Calculated",
+            "unit": definition.result_unit,
+            "comment": definition.comment,
+            "calculated_definition": definition.to_dict(),
+        }
+
+    def _signal_config_data(self):
+        config = serialize_calculated_signal_config(
+            tuple(self.calculated_signal_definitions.values())
+        )
+        config.update({
+            "selected_signals": self.get_selected_signals(),
+            "gps_lat_key": self.lat_combo.currentData(),
+            "gps_lon_key": self.lon_combo.currentData(),
+            "bus_config": {
+                str(bus_id): {
+                    "name": data.get("name", f"Bus {bus_id}"),
+                    "protocol": self.bus_protocols.get(bus_id, ""),
+                }
+                for bus_id, data in self.can_bus_data.items()
+            },
+        })
+        return config
+
+    def save_signal_config(self):
+        if not self.get_selected_signals() and not self.calculated_signal_definitions:
+            QMessageBox.warning(self, "保存", "未选择任何信号。")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存配置", "", "JSON Files (*.json)"
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", encoding="utf-8") as stream:
+                json.dump(self._signal_config_data(), stream, ensure_ascii=False, indent=4)
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", str(exc))
+
+    def _restore_calculated_channels(self, config_data):
+        """Restore definitions against current raw data, replacing managed IDs."""
+        managed_ids = set(self.calculated_signal_definitions)
+        base_catalog = {
+            key: value for key, value in self.signals.items() if key not in managed_ids
+        }
+        base_runtime = {
+            key: value for key, value in self.custom_math_data.items()
+            if key not in managed_ids
+        }
+        resolver = SignalResolver(
+            base_catalog,
+            data_source=self.mdf_file,
+            data_path=self.mdf_path,
+            can_data=self.can_parsed_data,
+            legacy_math_data=base_runtime,
+        )
+        report = CalculatedSignalRestoreService().restore(config_data, resolver)
+
+        for stable_id in managed_ids:
+            self.signals.pop(stable_id, None)
+            self.custom_math_data.pop(stable_id, None)
+        self.calculated_signal_definitions.clear()
+        self.calculated_signal_definitions.update(report.definitions)
+        for stable_id, result in report.results.items():
+            self._register_calculated_result(report.definitions[stable_id], result)
+        self._formula_restore_report = report
+        return report
+
+    def _apply_saved_bus_config(self, config_data):
+        for bus_id_str, config in config_data.get("bus_config", {}).items():
+            bus_id = int(bus_id_str)
+            if bus_id not in self.can_bus_data:
+                continue
+            self.can_bus_data[bus_id]["name"] = config.get("name", f"Bus {bus_id}")
+            protocol = config.get("protocol", "")
+            if protocol:
+                self.bus_protocols[bus_id] = protocol
+                self.db_per_bus.setdefault(bus_id, {})
+            if bus_id in self.bus_config_widgets:
+                widget = self.bus_config_widgets[bus_id]
+                widget.name_edit.setText(self.can_bus_data[bus_id]["name"])
+                if protocol:
+                    widget.protocol_label.setText(os.path.basename(protocol))
+                    widget.protocol_label.setStyleSheet("color: #27ae60; font-size: 9px;")
+                    widget.protocol_path = protocol
+
+    @staticmethod
+    def _restore_summary(report):
+        lines = [f"成功恢复：{len(report.results)}", f"失败：{len(report.failures)}"]
+        for stable_id, failure in report.failures.items():
+            definition = report.definitions.get(stable_id)
+            name = definition.display_name if definition else stable_id
+            lines.extend(("", f"{name}：", failure.message))
+        if report.migrated_legacy:
+            lines.extend(("", "已将旧二元计算配置迁移为 Config V2 定义。"))
+        return "\n".join(lines)
+
+    def load_signal_config(self):
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "加载信号配置", "", "JSON Files (*.json)"
+        )
+        if not file_name:
+            return
+        if not self.signals:
+            QMessageBox.warning(self, "错误", "请先加载数据文件，再加载配置。")
+            return
+        try:
+            with open(file_name, "r", encoding="utf-8") as stream:
+                config_data = json.load(stream)
+            report = self._restore_calculated_channels(config_data)
+            self._apply_saved_bus_config(config_data)
+            self.refresh_signal_list_ui()
+
+            selected_keys = set(config_data.get("selected_signals", ()))
+            for unique_key, widgets in self.signal_widgets.items():
+                widgets["checkbox"].setChecked(unique_key in selected_keys)
+            for combo, config_key in (
+                (self.lat_combo, "gps_lat_key"), (self.lon_combo, "gps_lon_key")
+            ):
+                saved_key = config_data.get(config_key)
+                index = combo.findData(saved_key) if saved_key else -1
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            self.plot_selected_signals()
+            summary = self._restore_summary(report)
+            if report.failures:
+                QMessageBox.warning(self, "计算通道恢复报告", summary)
+            else:
+                QMessageBox.information(self, "计算通道恢复报告", summary)
+        except Exception as exc:
+            QMessageBox.critical(self, "加载失败", f"配置文件解析或恢复失败: {exc}")
     def create_math_channel(self):
         """Open the V1 formula editor; the legacy binary dialog stays internal."""
         if not self.signals:
@@ -99,21 +250,8 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                     self, "计算失败", result.error or "公式计算失败"
                 )
                 return
-            self.custom_math_data[stable_id] = {
-                "timestamps": result.timestamps,
-                "samples": result.samples,
-                "unit": definition.result_unit,
-            }
             self.calculated_signal_definitions[stable_id] = definition
-            self.signals[stable_id] = {
-                "name": stable_id,
-                "display_name": f"🧮 {definition.display_name}",
-                "group": -99,
-                "channel": -99,
-                "source": "Calculated",
-                "comment": definition.comment,
-                "calculated_definition": definition.to_dict(),
-            }
+            self._register_calculated_result(definition, result)
             self.refresh_signal_list_ui()
             self.signal_widgets[stable_id]["checkbox"].setChecked(True)
             QMessageBox.information(
@@ -247,6 +385,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.signals.clear(); self.signals.update(result.signals)
         self.can_parsed_data.clear(); self.bus_signal_map.clear(); self.custom_math_data.clear()
         self.calculated_signal_definitions.clear()
+        self._formula_restore_report = None
         self.can_bus_data.clear(); self.db_per_bus.clear(); self.bus_protocols.clear(); self.can_bus_signals.clear()
         self.clear_bus_config(); self._sig_value_cache.clear(); self._user_signal_order.clear()
         self.refresh_signal_list_ui(); self.load_config()

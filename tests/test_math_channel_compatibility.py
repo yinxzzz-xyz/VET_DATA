@@ -194,7 +194,7 @@ class LegacyMathChannelCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder, "config.json")
             with patch.object(baseline.QFileDialog, "getSaveFileName", return_value=(str(path), "")):
-                self.window.save_signal_config()
+                baseline.MDFPlotter.save_signal_config(self.window)
             saved = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(saved["selected_signals"], ["MATH_sum"])
         self.assertEqual(saved["math_channels"]["MATH_sum"]["op"], "+")
@@ -213,13 +213,13 @@ class LegacyMathChannelCompatibilityTests(unittest.TestCase):
             reversed_path.write_text(json.dumps({"selected_signals": [], "math_channels": {"MATH_second": second, "MATH_first": first}}), encoding="utf-8")
             with patch.object(baseline.QFileDialog, "getOpenFileName", return_value=(str(ordered), "")), \
                  patch.object(self.window, "plot_selected_signals"):
-                self.window.load_signal_config()
+                baseline.MDFPlotter.load_signal_config(self.window)
             self.assertIn("MATH_second", self.window.signals)
             self.window.signals.pop("MATH_first"); self.window.signals.pop("MATH_second")
             self.window.custom_math_data.clear()
             with patch.object(baseline.QFileDialog, "getOpenFileName", return_value=(str(reversed_path), "")), \
                  patch.object(self.window, "plot_selected_signals"):
-                self.window.load_signal_config()
+                baseline.MDFPlotter.load_signal_config(self.window)
         self.assertIn("MATH_first", self.window.signals)
         self.assertNotIn("MATH_second", self.window.signals)
 

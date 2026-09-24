@@ -111,8 +111,10 @@ class SignalResolver:
         data_key = signal_key if signal_key in self.legacy_math_data else name
         if data_key in self.legacy_math_data:
             item = self.legacy_math_data[data_key]
+            unit = item["unit"] if "unit" in item else (info.get("unit") or "Math")
             signal = Signal(
-                samples=item["samples"], timestamps=item["timestamps"], name=name, unit="Math"
+                samples=item["samples"], timestamps=item["timestamps"], name=name,
+                unit=str(unit or ""),
             )
             return self._result(signal_key, info, signal, SignalSource.LEGACY_MATH)
 
