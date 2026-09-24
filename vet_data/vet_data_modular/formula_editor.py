@@ -39,6 +39,7 @@ class AtomicFormulaEdit(QTextEdit):
         self._next_atom_id = 1
         self._known_bindings = set()
         self._adjusting_cursor = False
+        self._pending_delete = None
         self.textChanged.connect(self.atomsChanged)
         self.cursorPositionChanged.connect(self._keep_cursor_out_of_atom)
 
@@ -53,7 +54,7 @@ class AtomicFormulaEdit(QTextEdit):
         char_format.setBackground(QColor("#d9ecff"))
         char_format.setForeground(QColor("#0b4f87"))
         char_format.setFontWeight(600)
-        cursor = self.textCursor()
+        cursor = self._prepare_insertion_cursor()
         cursor.insertText(label, char_format)
         cursor.setCharFormat(QTextCharFormat())
         self.setTextCursor(cursor)
@@ -61,8 +62,7 @@ class AtomicFormulaEdit(QTextEdit):
         self.atomsChanged.emit()
 
     def insert_normal_text(self, text: str, cursor_back: int = 0):
-        cursor = self.textCursor()
-        cursor.setCharFormat(QTextCharFormat())
+        cursor = self._prepare_insertion_cursor()
         cursor.insertText(text)
         if cursor_back:
             cursor.movePosition(QTextCursor.MoveOperation.Left, n=cursor_back)
@@ -203,6 +203,7 @@ class AtomicFormulaEdit(QTextEdit):
             self.copy()
             return
         if event.matches(QKeySequence.StandardKey.Paste):
+            self._clear_pending_delete()
             self.paste()
             return
         if event.matches(QKeySequence.StandardKey.Cut):
@@ -211,34 +212,93 @@ class AtomicFormulaEdit(QTextEdit):
             self._expand_selection_to_atoms(cursor)
             cursor.removeSelectedText()
             self.setTextCursor(cursor)
+            self._clear_pending_delete()
+            self._reset_typing_format()
             self.atomsChanged.emit()
             return
+
         key = event.key()
         cursor = self.textCursor()
+        no_modifier = event.modifiers() == Qt.KeyboardModifier.NoModifier
+        if no_modifier and key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            if cursor.hasSelection():
+                position = (
+                    cursor.selectionStart() if key == Qt.Key.Key_Left
+                    else cursor.selectionEnd()
+                )
+                cursor.setPosition(position)
+                self.setTextCursor(cursor)
+                self._clear_pending_delete()
+                self._reset_typing_format()
+                return
+            position = cursor.position()
+            atom = (
+                self._atom_ending_at(position) if key == Qt.Key.Key_Left
+                else self._atom_starting_at(position)
+            )
+            if atom is not None:
+                cursor.setPosition(atom[0] if key == Qt.Key.Key_Left else atom[1])
+                self.setTextCursor(cursor)
+                self._clear_pending_delete()
+                self._reset_typing_format()
+                return
+            self._clear_pending_delete()
+            super().keyPressEvent(event)
+            self._reset_typing_format()
+            return
+
         if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
             if cursor.hasSelection():
                 atom = self._exact_selected_atom(cursor)
-                if atom is not None:
+                pending = None if atom is None else (atom[4], key)
+                if atom is not None and self._pending_delete == pending:
                     cursor.removeSelectedText()
                     self.setTextCursor(cursor)
+                    self._clear_pending_delete()
+                    self._reset_typing_format()
                     self.atomsChanged.emit()
+                    return
+                if atom is not None:
+                    self._pending_delete = pending
+                    self._select_atom(atom)
                     return
                 self._expand_selection_to_atoms(cursor)
                 self.setTextCursor(cursor)
+                self._clear_pending_delete()
                 super().keyPressEvent(event)
+                self._reset_typing_format()
                 return
             position = cursor.position()
-            atom = self._atom_ending_at(position) if key == Qt.Key.Key_Backspace else self._atom_starting_at(position)
+            atom = (
+                self._atom_ending_at(position) if key == Qt.Key.Key_Backspace
+                else self._atom_starting_at(position)
+            )
             if atom is not None:
                 self._select_atom(atom)
+                self._pending_delete = (atom[4], key)
                 return
             inside = self._atom_containing(position)
             if inside is not None:
                 self._select_atom(inside)
+                self._pending_delete = (inside[4], key)
                 return
+            self._clear_pending_delete()
+            super().keyPressEvent(event)
+            self._reset_typing_format()
+            return
+
+        if event.text() and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            cursor = self._prepare_insertion_cursor()
+            self.setTextCursor(cursor)
+            super().keyPressEvent(event)
+            self._reset_typing_format()
+            return
+
+        self._clear_pending_delete()
         super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
+        self._clear_pending_delete()
         cursor = self.cursorForPosition(event.position().toPoint())
         atom = self._atom_containing(cursor.position())
         if atom is not None:
@@ -246,6 +306,32 @@ class AtomicFormulaEdit(QTextEdit):
             event.accept()
             return
         super().mousePressEvent(event)
+        self._reset_typing_format()
+
+    def _prepare_insertion_cursor(self):
+        cursor = self.textCursor()
+        atom = self._exact_selected_atom(cursor) if cursor.hasSelection() else None
+        if atom is not None:
+            if self._pending_delete == (atom[4], Qt.Key.Key_Delete):
+                cursor.setPosition(atom[0])
+            else:
+                cursor.setPosition(atom[1])
+        elif cursor.hasSelection():
+            self._expand_selection_to_atoms(cursor)
+            cursor.removeSelectedText()
+        self._clear_pending_delete()
+        cursor.setCharFormat(QTextCharFormat())
+        self.setTextCursor(cursor)
+        return cursor
+
+    def _reset_typing_format(self):
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            cursor.setCharFormat(QTextCharFormat())
+            self.setTextCursor(cursor)
+
+    def _clear_pending_delete(self):
+        self._pending_delete = None
 
     def _keep_cursor_out_of_atom(self):
         if self._adjusting_cursor:
@@ -253,6 +339,7 @@ class AtomicFormulaEdit(QTextEdit):
         cursor = self.textCursor()
         if cursor.hasSelection():
             return
+        self._clear_pending_delete()
         atom = self._atom_containing(cursor.position(), strict=True)
         if atom is None:
             return
