@@ -170,7 +170,8 @@ class FormulaEditorMainWindowTests(unittest.TestCase):
 
     def _dialog(self, name, formula, keys, unit=""):
         dialog = FormulaEditorDialog(
-            self.window.signals, preview_callback=self.window._preview_formula_definition
+            self.window.signals, preview_callback=self.window._preview_formula_definition,
+            background_calculation=False,
         )
         token_keys = {f"S{index + 1:03d}": key for index, key in enumerate(keys)}
         for part in re.split(r"(S\d{3,})", formula):
@@ -246,7 +247,8 @@ class FormulaEditorMainWindowTests(unittest.TestCase):
         self._create(self._dialog("First Calc", "S001+S002", ["A", "B"]))
         first_key = next(iter(self.window.calculated_signal_definitions))
         second = FormulaEditorDialog(
-            self.window.signals, preview_callback=self.window._preview_formula_definition
+            self.window.signals, preview_callback=self.window._preview_formula_definition,
+            background_calculation=False,
         )
         try:
             second.filter_signals("first calc")

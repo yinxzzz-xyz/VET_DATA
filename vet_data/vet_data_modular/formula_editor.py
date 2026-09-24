@@ -17,6 +17,7 @@ from .calculated_signal import (
 )
 from .formula_parser import FormulaError
 from .formula_validator import ALLOWED_FUNCTIONS, parse_and_validate_formula
+from .workers import FormulaCalculationWorker
 
 
 SIGNAL_KEY_ROLE = Qt.ItemDataRole.UserRole
@@ -397,10 +398,21 @@ class FormulaEditorDialog(QDialog):
         available_signals: Mapping[str, Mapping],
         parent=None,
         preview_callback: Callable[[CalculatedSignalDefinition], CalculatedSignalResult] | None = None,
+        background_callback: Callable[[CalculatedSignalDefinition, object], CalculatedSignalResult] | None = None,
+        context_callback: Callable[[], object] | None = None,
+        background_calculation: bool = True,
     ):
         super().__init__(parent)
         self.available_signals = available_signals
         self.preview_callback = preview_callback
+        self.background_callback = background_callback
+        self.context_callback = context_callback
+        self.background_calculation = background_calculation
+        self.generated_definition = None
+        self.generated_result = None
+        self.generated_context = None
+        self._calculation_worker = None
+        self._closed_during_calculation = False
         self.signal_tokens: dict[str, str] = {}
         self._key_tokens: dict[str, str] = {}
         self._syncing_atoms = False
@@ -621,19 +633,12 @@ class FormulaEditorDialog(QDialog):
             comment=f"公式计算: {validated.normalized_formula}",
         )
 
-    def preview_formula(self):
-        definition = self.build_definition("__preview__")
-        if definition is None:
-            return None
-        if self.preview_callback is None:
-            self.diagnostic_output.setPlainText("✗ 预览服务不可用")
-            return None
-        result = self.preview_callback(definition)
+    def _format_preview_result(self, definition, result):
         if result.status is not CalculationStatus.SUCCESS:
             self.diagnostic_output.setPlainText(
                 f"✗ 预览失败：{result.error or '计算失败'}\n诊断：{result.diagnostics}"
             )
-            return result
+            return
         diagnostics = result.diagnostics
         finite = result.samples[np.isfinite(result.samples)]
         lines = [
@@ -647,11 +652,93 @@ class FormulaEditorDialog(QDialog):
         if finite.size:
             lines.extend((f"最小值：{finite.min()}", f"最大值：{finite.max()}"))
         self.diagnostic_output.setPlainText("\n".join(lines))
+
+    def _set_calculation_busy(self, busy):
+        self.preview_button.setEnabled(not busy)
+        self.generate_button.setEnabled(not busy)
+        self.validate_button.setEnabled(not busy)
+
+    def _start_calculation(self, definition, purpose):
+        if self._calculation_worker is not None and self._calculation_worker.isRunning():
+            return self._calculation_worker
+        context = self.context_callback() if self.context_callback else None
+        self._set_calculation_busy(True)
+        self.diagnostic_output.setPlainText("正在计算……")
+        calculation = self.preview_callback
+        if self.background_callback is not None:
+            validated = self._validated
+            calculation = lambda item: self.background_callback(item, validated)
+        worker = FormulaCalculationWorker(definition, calculation)
+        self._calculation_worker = worker
+        worker.completed.connect(
+            lambda result: self._calculation_completed(definition, result, purpose, context)
+        )
+        worker.failed.connect(lambda message: self._calculation_failed(message, context))
+        worker.finished.connect(self._calculation_finished)
+        worker.start_tracked()
+        return worker
+
+    def _context_is_current(self, context):
+        return self.context_callback is None or self.context_callback() == context
+
+    def _calculation_completed(self, definition, result, purpose, context):
+        if self._closed_during_calculation or not self._context_is_current(context):
+            return
+        if purpose == "preview":
+            self._format_preview_result(definition, result)
+            return
+        if result.status is not CalculationStatus.SUCCESS:
+            self.diagnostic_output.setPlainText(
+                f"✗ 计算失败：{result.error or '计算失败'}\n诊断：{result.diagnostics}"
+            )
+            return
+        self.generated_definition = definition
+        self.generated_result = result
+        self.generated_context = context
+        self.accept()
+
+    def _calculation_failed(self, message, context):
+        if not self._closed_during_calculation and self._context_is_current(context):
+            self.diagnostic_output.setPlainText(f"✗ 计算失败：{message}")
+
+    def _calculation_finished(self):
+        self._calculation_worker = None
+        if not self._closed_during_calculation:
+            self._set_calculation_busy(False)
+
+    def preview_formula(self):
+        definition = self.build_definition("__preview__")
+        if definition is None:
+            return None
+        if self.preview_callback is None:
+            self.diagnostic_output.setPlainText("✗ 预览服务不可用")
+            return None
+        if self.background_calculation:
+            return self._start_calculation(definition, "preview")
+        result = self.preview_callback(definition)
+        self._format_preview_result(definition, result)
         return result
 
     def _accept_if_valid(self):
         if not self.name_edit.text().strip():
             self.diagnostic_output.setPlainText("✗ 新信号名称不能为空")
             return
-        if self.validate_formula() is not None:
+        definition = self.build_definition("__generate__")
+        if definition is None:
+            return
+        if self.preview_callback is not None and self.background_calculation:
+            self._start_calculation(definition, "generate")
+        else:
             self.accept()
+
+    def reject(self):
+        self._closed_during_calculation = bool(
+            self._calculation_worker is not None and self._calculation_worker.isRunning()
+        )
+        super().reject()
+
+    def closeEvent(self, event):
+        self._closed_during_calculation = bool(
+            self._calculation_worker is not None and self._calculation_worker.isRunning()
+        )
+        super().closeEvent(event)

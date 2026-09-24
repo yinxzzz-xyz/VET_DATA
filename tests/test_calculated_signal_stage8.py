@@ -49,6 +49,7 @@ class FormulaConfigLifecycleTests(unittest.TestCase):
         self.window.signals.clear()
         self.window.custom_math_data.clear()
         self.window.calculated_signal_definitions.clear()
+        self.window._formula_restore_background_enabled = False
         self._raw("A", [1, 2, 3])
         self._raw("B", [2, 2, 2])
         self._raw("C", [2, 2, 2])

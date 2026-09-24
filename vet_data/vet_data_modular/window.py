@@ -1,6 +1,7 @@
 """Merged VET_DATA main window."""
 
 import json
+from dataclasses import replace
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -27,7 +28,7 @@ from .math_channel import SearchableMathChannelDialog  # retains legacy compatib
 from .plot_panel import PlotPanelMixin
 from .signal_panel import SignalPanelMixin
 from .signal_resolver import SignalResolver
-from .workers import BusyLoadDialog, DataLoadWorker
+from .workers import BusyLoadDialog, DataLoadWorker, FormulaRestoreWorker
 
 
 class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, baseline.MDFPlotter):
@@ -41,11 +42,18 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._close_after_load = False; self._close_after_blf_slice = False
         self.calculated_signal_definitions = {}
         self._formula_restore_report = None
+        self._formula_context_generation = 0
+        self._formula_restore_worker = None
+        self._formula_restore_background_enabled = True
+        self._close_after_formula_restore = False
         self._formula_editor_dialog = None
         self.math_channel_button.setText("➕ 创建自定义公式计算通道")
         self.math_channel_button.setToolTip("使用多信号公式、数学函数、导数和积分创建通道")
         self._setup_signal_panel(); self._setup_plot_panel(); self._setup_collapsible_panels()
         self._setup_blf_slice_entry()
+
+    def _formula_context_token(self):
+        return (self._formula_context_generation, self.mdf_path, id(self.mdf_file))
 
     def _formula_resolver(self):
         return SignalResolver(
@@ -56,6 +64,9 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             legacy_math_data=self.custom_math_data,
         )
 
+    @staticmethod
+    def _calculate_formula_definition(definition, validated, resolver):
+        return CalculationEngine().calculate(definition, validated, resolver)
     def _preview_formula_definition(self, definition):
         validated = parse_and_validate_formula(
             definition.normalized_formula or definition.user_formula,
@@ -117,25 +128,21 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", str(exc))
 
-    def _restore_calculated_channels(self, config_data):
-        """Restore definitions against current raw data, replacing managed IDs."""
+    def _formula_restore_inputs(self):
         managed_ids = set(self.calculated_signal_definitions)
-        base_catalog = {
-            key: value for key, value in self.signals.items() if key not in managed_ids
-        }
-        base_runtime = {
-            key: value for key, value in self.custom_math_data.items()
-            if key not in managed_ids
-        }
         resolver = SignalResolver(
-            base_catalog,
+            {key: value for key, value in self.signals.items() if key not in managed_ids},
             data_source=self.mdf_file,
             data_path=self.mdf_path,
             can_data=self.can_parsed_data,
-            legacy_math_data=base_runtime,
+            legacy_math_data={
+                key: value for key, value in self.custom_math_data.items()
+                if key not in managed_ids
+            },
         )
-        report = CalculatedSignalRestoreService().restore(config_data, resolver)
+        return managed_ids, resolver
 
+    def _apply_formula_restore_report(self, report, managed_ids):
         for stable_id in managed_ids:
             self.signals.pop(stable_id, None)
             self.custom_math_data.pop(stable_id, None)
@@ -144,8 +151,13 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         for stable_id, result in report.results.items():
             self._register_calculated_result(report.definitions[stable_id], result)
         self._formula_restore_report = report
-        return report
 
+    def _restore_calculated_channels(self, config_data):
+        """Synchronous service entry retained for tests and non-GUI callers."""
+        managed_ids, resolver = self._formula_restore_inputs()
+        report = CalculatedSignalRestoreService().restore(config_data, resolver)
+        self._apply_formula_restore_report(report, managed_ids)
+        return report
     def _apply_saved_bus_config(self, config_data):
         for bus_id_str, config in config_data.get("bus_config", {}).items():
             bus_id = int(bus_id_str)
@@ -175,7 +187,45 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             lines.extend(("", "已将旧二元计算配置迁移为 Config V2 定义。"))
         return "\n".join(lines)
 
+    def _finish_loaded_config(self, report, managed_ids, config_data, context):
+        if context != self._formula_context_token():
+            return
+        self._apply_formula_restore_report(report, managed_ids)
+        self._apply_saved_bus_config(config_data)
+        self.refresh_signal_list_ui()
+        selected_keys = set(config_data.get("selected_signals", ()))
+        for unique_key, widgets in self.signal_widgets.items():
+            widgets["checkbox"].setChecked(unique_key in selected_keys)
+        for combo, config_key in (
+            (self.lat_combo, "gps_lat_key"), (self.lon_combo, "gps_lon_key")
+        ):
+            saved_key = config_data.get(config_key)
+            index = combo.findData(saved_key) if saved_key else -1
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        self.plot_selected_signals()
+        summary = self._restore_summary(report)
+        if report.failures:
+            QMessageBox.warning(self, "计算通道恢复报告", summary)
+        else:
+            QMessageBox.information(self, "计算通道恢复报告", summary)
+
+    def _formula_restore_failed(self, message, context):
+        if context == self._formula_context_token():
+            QMessageBox.critical(self, "加载失败", f"配置文件解析或恢复失败: {message}")
+
+    def _formula_restore_finished(self):
+        self._formula_restore_worker = None
+        loading_data = self._data_load_worker is not None and self._data_load_worker.isRunning()
+        self.load_config_button.setEnabled(not loading_data)
+        self.load_config_button.setText("加载配置")
+        if self._close_after_formula_restore:
+            self._close_after_formula_restore = False
+            self.close()
+
     def load_signal_config(self):
+        if self._formula_restore_worker is not None and self._formula_restore_worker.isRunning():
+            return
         file_name, _ = QFileDialog.getOpenFileName(
             self, "加载信号配置", "", "JSON Files (*.json)"
         )
@@ -187,26 +237,26 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         try:
             with open(file_name, "r", encoding="utf-8") as stream:
                 config_data = json.load(stream)
-            report = self._restore_calculated_channels(config_data)
-            self._apply_saved_bus_config(config_data)
-            self.refresh_signal_list_ui()
-
-            selected_keys = set(config_data.get("selected_signals", ()))
-            for unique_key, widgets in self.signal_widgets.items():
-                widgets["checkbox"].setChecked(unique_key in selected_keys)
-            for combo, config_key in (
-                (self.lat_combo, "gps_lat_key"), (self.lon_combo, "gps_lon_key")
-            ):
-                saved_key = config_data.get(config_key)
-                index = combo.findData(saved_key) if saved_key else -1
-                if index >= 0:
-                    combo.setCurrentIndex(index)
-            self.plot_selected_signals()
-            summary = self._restore_summary(report)
-            if report.failures:
-                QMessageBox.warning(self, "计算通道恢复报告", summary)
-            else:
-                QMessageBox.information(self, "计算通道恢复报告", summary)
+            managed_ids, resolver = self._formula_restore_inputs()
+            context = self._formula_context_token()
+            if not self._formula_restore_background_enabled:
+                report = CalculatedSignalRestoreService().restore(config_data, resolver)
+                self._finish_loaded_config(report, managed_ids, config_data, context)
+                return
+            self.load_config_button.setEnabled(False)
+            self.load_config_button.setText("正在恢复……")
+            worker = FormulaRestoreWorker(config_data, resolver)
+            self._formula_restore_worker = worker
+            worker.completed.connect(
+                lambda report: self._finish_loaded_config(
+                    report, managed_ids, config_data, context
+                )
+            )
+            worker.failed.connect(
+                lambda message: self._formula_restore_failed(message, context)
+            )
+            worker.finished.connect(self._formula_restore_finished)
+            worker.start_tracked()
         except Exception as exc:
             QMessageBox.critical(self, "加载失败", f"配置文件解析或恢复失败: {exc}")
     def create_math_channel(self):
@@ -215,7 +265,13 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             QMessageBox.warning(self, "计算通道", "当前未加载任何有效数据文件。")
             return
         dialog = FormulaEditorDialog(
-            self.signals, self, preview_callback=self._preview_formula_definition
+            self.signals,
+            self,
+            preview_callback=self._preview_formula_definition,
+            background_callback=lambda definition, validated: self._calculate_formula_definition(
+                definition, validated, self._formula_resolver()
+            ),
+            context_callback=self._formula_context_token,
         )
         self._formula_editor_dialog = dialog
         try:
@@ -240,11 +296,19 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                 )
                 return
             stable_id = f"CALC_{uuid4().hex}"
-            definition = dialog.build_definition(stable_id)
-            if definition is None:
-                QMessageBox.warning(self, "公式错误", dialog.diagnostic_output.toPlainText())
-                return
-            result = self._preview_formula_definition(definition)
+            if dialog.generated_result is not None:
+                if dialog.generated_context != self._formula_context_token():
+                    QMessageBox.warning(self, "计算已失效", "数据文件已变化，旧计算结果已丢弃。")
+                    return
+                definition = replace(dialog.generated_definition, stable_id=stable_id)
+                result = dialog.generated_result
+            else:
+                # Compatibility path for non-interactive tests/custom dialog subclasses.
+                definition = dialog.build_definition(stable_id)
+                if definition is None:
+                    QMessageBox.warning(self, "公式错误", dialog.diagnostic_output.toPlainText())
+                    return
+                result = self._preview_formula_definition(definition)
             if result.status is not CalculationStatus.SUCCESS:
                 QMessageBox.critical(
                     self, "计算失败", result.error or "公式计算失败"
@@ -363,6 +427,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         suffix = Path(path).suffix.lower()
         if suffix in {".blf", ".asc", ".trc"}:
             # CAN parsing already has the baseline's determinate ParseWorker dialog.
+            self._formula_context_generation += 1
             self.mdf_path = path; self.current_file_label.setText(f"当前文件: {Path(path).name}")
             self.load_can_bus_info(path); self.create_bus_config_ui()
             return
@@ -380,6 +445,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         if old is not None and hasattr(old, "close"):
             try: old.close()
             except Exception: pass
+        self._formula_context_generation += 1
         self.mdf_path = result.path; self.mdf_file = result.data
         self.current_file_label.setText(f"当前文件: {Path(result.path).name}")
         self.signals.clear(); self.signals.update(result.signals)
@@ -406,6 +472,13 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             self._close_after_blf_slice = True
             if self._blf_slice_progress is not None:
                 self._blf_slice_progress.phase_label.setText("正在安全停止 BLF 切片…")
+            event.ignore()
+            return
+        if self._formula_restore_worker is not None and self._formula_restore_worker.isRunning():
+            if not self._close_after_formula_restore:
+                self._close_after_formula_restore = True
+                self._formula_restore_worker.finished.connect(self.close)
+            self.load_config_button.setText("正在安全完成配置恢复……")
             event.ignore()
             return
         if self._data_load_worker is not None and self._data_load_worker.isRunning():

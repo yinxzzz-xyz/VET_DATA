@@ -15,7 +15,11 @@ hiddenimports = (
         "openpyxl.cell._writer",
     ]
 )
-datas = collect_data_files("pyqtgraph") + collect_data_files("canmatrix")
+datas = (
+    collect_data_files("pyqtgraph")
+    + collect_data_files("canmatrix")
+    + [("assets/VET_DATA.ico", "assets")]
+)
 
 a = Analysis(
     ["vet_data/VET_DATA_merged.py"],
@@ -38,6 +42,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="VET_DATA",
+    icon="assets/VET_DATA.ico",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

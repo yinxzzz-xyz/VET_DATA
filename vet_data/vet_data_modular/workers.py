@@ -101,3 +101,51 @@ class BusyLoadDialog(QDialog):
         layout = QVBoxLayout(self); self.label = QLabel("正在读取文件…"); layout.addWidget(self.label)
         bar = QProgressBar(); bar.setRange(0, 0); layout.addWidget(bar)
     def set_status(self, text): self.label.setText(text)
+_ACTIVE_FORMULA_WORKERS = set()
+
+
+class FormulaCalculationWorker(QThread):
+    """Run pure formula parsing/resolution/alignment/calculation off the GUI thread."""
+
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, definition, calculation):
+        super().__init__()
+        self.definition = definition
+        self.calculation = calculation
+
+    def run(self):
+        try:
+            self.completed.emit(self.calculation(self.definition))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def start_tracked(self):
+        _ACTIVE_FORMULA_WORKERS.add(self)
+        self.finished.connect(lambda: _ACTIVE_FORMULA_WORKERS.discard(self))
+        self.start()
+class FormulaRestoreWorker(QThread):
+    """Run a complete dependency restore session without touching widgets."""
+
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, config_data, resolver):
+        super().__init__()
+        self.config_data = config_data
+        self.resolver = resolver
+
+    def run(self):
+        try:
+            from .calculated_signal_config import CalculatedSignalRestoreService
+            self.completed.emit(
+                CalculatedSignalRestoreService().restore(self.config_data, self.resolver)
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def start_tracked(self):
+        _ACTIVE_FORMULA_WORKERS.add(self)
+        self.finished.connect(lambda: _ACTIVE_FORMULA_WORKERS.discard(self))
+        self.start()
