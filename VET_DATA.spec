@@ -1,8 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
 """Reproducible Windows one-directory build for the supported GUI launcher."""
 
+from pathlib import Path
+
+import PyQt6
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
+
+qt_bin_dir = Path(PyQt6.__file__).resolve().parent / "Qt6" / "bin"
+qt_vc_runtime_names = (
+    "msvcp140_atomic_wait.dll",
+    "msvcp140_codecvt_ids.dll",
+    "vcruntime140_threads.dll",
+    "concrt140.dll",
+)
+qt_vc_runtime_binaries = [
+    (str(qt_bin_dir / name), "PyQt6/Qt6/bin")
+    for name in qt_vc_runtime_names
+]
 
 hiddenimports = (
     collect_submodules("can.io")
@@ -24,7 +39,7 @@ datas = (
 a = Analysis(
     ["vet_data/VET_DATA_merged.py"],
     pathex=["vet_data"],
-    binaries=[],
+    binaries=qt_vc_runtime_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
