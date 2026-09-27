@@ -23,6 +23,7 @@ from .blf_slice_service import (
     select_blf_candidates, validate_task,
 )
 from .blf_slice_time import build_condition_time_window
+from .theme import DEFAULT_THEME, build_blf_slice_stylesheet
 
 
 LOGGER = logging.getLogger(__name__)
@@ -202,10 +203,22 @@ class BlfSliceProgressDialog(QDialog):
         self.worker = worker
         self.setWindowTitle("BLF 工况切片进度")
         self.setModal(False)
-        self.setMinimumWidth(520)
+        self.setProperty("uiDialog", "blfSlice")
+        self.setMinimumSize(520, 190)
+        self.resize(620, 220)
+        self.setStyleSheet(build_blf_slice_stylesheet(DEFAULT_THEME))
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+        )
+        layout.setSpacing(DEFAULT_THEME.spacing.small)
         self.phase_label, self.file_label = QLabel("准备开始…"), QLabel("")
+        self.phase_label.setProperty("uiTextRole", "status")
+        self.file_label.setProperty("uiTextRole", "secondary")
+        self.file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.progress, self.cancel_button = QProgressBar(), QPushButton("取消")
+        self.cancel_button.setProperty("uiRole", "secondary")
         self.progress.setRange(0, 0)
         for widget in (self.phase_label, self.file_label, self.progress, self.cancel_button):
             layout.addWidget(widget)
@@ -215,6 +228,7 @@ class BlfSliceProgressDialog(QDialog):
 
     def set_progress(self, value, total, path):
         self.file_label.setText(path)
+        self.file_label.setToolTip(path)
         if total > 0:
             self.progress.setRange(0, total)
             self.progress.setValue(value)
@@ -249,13 +263,33 @@ class BlfSliceResultDialog(QDialog):
         super().__init__(parent)
         self.result = result
         self.setWindowTitle("BLF 工况切片结果")
+        self.setProperty("uiDialog", "blfSlice")
+        self.setMinimumSize(760, 420)
         self.resize(980, 480)
+        self.setStyleSheet(build_blf_slice_stylesheet(DEFAULT_THEME))
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(f"任务状态：{result.status.value}"))
-        layout.addWidget(QLabel(f"输出目录：{result.task.output_dir}"))
-        layout.addWidget(QLabel(f"报告位置：{result.report_path or '未生成'}"))
+        layout.setContentsMargins(
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+        )
+        layout.setSpacing(DEFAULT_THEME.spacing.small)
+        self.status_label = QLabel(f"任务状态：{result.status.value}")
+        self.output_label = QLabel(f"输出目录：{result.task.output_dir}")
+        self.report_label = QLabel(f"报告位置：{result.report_path or '未生成'}")
+        self.status_label.setProperty("uiTextRole", "status")
+        for label in (self.output_label, self.report_label):
+            label.setProperty("uiTextRole", "secondary")
+            label.setToolTip(label.text())
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.output_label)
+        layout.addWidget(self.report_label)
         self.table = QTableWidget(len(result.condition_results), len(self.HEADERS))
+        self.table.setObjectName("blfResultTable")
         self.table.setHorizontalHeaderLabels(self.HEADERS)
+        self.table.setAlternatingRowColors(True)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.table.verticalHeader().setDefaultSectionSize(30)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         for row, condition_result in enumerate(result.condition_results):
@@ -270,6 +304,7 @@ class BlfSliceResultDialog(QDialog):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(value)
                 self.table.setItem(row, column, item)
         layout.addWidget(self.table, 1)
         if result.warnings:
@@ -277,5 +312,8 @@ class BlfSliceResultDialog(QDialog):
         if result.errors:
             layout.addWidget(QLabel("任务错误：" + "；".join(result.errors)))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setProperty(
+            "uiRole", "secondary"
+        )
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)

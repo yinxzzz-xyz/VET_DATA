@@ -9,14 +9,15 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QButtonGroup, QComboBox, QDialog, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+    QGroupBox, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
     QPushButton, QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QScrollArea,
 )
 
 from .blf_slice_models import InputMode, SliceTask
 from .blf_slice_service import resolve_output_directory, validate_task
 from .blf_slice_table import TableParseError, TableParseResult, parse_condition_table
+from .theme import DEFAULT_THEME, build_blf_slice_stylesheet
 
 
 OTHER_OFFSET = "other"
@@ -84,27 +85,52 @@ class DuplicateSelectionDialog(QDialog):
         self.groups = tuple(groups)
         self.setWindowTitle("确认重复 BLF")
         self.setModal(True)
+        self.setProperty("uiDialog", "blfSlice")
+        self.setMinimumSize(560, 360)
+        self.resize(760, 480)
+        self.setStyleSheet(build_blf_slice_stylesheet(DEFAULT_THEME))
         root = QVBoxLayout(self)
-        root.addWidget(QLabel("每个重复组必须选择一个保留文件；原文件不会被修改。"))
+        root.setContentsMargins(
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+        )
+        root.setSpacing(DEFAULT_THEME.spacing.small)
+        guidance = QLabel("每个重复组必须选择一个保留文件；原文件不会被修改。")
+        guidance.setProperty("uiTextRole", "secondary")
+        root.addWidget(guidance)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        group_container = QWidget()
+        group_layout = QVBoxLayout(group_container)
+        group_layout.setContentsMargins(0, 0, 0, 0)
+        group_layout.setSpacing(DEFAULT_THEME.spacing.small)
         self._groups = []
         for index, group in enumerate(self.groups, 1):
             box = QGroupBox(f"重复组 {index}（{group.size} 字节）")
+            box.setProperty("uiBlfSection", "true")
             layout, buttons = QVBoxLayout(box), QButtonGroup(self)
             buttons.setExclusive(True)
             for path in group.paths:
                 button = QRadioButton(str(path))
                 button.setProperty("blf_path", path)
+                button.setToolTip(str(path))
                 layout.addWidget(button)
                 buttons.addButton(button)
             self._groups.append(buttons)
-            root.addWidget(box)
+            group_layout.addWidget(box)
+        group_layout.addStretch()
+        scroll.setWidget(group_container)
+        root.addWidget(scroll, 1)
         actions = QHBoxLayout()
         actions.addStretch()
-        ok, cancel = QPushButton("继续"), QPushButton("取消任务")
-        ok.clicked.connect(self._accept_if_complete)
-        cancel.clicked.connect(self.reject)
-        actions.addWidget(ok)
-        actions.addWidget(cancel)
+        self.continue_button = QPushButton("继续")
+        self.cancel_button = QPushButton("取消任务")
+        self.continue_button.setProperty("uiRole", "primary")
+        self.cancel_button.setProperty("uiRole", "secondary")
+        self.continue_button.clicked.connect(self._accept_if_complete)
+        self.cancel_button.clicked.connect(self.reject)
+        actions.addWidget(self.continue_button)
+        actions.addWidget(self.cancel_button)
         root.addLayout(actions)
 
     def choices(self) -> dict[int, Path]:
@@ -129,24 +155,48 @@ class BlfSliceDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("BLF 工况切片")
         self.setModal(False)
-        self.resize(1050, 620)
+        self.setProperty("uiDialog", "blfSlice")
+        self.setMinimumSize(820, 560)
+        self.resize(1050, 680)
+        self.setStyleSheet(build_blf_slice_stylesheet(DEFAULT_THEME))
         self._table_result: TableParseResult | None = None
         root = QVBoxLayout(self)
-        input_box, form = QGroupBox("输入"), QFormLayout()
-        input_box.setLayout(form)
+        root.setContentsMargins(
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+        )
+        root.setSpacing(DEFAULT_THEME.spacing.small)
+        self.input_box, form = QGroupBox("输入"), QFormLayout()
+        self.input_box.setObjectName("blfInputSection")
+        self.input_box.setProperty("uiBlfSection", "true")
+        self.input_box.setLayout(form)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(DEFAULT_THEME.spacing.small)
+        form.setVerticalSpacing(DEFAULT_THEME.spacing.xsmall)
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("单个 BLF", InputMode.FILE)
         self.mode_combo.addItem("BLF 文件夹", InputMode.FOLDER)
         self.input_edit, self.table_edit, self.output_edit = QLineEdit(), QLineEdit(), QLineEdit()
+        for edit in (self.input_edit, self.table_edit, self.output_edit):
+            edit.textChanged.connect(edit.setToolTip)
         form.addRow("输入方式", self.mode_combo)
-        form.addRow("BLF 输入", self._path_row(self.input_edit, self._choose_input))
-        form.addRow("工况表", self._path_row(self.table_edit, self._choose_table))
-        form.addRow("输出目录", self._path_row(self.output_edit, self._choose_output))
+        self.input_path_row = self._path_row(self.input_edit, self._choose_input)
+        self.table_path_row = self._path_row(self.table_edit, self._choose_table)
+        self.output_path_row = self._path_row(self.output_edit, self._choose_output)
+        form.addRow("BLF 输入", self.input_path_row)
+        form.addRow("工况表", self.table_path_row)
+        form.addRow("输出目录", self.output_path_row)
         self.output_hint = QLabel("未单独选择时使用 BLF 输入所在目录。")
+        self.output_hint.setProperty("uiTextRole", "secondary")
+        self.output_hint.setToolTip(self.output_hint.text())
         form.addRow("", self.output_hint)
-        root.addWidget(input_box)
-        settings, settings_layout = QGroupBox("任务级设置"), QHBoxLayout()
-        settings.setLayout(settings_layout)
+        root.addWidget(self.input_box)
+        self.settings_box, settings_layout = QGroupBox("任务级设置"), QGridLayout()
+        self.settings_box.setObjectName("blfSettingsSection")
+        self.settings_box.setProperty("uiBlfSection", "true")
+        self.settings_box.setLayout(settings_layout)
+        settings_layout.setHorizontalSpacing(DEFAULT_THEME.spacing.small)
+        settings_layout.setVerticalSpacing(DEFAULT_THEME.spacing.xsmall)
         self.blf_offset_combo, self.table_offset_combo = QComboBox(), QComboBox()
         self.blf_special_offset_combo, self.table_special_offset_combo = QComboBox(), QComboBox()
         populate_special_offset_combo(self.blf_special_offset_combo)
@@ -159,46 +209,70 @@ class BlfSliceDialog(QDialog):
         self.table_offset_combo.currentIndexChanged.connect(
             lambda: self._sync_special_offset_visibility(self.table_offset_combo, self.table_special_offset_combo)
         )
-        settings_layout.addWidget(QLabel("BLF 时区"))
-        settings_layout.addWidget(self.blf_offset_combo)
-        settings_layout.addWidget(self.blf_special_offset_combo)
-        settings_layout.addWidget(QLabel("工况表时区"))
-        settings_layout.addWidget(self.table_offset_combo)
-        settings_layout.addWidget(self.table_special_offset_combo)
-        settings_layout.addSpacing(20)
-        settings_layout.addWidget(QLabel("批量设置：向前"))
+        settings_layout.addWidget(QLabel("BLF 时区"), 0, 0)
+        settings_layout.addWidget(self.blf_offset_combo, 0, 1)
+        settings_layout.addWidget(self.blf_special_offset_combo, 0, 2)
+        settings_layout.addWidget(QLabel("工况表时区"), 0, 3)
+        settings_layout.addWidget(self.table_offset_combo, 0, 4)
+        settings_layout.addWidget(self.table_special_offset_combo, 0, 5)
+        settings_layout.addWidget(QLabel("批量设置：向前"), 1, 0)
         self.batch_before_spin, self.batch_after_spin = QSpinBox(), QSpinBox()
         for spin in (self.batch_before_spin, self.batch_after_spin):
             spin.setRange(0, 300)
             spin.setValue(60)
             spin.setSuffix(" 秒")
-        settings_layout.addWidget(self.batch_before_spin)
-        settings_layout.addWidget(QLabel("向后"))
-        settings_layout.addWidget(self.batch_after_spin)
+        settings_layout.addWidget(self.batch_before_spin, 1, 1)
+        settings_layout.addWidget(QLabel("向后"), 1, 3)
+        settings_layout.addWidget(self.batch_after_spin, 1, 4)
         self.apply_batch_button = QPushButton("应用到全部工况")
+        self.apply_batch_button.setProperty("uiRole", "secondary")
         self.apply_batch_button.clicked.connect(self._apply_batch_windows)
-        settings_layout.addWidget(self.apply_batch_button)
-        settings_layout.addStretch()
+        settings_layout.addWidget(self.apply_batch_button, 1, 5)
+        settings_layout.setColumnStretch(6, 1)
         self._sync_special_offset_visibility(self.blf_offset_combo, self.blf_special_offset_combo)
         self._sync_special_offset_visibility(self.table_offset_combo, self.table_special_offset_combo)
-        root.addWidget(settings)
+        root.addWidget(self.settings_box)
+        self.condition_box = QGroupBox("工况表")
+        self.condition_box.setObjectName("blfConditionSection")
+        self.condition_box.setProperty("uiBlfSection", "true")
+        condition_layout = QVBoxLayout(self.condition_box)
         self.condition_table = QTableWidget(0, len(self.COLUMNS))
+        self.condition_table.setObjectName("blfConditionTable")
         self.condition_table.setHorizontalHeaderLabels(self.COLUMNS)
         self.condition_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
-        self.condition_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        root.addWidget(self.condition_table, 1)
-        actions = QHBoxLayout()
-        select_all, clear_all, start, cancel = QPushButton("全选"), QPushButton("全部取消"), QPushButton("开始切片"), QPushButton("取消")
-        select_all.clicked.connect(lambda: self._set_all_selected(True))
-        clear_all.clicked.connect(lambda: self._set_all_selected(False))
-        start.clicked.connect(self._confirm_task)
-        cancel.clicked.connect(self.reject)
-        for widget in (select_all, clear_all):
+        self.condition_table.setAlternatingRowColors(True)
+        self.condition_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.condition_table.verticalHeader().setDefaultSectionSize(30)
+        header = self.condition_table.horizontalHeader()
+        for column in (0, 1, 3, 4, 5):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.condition_table.itemChanged.connect(self._sync_table_item_tooltip)
+        condition_layout.addWidget(self.condition_table)
+        root.addWidget(self.condition_box, 1)
+
+        self.execution_box = QGroupBox("执行")
+        self.execution_box.setObjectName("blfExecutionSection")
+        self.execution_box.setProperty("uiBlfSection", "true")
+        actions = QHBoxLayout(self.execution_box)
+        self.select_all_button = QPushButton("全选")
+        self.clear_all_button = QPushButton("全部取消")
+        self.start_button = QPushButton("开始切片")
+        self.cancel_button = QPushButton("取消")
+        self.select_all_button.clicked.connect(lambda: self._set_all_selected(True))
+        self.clear_all_button.clicked.connect(lambda: self._set_all_selected(False))
+        self.start_button.clicked.connect(self._confirm_task)
+        self.cancel_button.clicked.connect(self.reject)
+        self.start_button.setProperty("uiRole", "primary")
+        for widget in (self.select_all_button, self.clear_all_button, self.cancel_button):
+            widget.setProperty("uiRole", "secondary")
+        for widget in (self.select_all_button, self.clear_all_button):
             actions.addWidget(widget)
         actions.addStretch()
-        actions.addWidget(start)
-        actions.addWidget(cancel)
-        root.addLayout(actions)
+        actions.addWidget(self.start_button)
+        actions.addWidget(self.cancel_button)
+        root.addWidget(self.execution_box)
 
     def _path_row(self, edit, callback):
         widget, layout = QWidget(), QHBoxLayout()
@@ -206,8 +280,10 @@ class BlfSliceDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(edit, 1)
         button = QPushButton("浏览…")
+        button.setProperty("uiRole", "secondary")
         button.clicked.connect(callback)
         layout.addWidget(button)
+        widget.browse_button = button
         return widget
 
     def _choose_input(self):
@@ -219,7 +295,7 @@ class BlfSliceDialog(QDialog):
             self.input_edit.setText(path)
             if not self.output_edit.text().strip():
                 default = resolve_output_directory(self.mode_combo.currentData(), path)
-                self.output_hint.setText(f"实际输出目录：{default}（默认）")
+                self._set_output_hint(f"实际输出目录：{default}（默认）")
 
     def _choose_table(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择工况表", "", "工况表 (*.csv *.xlsx)")
@@ -231,7 +307,16 @@ class BlfSliceDialog(QDialog):
         path = QFileDialog.getExistingDirectory(self, "选择输出目录")
         if path:
             self.output_edit.setText(path)
-            self.output_hint.setText(f"实际输出目录：{path}")
+            self._set_output_hint(f"实际输出目录：{path}")
+
+    def _set_output_hint(self, text):
+        self.output_hint.setText(text)
+        self.output_hint.setToolTip(text)
+
+    @staticmethod
+    def _sync_table_item_tooltip(item):
+        if item is not None and item.toolTip() != item.text():
+            item.setToolTip(item.text())
 
     def load_condition_table(self, path):
         try:

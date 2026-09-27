@@ -403,6 +403,99 @@ QSplitter[uiFormulaSplitter="true"]::handle {{
 """.strip()
 
 
+def build_blf_slice_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
+    """Return compact shared styling for the BLF slicing dialog family."""
+    c, f = theme.colors, theme.fonts
+    controls, padding, spacing = theme.controls, theme.padding, theme.spacing
+    return f"""
+QDialog[uiDialog="blfSlice"] {{ background-color: {c.background}; }}
+QGroupBox[uiBlfSection="true"] {{
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+    margin-top: {spacing.small}px;
+    padding-top: {spacing.small}px;
+}}
+QGroupBox[uiBlfSection="true"]::title {{
+    subcontrol-origin: margin;
+    left: {spacing.small}px;
+    padding: 0 {padding.compact}px;
+    font-weight: 600;
+}}
+QLabel[uiTextRole="secondary"] {{
+    color: {c.text_secondary};
+    font-size: {f.small}px;
+}}
+QLabel[uiTextRole="status"] {{
+    color: {c.text_primary};
+    font-weight: 600;
+}}
+QLineEdit, QComboBox, QSpinBox {{
+    min-height: {controls.standard_height}px;
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+    padding: 0 {padding.compact}px;
+}}
+QPushButton[uiRole="primary"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.surface};
+    background-color: {c.primary};
+    border: 1px solid {c.primary};
+    border-radius: {controls.corner_radius}px;
+    font-weight: 600;
+}}
+QPushButton[uiRole="secondary"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.secondary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+}}
+QPushButton:disabled {{
+    color: {c.disabled_text};
+    background-color: {c.disabled_background};
+    border-color: {c.border};
+}}
+QTableWidget {{
+    color: {c.text_primary};
+    background-color: {c.surface};
+    alternate-background-color: {c.background};
+    border: 1px solid {c.border};
+    gridline-color: {c.border};
+    selection-background-color: {c.selection};
+    selection-color: {c.selection_text};
+    font-size: {f.small}px;
+}}
+QTableWidget::item {{ padding: 1px {padding.compact}px; }}
+QHeaderView::section {{
+    color: {c.text_primary};
+    background-color: {c.disabled_background};
+    padding: {padding.compact}px;
+    border: none;
+    border-right: 1px solid {c.border};
+    border-bottom: 1px solid {c.border};
+    font-size: {f.small}px;
+    font-weight: 600;
+}}
+QProgressBar {{
+    min-height: {controls.compact_height}px;
+    color: {c.text_primary};
+    background-color: {c.disabled_background};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+    text-align: center;
+}}
+QProgressBar::chunk {{ background-color: {c.primary}; }}
+QRadioButton {{ color: {c.text_primary}; font-size: {f.body}px; }}
+QScrollArea {{ border: none; background-color: transparent; }}
+""".strip()
+
+
 def apply_application_theme(
     application: QApplication, theme: ThemeTokens = DEFAULT_THEME
 ) -> None:
@@ -424,6 +517,7 @@ __all__ = [
     "apply_application_theme",
     "build_application_stylesheet",
     "build_can_config_stylesheet",
+    "build_blf_slice_stylesheet",
     "build_formula_editor_stylesheet",
     "build_main_window_stylesheet",
     "build_signal_filter_stylesheet",
