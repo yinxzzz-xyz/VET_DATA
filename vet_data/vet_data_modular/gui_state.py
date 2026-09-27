@@ -13,6 +13,8 @@ ORGANIZATION_NAME = "VET_DATA"
 APPLICATION_NAME = "VET_DATA"
 GEOMETRY_KEY = "main_window/geometry"
 HORIZONTAL_SPLITTER_SIZES_KEY = "main_window/horizontal_splitter_sizes"
+CAN_PANEL_EXPANDED_KEY = "main_window/panels/can_expanded"
+GPS_PANEL_EXPANDED_KEY = "main_window/panels/gps_expanded"
 
 DEFAULT_GEOMETRY = (100, 100, 1450, 950)
 DEFAULT_SPLITTER_SIZES = (360, 1080)
@@ -104,16 +106,57 @@ def save_main_window_state(
     settings.sync()
 
 
+def _coerce_bool(value, default=False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    return default
+
+
+def restore_collapsible_panel_state(groups: dict, settings: QSettings) -> None:
+    """Restore CAN/GPS expansion only; invalid or absent values stay collapsed."""
+    for title, key in (
+        ("CAN通道配置", CAN_PANEL_EXPANDED_KEY),
+        ("GPS轨迹图", GPS_PANEL_EXPANDED_KEY),
+    ):
+        group = groups.get(title)
+        if group is not None:
+            group.setChecked(_coerce_bool(settings.value(key), False))
+
+
+def save_collapsible_panel_state(groups: dict, settings: QSettings) -> None:
+    """Persist only the two main-window collapsible panel states."""
+    for title, key in (
+        ("CAN通道配置", CAN_PANEL_EXPANDED_KEY),
+        ("GPS轨迹图", GPS_PANEL_EXPANDED_KEY),
+    ):
+        group = groups.get(title)
+        if group is not None:
+            settings.setValue(key, bool(group.isChecked()))
+    settings.sync()
+
+
 __all__ = [
     "APPLICATION_NAME",
+    "CAN_PANEL_EXPANDED_KEY",
     "DEFAULT_GEOMETRY",
     "DEFAULT_SPLITTER_SIZES",
     "GEOMETRY_KEY",
+    "GPS_PANEL_EXPANDED_KEY",
     "HORIZONTAL_SPLITTER_SIZES_KEY",
     "MIN_LEFT_WIDTH",
     "MIN_RIGHT_WIDTH",
     "ORGANIZATION_NAME",
     "create_gui_settings",
     "restore_main_window_state",
+    "restore_collapsible_panel_state",
     "save_main_window_state",
+    "save_collapsible_panel_state",
 ]

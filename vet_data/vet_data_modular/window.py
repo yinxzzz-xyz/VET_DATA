@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from PyQt6.QtWidgets import (
-    QDialog, QFileDialog, QInputDialog, QLabel, QMessageBox, QPushButton,
+    QDialog, QFileDialog, QGroupBox, QInputDialog, QLabel, QMessageBox, QPushButton,
     QSplitter,
 )
 
@@ -28,12 +28,15 @@ from .formula_editor import FormulaEditorDialog
 from .formula_parser import FormulaError
 from .formula_validator import parse_and_validate_formula
 from .gui_state import (
-    create_gui_settings, restore_main_window_state, save_main_window_state,
+    create_gui_settings, restore_collapsible_panel_state,
+    restore_main_window_state, save_collapsible_panel_state,
+    save_main_window_state,
 )
 from .math_channel import SearchableMathChannelDialog  # retains legacy compatibility
 from .plot_panel import PlotPanelMixin
 from .signal_panel import SignalPanelMixin
 from .signal_resolver import SignalResolver
+from .theme import DEFAULT_THEME, build_main_window_stylesheet
 from .workers import (
     BusyLoadDialog, CanBusDetectionDialog, CanBusDetectionWorker,
     CsvExportSignal, CsvExportSnapshot, CsvExportWorker, DataLoadWorker,
@@ -45,7 +48,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
     """26.09.01 baseline plus the v10 interaction enhancements."""
     def __init__(self, gui_settings=None):
         super().__init__()
-        self.setWindowTitle("VET_DATA merged modular")
+        self.setWindowTitle("VET_DATA")
         self._data_load_worker = None; self._data_load_dialog = None
         self._can_bus_detection_worker = None; self._can_bus_detection_dialog = None
         self.can_bus_mapping = None
@@ -72,6 +75,41 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._pending_splitter_sizes = restore_main_window_state(
             self, self.main_splitter, self._gui_settings
         )
+        restore_collapsible_panel_state(self.collapsible_groups, self._gui_settings)
+        self._setup_main_window_theme()
+
+    def _setup_main_window_theme(self):
+        tokens = DEFAULT_THEME
+        self.setProperty("uiSurface", "main")
+        self.setStyleSheet(build_main_window_stylesheet(tokens))
+        self.layout().setSpacing(tokens.spacing.small)
+        self.left_panel_widget.layout().setContentsMargins(
+            tokens.spacing.small, tokens.spacing.small,
+            tokens.spacing.small, tokens.spacing.small,
+        )
+        self.left_panel_widget.layout().setSpacing(tokens.spacing.small)
+        self.search_box.setProperty("uiControl", "main")
+        self.search_box.setStyleSheet("")
+        self.current_file_label.setProperty("uiTextRole", "secondary")
+        self.main_splitter.setProperty("uiSplitter", "main")
+        for group in self.findChildren(QGroupBox):
+            if group.title() in {"可用信号", "CAN通道配置", "GPS轨迹图", "信号曲线"}:
+                group.setProperty("uiPanel", "main")
+                group.setStyleSheet("")
+        primary_buttons = (self.load_file_button, self.plot_button)
+        secondary_buttons = (
+            self.select_all_button, self.deselect_all_button,
+            self.save_config_button, self.load_config_button,
+            self.math_channel_button, self.export_button,
+            self.save_data_button, self.blf_slice_button,
+            self.show_map_button,
+        )
+        for button in primary_buttons:
+            button.setProperty("uiRole", "primary")
+            button.setStyleSheet("")
+        for button in secondary_buttons:
+            button.setProperty("uiRole", "secondary")
+            button.setStyleSheet("")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -705,5 +743,6 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             event.ignore()
             return
         save_main_window_state(self, self.main_splitter, self._gui_settings)
+        save_collapsible_panel_state(self.collapsible_groups, self._gui_settings)
         self._close_load_dialog()
         super().closeEvent(event)

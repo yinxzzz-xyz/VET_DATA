@@ -8,9 +8,11 @@ from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtWidgets import QApplication, QGroupBox, QSplitter
 
 from vet_data_modular.gui_state import (
+    CAN_PANEL_EXPANDED_KEY,
     DEFAULT_GEOMETRY,
     DEFAULT_SPLITTER_SIZES,
     GEOMETRY_KEY,
+    GPS_PANEL_EXPANDED_KEY,
     HORIZONTAL_SPLITTER_SIZES_KEY,
     MIN_LEFT_WIDTH,
     MIN_RIGHT_WIDTH,
@@ -103,7 +105,10 @@ class MainWindowLayoutStateTests(unittest.TestCase):
         APP.processEvents()
         self.assertEqual(
             set(self.settings.allKeys()),
-            {GEOMETRY_KEY, HORIZONTAL_SPLITTER_SIZES_KEY},
+            {
+                GEOMETRY_KEY, HORIZONTAL_SPLITTER_SIZES_KEY,
+                CAN_PANEL_EXPANDED_KEY, GPS_PANEL_EXPANDED_KEY,
+            },
         )
 
     def test_missing_and_invalid_settings_fall_back_safely(self):

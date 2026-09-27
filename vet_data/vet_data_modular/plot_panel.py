@@ -1,5 +1,6 @@
 """Curve interaction enhancements."""
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSpinBox, QWidget
 
 
@@ -17,8 +18,17 @@ class PlotPanelMixin:
         row.addWidget(self.height_spin); row.addStretch()
         panel.layout().insertWidget(0, controls)
         self.height_spin.valueChanged.connect(self._plot_height_changed)
+        self.plot_empty_label = QLabel("选择信号并点击“绘制所选信号”")
+        self.plot_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.plot_empty_label.setProperty("uiEmptyState", True)
+        self.plot_layout.addWidget(self.plot_empty_label)
+
+    def _set_plot_empty_state(self, message):
+        self.plot_empty_label.setText(message or "")
+        self.plot_empty_label.setVisible(bool(message))
 
     def plot_selected_signals(self):
+        self._set_plot_empty_state(None)
         super().plot_selected_signals()
         for plot in self.plot_widgets:
             plot.setMinimumHeight(self.plot_min_height)

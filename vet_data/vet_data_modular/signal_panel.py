@@ -4,7 +4,7 @@ import numpy as np
 from PyQt6.QtCore import QSignalBlocker, Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QListWidget, QListWidgetItem, QPushButton,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
     QStyledItemDelegate, QStyle, QWidget,
 )
 
@@ -88,11 +88,17 @@ class SignalPanelMixin:
         row.addWidget(self.reset_order_btn)
         group.layout().insertWidget(0, controls)
 
+        self.signal_empty_label = QLabel("加载数据后，可在此选择和筛选信号")
+        self.signal_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.signal_empty_label.setProperty("uiEmptyState", True)
+        self.signal_layout.addWidget(self.signal_empty_label)
+
         self.signal_list_widget = QListWidget()
         self.signal_list_widget.setUniformItemSizes(True)
         self.signal_list_widget.setSpacing(1)
         self.signal_list_widget.setItemDelegate(SignalItemDelegate(self.signal_list_widget))
         self.signal_layout.addWidget(self.signal_list_widget)
+        self.signal_list_widget.setVisible(False)
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -153,6 +159,9 @@ class SignalPanelMixin:
             return super().refresh_signal_list_ui()
         snapshot = self._signal_list_snapshot()
         if snapshot == self._last_signal_list_snapshot:
+            has_signals = bool(self.signals)
+            self.signal_empty_label.setVisible(not has_signals)
+            self.signal_list_widget.setVisible(has_signals)
             self.set_buttons_enabled(bool(self.signals))
             return
         checked = set(self.get_selected_signals())
@@ -187,6 +196,9 @@ class SignalPanelMixin:
             combo.blockSignals(False)
         self.signal_list_widget.blockSignals(False)
         self.signal_list_widget.setUpdatesEnabled(True)
+        has_signals = bool(self.signals)
+        self.signal_empty_label.setVisible(not has_signals)
+        self.signal_list_widget.setVisible(has_signals)
         self._selection_changed(replot=False)
         self._apply_signal_filter()
         self.set_buttons_enabled(bool(self.signals))

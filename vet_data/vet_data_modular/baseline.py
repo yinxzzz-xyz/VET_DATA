@@ -2545,20 +2545,10 @@ class MDFPlotter(QWidget):
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("搜索信号...")
-        self.search_box.setStyleSheet("""
-            QLineEdit {
-                padding: 3px 6px;
-                font-size: 11px;
-                border: 1px solid #ccc;
-                border-radius: 3px;
-            }
-        """)
 
         select_buttons_layout = QHBoxLayout()
         self.select_all_button = QPushButton("全选")
-        self.select_all_button.setStyleSheet("padding: 2px 10px;")
         self.deselect_all_button = QPushButton("全部取消")
-        self.deselect_all_button.setStyleSheet("padding: 2px 10px;")
         select_buttons_layout.addWidget(self.select_all_button)
         select_buttons_layout.addWidget(self.deselect_all_button)
 
@@ -2569,23 +2559,9 @@ class MDFPlotter(QWidget):
         config_buttons_layout.addWidget(self.load_config_button)
 
         self.math_channel_button = QPushButton("➕ 创建计算通道 (加减乘除)")
-        self.math_channel_button.setStyleSheet(
-            "QPushButton { background-color: #2b8a3e; color: white; font-weight: bold; }"
-        )
 
         # ====== 可用信号区域 ======
         signal_groupbox = QGroupBox("可用信号")
-        signal_groupbox.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                font-size: 12px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-            }
-        """)
         signal_layout_outer = QVBoxLayout()
         signal_groupbox.setLayout(signal_layout_outer)
 
@@ -2612,17 +2588,6 @@ class MDFPlotter(QWidget):
 
         # ====== CAN通道配置区域 ======
         bus_groupbox = QGroupBox("CAN通道配置")
-        bus_groupbox.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                font-size: 12px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-            }
-        """)
         bus_layout = QVBoxLayout()
         bus_layout.setSpacing(2)
 
@@ -2661,17 +2626,6 @@ class MDFPlotter(QWidget):
 
         # ====== GPS地图面板 ======
         map_groupbox = QGroupBox("GPS轨迹图")
-        map_groupbox.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                font-size: 12px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-            }
-        """)
         map_layout = QVBoxLayout()
         lat_layout = QHBoxLayout()
         lat_label = QLabel("纬度信号:")
@@ -2684,9 +2638,6 @@ class MDFPlotter(QWidget):
         lon_layout.addWidget(lon_label)
         lon_layout.addWidget(self.lon_combo)
         self.show_map_button = QPushButton("显示GPS轨迹")
-        self.show_map_button.setStyleSheet(
-            "QPushButton { background-color: #0066cc; color: white; font-weight: bold; }"
-        )
         map_layout.addLayout(lat_layout)
         map_layout.addLayout(lon_layout)
         map_layout.addWidget(self.show_map_button)
@@ -2720,17 +2671,6 @@ class MDFPlotter(QWidget):
 
         # ====== 右侧面板 ======
         right_panel = QGroupBox("信号曲线")
-        right_panel.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                font-size: 12px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-            }
-        """)
         right_panel_layout = QVBoxLayout(right_panel)
         self.plot_container = QWidget()
         self.plot_layout = QVBoxLayout(self.plot_container)
@@ -3971,7 +3911,10 @@ class MDFPlotter(QWidget):
 
         selected_signals = self.get_selected_signals()
         if not selected_signals:
-            self.plot_layout.addWidget(QLabel("请选择至少一个信号进行绘制"))
+            if hasattr(self, '_set_plot_empty_state'):
+                self._set_plot_empty_state("请选择至少一个信号进行绘制")
+            else:
+                self.plot_layout.addWidget(QLabel("请选择至少一个信号进行绘制"))
             return
 
         all_data_list = []
@@ -3987,7 +3930,10 @@ class MDFPlotter(QWidget):
                 all_timestamps.extend([signal.timestamps[0], signal.timestamps[-1]])
 
         if not all_data_list:
-            self.plot_layout.addWidget(QLabel("无法获取任何信号数据。"))
+            if hasattr(self, '_set_plot_empty_state'):
+                self._set_plot_empty_state("无法获取任何信号数据。")
+            else:
+                self.plot_layout.addWidget(QLabel("无法获取任何信号数据。"))
             return
 
         t_min = np.min(all_timestamps)

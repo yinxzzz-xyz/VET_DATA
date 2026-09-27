@@ -137,6 +137,68 @@ QPushButton:disabled {{
 """.strip()
 
 
+def build_main_window_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
+    """Return compact, token-driven rules scoped by main-window properties."""
+    c, f = theme.colors, theme.fonts
+    controls, spacing, padding = theme.controls, theme.spacing, theme.padding
+    return f"""
+QWidget[uiSurface="main"] {{
+    background-color: {c.background};
+}}
+QGroupBox[uiPanel="main"] {{
+    color: {c.text_primary};
+    font-size: {f.body}px;
+    font-weight: 600;
+}}
+QGroupBox[uiPanel="main"]::title {{
+    subcontrol-origin: margin;
+    left: {spacing.medium}px;
+    padding: 0 {padding.compact}px;
+}}
+QLineEdit[uiControl="main"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+}}
+QPushButton[uiRole="primary"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.surface};
+    background-color: {c.primary};
+    border: 1px solid {c.primary};
+    border-radius: {controls.corner_radius}px;
+    font-weight: 600;
+}}
+QPushButton[uiRole="secondary"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.secondary};
+    background-color: {c.surface};
+    border: 1px solid {c.secondary};
+    border-radius: {controls.corner_radius}px;
+}}
+QPushButton[uiRole="primary"]:disabled,
+QPushButton[uiRole="secondary"]:disabled {{
+    color: {c.disabled_text};
+    background-color: {c.disabled_background};
+    border-color: {c.border};
+}}
+QLabel[uiTextRole="secondary"], QLabel[uiEmptyState="true"] {{
+    color: {c.text_secondary};
+}}
+QLabel[uiEmptyState="true"] {{
+    padding: {padding.comfortable}px;
+    font-size: {f.body}px;
+}}
+QSplitter[uiSplitter="main"]::handle {{
+    background-color: {c.border};
+}}
+""".strip()
+
+
 def apply_application_theme(
     application: QApplication, theme: ThemeTokens = DEFAULT_THEME
 ) -> None:
@@ -157,5 +219,6 @@ __all__ = [
     "ThemeTokens",
     "apply_application_theme",
     "build_application_stylesheet",
+    "build_main_window_stylesheet",
     "semantic_button_stylesheet",
 ]
