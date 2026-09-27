@@ -8,6 +8,7 @@ from pathlib import Path
 import pyqtgraph as pg
 from PyQt6.QtWidgets import QApplication
 
+from .theme import apply_application_theme
 from .window import MDFPlotter
 
 
@@ -30,6 +31,7 @@ def main():
         "--enable-local-file-accesses --disable-web-security",
     )
     app = QApplication.instance() or QApplication(sys.argv)
+    apply_application_theme(app)
     window = MDFPlotter()
     window.show()
     return app.exec()
