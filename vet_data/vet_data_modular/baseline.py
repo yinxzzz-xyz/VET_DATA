@@ -35,6 +35,13 @@ import time
 import multiprocessing
 
 from .signal_resolver import SignalResolutionError, SignalResolver
+from .workers import (
+    CanDetectionSnapshot,
+    capture_can_file_identity,
+    detect_can_bus_info,
+    message_raw_channel,
+    normalized_can_path,
+)
 
 # 抑制警告
 warnings.filterwarnings("ignore")
@@ -1794,13 +1801,17 @@ class ParseWorker(QThread):
     parse_finished = pyqtSignal(int, dict)
     parse_error = pyqtSignal(int, str)
 
-    def __init__(self, bus_id, log_path, db, arxml_sub_bus="", channel_offset=0, parent=None):
+    def __init__(self, bus_id, target_raw_channel, msg_count, log_path, file_identity, db, arxml_sub_bus="", parent=None):
         super().__init__(parent)
+        if isinstance(msg_count, bool) or not isinstance(msg_count, int) or msg_count <= 0:
+            raise ValueError("msg_count 必须是大于0的整数")
         self.bus_id = bus_id
+        self.target_raw_channel = target_raw_channel
+        self.msg_count = msg_count
         self.log_path = log_path
+        self.file_identity = file_identity
         self.db = db
         self.arxml_sub_bus = arxml_sub_bus
-        self.channel_offset = channel_offset
         self._is_running = True
 
         # ===== 多路复用映射（从 main_py.py 移植） =====
@@ -2062,6 +2073,8 @@ class ParseWorker(QThread):
 
     def run(self):
         try:
+            if capture_can_file_identity(self.log_path) != self.file_identity:
+                raise ValueError("CAN日志在解析启动前发生变化，请重新探测")
             print(f"\n{'=' * 70}")
             print(f"🚀 [Bus {self.bus_id}] 开始解析")
             print(f"   日志文件: {self.log_path}")
@@ -2098,24 +2111,8 @@ class ParseWorker(QThread):
             print(f"\n总线 {self.bus_id}: 数据库中有 {len(msg_shard)} 个消息定义")
             print(f"  消息ID列表: {[hex(i) for i in sorted(msg_shard.keys())]}")
 
-            # ===== 统计总消息数 =====
-            total_msgs = 0
-            try:
-                temp_reader = can.BLFReader(self.log_path) if self.log_path.lower().endswith('.blf') else can.LogReader(
-                    self.log_path)
-                for msg in temp_reader:
-                    raw_channel = getattr(msg, 'channel', 0)
-                    if raw_channel == 0:
-                        bus_id = 1
-                    else:
-                        bus_id = raw_channel + 1
-                    if bus_id == self.bus_id:
-                        total_msgs += 1
-                temp_reader.stop()
-                print(f"总线 {self.bus_id}: 预估总消息数: {total_msgs}")
-            except Exception as e:
-                print(f"统计消息总数失败: {e}")
-                total_msgs = 0
+            total_msgs = self.msg_count
+            print(f"总线 {self.bus_id}: 探测消息总数: {total_msgs}")
 
             t0 = None
             pool = defaultdict(lambda: {'t': [], 'v': [], 'unit': '', 'comment': ''})
@@ -2146,13 +2143,8 @@ class ParseWorker(QThread):
                 if t0 is None:
                     t0 = msg.timestamp
 
-                raw_channel = getattr(msg, 'channel', 0)
-                if raw_channel == 0:
-                    bus_id = 1
-                else:
-                    bus_id = raw_channel + 1
-
-                if bus_id != self.bus_id:
+                raw_channel = message_raw_channel(msg)
+                if raw_channel != self.target_raw_channel:
                     continue
 
                 rel_t = msg.timestamp - t0
@@ -2162,7 +2154,7 @@ class ParseWorker(QThread):
                 if msg_id == 0x13E:
                     print(f"\n{'=' * 60}")
                     print(f"🔍 [0x13E 帧] 时间: {rel_t:.6f}s, 数据长度: {len(msg.data)}, 数据: {msg.data.hex()}")
-                    print(f"   raw_channel: {raw_channel}, bus_id: {bus_id}")
+                    print(f"   raw_channel: {raw_channel}, bus_id: {self.bus_id}")
 
                 msg_def = msg_shard.get(msg_id)
                 if msg_def is None:
@@ -2432,6 +2424,8 @@ class ParseWorker(QThread):
                 reader.stop()
             except Exception:
                 pass
+            if capture_can_file_identity(self.log_path) != self.file_identity:
+                raise ValueError("CAN日志在解析期间发生变化，请重新探测")
 
             # ===== 打印统计 =====
             print(f"\n{'=' * 70}")
@@ -3125,111 +3119,12 @@ class MDFPlotter(QWidget):
     def load_can_bus_info(self, log_path):
         try:
             self.can_bus_data.clear()
-
-            if log_path.lower().endswith('.blf'):
-                reader = can.BLFReader(log_path)
-            else:
-                reader = can.LogReader(log_path)
-
-            bus_stats = {}
-            total_count = 0
-
-            sample_interval = 100
-            bus_samples = defaultdict(lambda: {'timestamps': [], 'ids': set(), 'data': [], 'is_fd': [], 'dlc': []})
-
-            t0 = None
-            bus_id_sets = defaultdict(set)
-
-            raw_channels = set()
-            has_channel_zero = False
-
-            for msg in reader:
-                if t0 is None:
-                    t0 = msg.timestamp
-
-                total_count += 1
-                raw_channel = getattr(msg, 'channel', 1)
-                raw_channels.add(raw_channel)
-                if raw_channel == 0:
-                    has_channel_zero = True
-
-                bus_id = raw_channel
-                if bus_id == 0:
-                    bus_id = 0
-
-                rel_t = msg.timestamp - t0 if t0 else 0
-
-                is_fd = getattr(msg, 'is_fd', False) or getattr(msg, 'is_can_fd', False)
-
-                if bus_id not in bus_stats:
-                    bus_stats[bus_id] = {'count': 0, 'first_timestamp': msg.timestamp, 'is_fd': is_fd,
-                                         'raw_channel': raw_channel}
-                bus_stats[bus_id]['count'] += 1
-                if is_fd:
-                    bus_stats[bus_id]['is_fd'] = True
-
-                # 关键：收集每个总线的仲裁ID
-                bus_id_sets[bus_id].add(msg.arbitration_id)
-
-                bus_samples[bus_id]['ids'].add(msg.arbitration_id)
-
-                if bus_stats[bus_id]['count'] % sample_interval == 1 or bus_stats[bus_id]['count'] <= 10:
-                    bus_samples[bus_id]['timestamps'].append(rel_t)
-                    if hasattr(msg, 'data'):
-                        bus_samples[bus_id]['data'].append(msg.data)
-                    bus_samples[bus_id]['is_fd'].append(is_fd)
-                    bus_samples[bus_id]['dlc'].append(len(msg.data) if hasattr(msg, 'data') else 0)
-
-            try:
-                reader.stop()
-            except Exception:
-                pass
-
-            if total_count == 0:
-                raise Exception("未读取到任何CAN报文")
-
-            channel_offset = 1 if has_channel_zero else 0
-
-            print(f"\n{'=' * 60}")
-            print(f"📊 通道检测结果:")
-            print(f"  原始通道号: {sorted(raw_channels)}")
-            print(f"  是否包含通道0: {has_channel_zero}")
-            print(f"  通道偏移量: {channel_offset}")
-            if has_channel_zero:
-                print(f"  ⚠️ 检测到通道0，所有通道将+1映射")
-            print(f"{'=' * 60}\n")
-
-            for raw_bus_id, samples in bus_samples.items():
-                bus_id = raw_bus_id + channel_offset
-
-                if bus_id == 0:
-                    bus_id = 1
-
-                actual_id_count = len(bus_id_sets.get(raw_bus_id, set()))
-                stats = bus_stats.get(raw_bus_id, {})
-                is_fd = stats.get('is_fd', False)
-
-                # 打印每个总线的ID信息
-                actual_ids_list = list(bus_id_sets.get(raw_bus_id, set()))
-                print(f"📊 总线 {bus_id} (原始通道: {raw_bus_id})")
-                print(f"   - 实际ID数量: {len(actual_ids_list)}")
-                print(f"   - 前10个ID: {actual_ids_list[:10]}")
-
-                self.can_bus_data[bus_id] = {
-                    'timestamps': samples['timestamps'],
-                    'ids': list(samples['ids']),
-                    'actual_ids': actual_ids_list,  # 关键：存储实际的CAN ID列表
-                    'data': samples['data'],
-                    'is_fd': samples['is_fd'],
-                    'dlc': samples['dlc'],
-                    'msg_count': stats.get('count', 0),
-                    'id_count': actual_id_count,
-                    'name': f"Bus {bus_id}",
-                    'has_fd': is_fd,
-                    'raw_channel': stats.get('raw_channel', raw_bus_id),
-                    'original_bus_id': raw_bus_id
-                }
-
+            self.can_bus_mapping = None
+            self.can_detection_snapshot = None
+            detected = detect_can_bus_info(log_path)
+            self.can_bus_data.update(detected)
+            self.can_bus_mapping = detected.mapping
+            self.can_detection_snapshot = detected.snapshot
             self.bus_loaded = True
             self._print_bus_info()
 
@@ -3312,12 +3207,17 @@ class MDFPlotter(QWidget):
     def on_bus_name_changed(self, bus_id, new_name):
         if bus_id in self.can_bus_data:
             self.can_bus_data[bus_id]['name'] = new_name
-            self.update_signal_names_for_bus(bus_id, new_name)
-            self.refresh_signal_list_ui()
+            affected_keys = self.update_signal_names_for_bus(bus_id, new_name)
+            if hasattr(self, 'update_signal_metadata_batch'):
+                self.update_signal_metadata_batch(affected_keys)
+            else:
+                self.refresh_signal_list_ui()
 
     def update_signal_names_for_bus(self, bus_id, bus_name):
+        affected_keys = []
         for key, info in self.signals.items():
             if info.get('bus_id') == bus_id:
+                affected_keys.append(key)
                 if key.startswith('CAN_'):
                     parts = key.split('_', 2)
                     if len(parts) >= 3:
@@ -3329,6 +3229,7 @@ class MDFPlotter(QWidget):
                     info['display_name'] = f"⏱️ {bus_name} 时间轴"
                 elif key.endswith('_MsgCount'):
                     info['display_name'] = f"📊 {bus_name} 报文计数"
+        return affected_keys
 
     def on_bus_protocol_changed(self, bus_id, protocol_info):
         # 普通 DBC
@@ -3341,6 +3242,53 @@ class MDFPlotter(QWidget):
         if bus_id in self.bus_config_widgets:
             self.bus_config_widgets[bus_id].set_status('idle')
 
+    def _validated_can_detection_bus(self, bus_id):
+        detection_worker = getattr(self, '_can_bus_detection_worker', None)
+        if detection_worker is not None and detection_worker.isRunning():
+            raise ValueError("CAN总线探测仍在进行中")
+
+        snapshot = getattr(self, 'can_detection_snapshot', None)
+        if not isinstance(snapshot, CanDetectionSnapshot):
+            raise ValueError("缺少完整成功的CAN总线探测快照")
+        if normalized_can_path(self.mdf_path) != snapshot.file_identity.path:
+            raise ValueError("当前CAN日志与探测快照不是同一文件")
+        try:
+            current_identity = capture_can_file_identity(self.mdf_path)
+        except OSError as exc:
+            raise ValueError(f"无法验证当前CAN日志: {exc}") from exc
+        if current_identity != snapshot.file_identity:
+            raise ValueError("CAN日志在探测后发生变化")
+        if bus_id not in snapshot.buses:
+            raise ValueError(f"探测快照中不存在 Bus {bus_id}")
+
+        bus_snapshot = snapshot.buses[bus_id]
+        target_raw_channel = snapshot.mapping.bus_to_raw.get(bus_id)
+        if (
+            target_raw_channel is None
+            or target_raw_channel != bus_snapshot.original_bus_id
+            or bus_snapshot.bus_id != bus_id
+        ):
+            raise ValueError(f"Bus {bus_id} 的通道映射不一致")
+        msg_count = bus_snapshot.msg_count
+        if isinstance(msg_count, bool) or not isinstance(msg_count, int) or msg_count <= 0:
+            raise ValueError(f"Bus {bus_id} 的msg_count无效")
+
+        mutable_bus_data = self.can_bus_data.get(bus_id)
+        if not isinstance(mutable_bus_data, dict):
+            raise ValueError(f"当前总线数据中不存在 Bus {bus_id}")
+        current_raw = mutable_bus_data.get('original_bus_id')
+        current_count = mutable_bus_data.get('msg_count')
+        if current_raw != target_raw_channel:
+            raise ValueError(f"Bus {bus_id} 的当前通道与探测快照不一致")
+        if (
+            isinstance(current_count, bool)
+            or not isinstance(current_count, int)
+            or current_count <= 0
+            or current_count != msg_count
+        ):
+            raise ValueError(f"Bus {bus_id} 的当前msg_count与探测快照不一致")
+        return bus_snapshot
+
     def parse_bus(self, bus_id, auto_parse=False):
         if bus_id in self._parsing_bus_ids:
             return
@@ -3350,6 +3298,18 @@ class MDFPlotter(QWidget):
             self._parsing_bus_ids.discard(bus_id)
             if not auto_parse:
                 QMessageBox.warning(self, "解析失败", f"Bus {bus_id} 未配置协议文件")
+            return
+
+        try:
+            bus_snapshot = self._validated_can_detection_bus(bus_id)
+        except (KeyError, TypeError, ValueError) as exc:
+            self._parsing_bus_ids.discard(bus_id)
+            message = f"无法开始解析：{exc}。请重新探测当前CAN日志。"
+            if bus_id in self.bus_config_widgets:
+                self.bus_config_widgets[bus_id].set_status('error')
+            if not auto_parse:
+                QMessageBox.warning(self, "需要重新探测", message)
+            print(f"⚠️ {message}")
             return
 
         if bus_id in self.parse_workers and self.parse_workers[bus_id].isRunning():
@@ -3394,7 +3354,15 @@ class MDFPlotter(QWidget):
             self.db_per_bus[bus_id]['parsed'] = False
             self.db_per_bus[bus_id]['is_arxml'] = False
 
-            worker = ParseWorker(bus_id, self.mdf_path, db, "", channel_offset=1)
+            worker = ParseWorker(
+                bus_id,
+                bus_snapshot.original_bus_id,
+                bus_snapshot.msg_count,
+                self.can_detection_snapshot.file_identity.path,
+                self.can_detection_snapshot.file_identity,
+                db,
+                "",
+            )
             worker.progress_updated.connect(self.on_parse_progress)
             worker.parse_finished.connect(self.on_parse_finished)
             worker.parse_error.connect(self.on_parse_error)
@@ -3598,7 +3566,9 @@ class MDFPlotter(QWidget):
             t0_per_bus = {}
 
             for msg in reader:
-                bus_id = getattr(msg, 'channel', 0)
+                raw_channel = message_raw_channel(msg)
+                mapping = getattr(self, 'can_bus_mapping', None)
+                bus_id = mapping.raw_to_bus.get(raw_channel, raw_channel) if mapping else raw_channel
                 if bus_id not in t0_per_bus:
                     t0_per_bus[bus_id] = msg.timestamp
                 rel_t = msg.timestamp - t0_per_bus[bus_id]
@@ -4031,7 +4001,7 @@ class MDFPlotter(QWidget):
                 has_text_mapping = hasattr(signal, 'text_mapping') and signal.text_mapping is not None
 
                 if is_text_signal and has_text_mapping:
-                    plot_widget.plot(signal.timestamps, signal.samples, pen='y')
+                    data_curve = plot_widget.plot(signal.timestamps, signal.samples, pen='y')
 
                     ay = plot_widget.getPlotItem().getAxis('left')
                     ticks = [(j, label) for j, label in enumerate(signal.text_mapping)]
@@ -4059,7 +4029,9 @@ class MDFPlotter(QWidget):
                         y_padding = y_range * 0.4
 
                     plot_widget.setYRange(y_min_data - y_padding, y_max_data + y_padding, padding=0)
-                    plot_widget.plot(signal.timestamps, signal.samples, pen='y')
+                    data_curve = plot_widget.plot(signal.timestamps, signal.samples, pen='y')
+                    data_curve.setDownsampling(auto=True, method='peak')
+                    data_curve.setClipToView(True)
                     plot_widget.sigXRangeChanged.connect(self.on_x_range_changed)
 
                     title = f"信号: {signal_info['display_name']}"
@@ -4085,6 +4057,7 @@ class MDFPlotter(QWidget):
                 plot_widget.signal_data = signal
                 plot_widget.signal_info = signal_info
                 plot_widget.is_text_signal = is_text_signal
+                plot_widget.data_curve = data_curve
 
                 # ===== 右上角统计信息 =====
                 stats_text_item = pg.TextItem(
@@ -4651,9 +4624,9 @@ class MDFPlotter(QWidget):
             t0_per_bus = {}
             with can.BLFReader(input_path) as reader:
                 for msg in reader:
-                    bus_id = getattr(msg, 'channel', 0)
-                    if bus_id not in t0_per_bus:
-                        t0_per_bus[bus_id] = msg.timestamp
+                    raw_channel = message_raw_channel(msg)
+                    if raw_channel not in t0_per_bus:
+                        t0_per_bus[raw_channel] = msg.timestamp
                     if len(t0_per_bus) > 0:
                         break
 
@@ -4670,8 +4643,10 @@ class MDFPlotter(QWidget):
                     with can.BLFReader(input_path) as reader:
                         for msg in reader:
                             total_count += 1
-                            bus_id = getattr(msg, 'channel', 0)
-                            t0 = t0_per_bus.get(bus_id, t0_per_bus.get(0, msg.timestamp))
+                            raw_channel = message_raw_channel(msg)
+                            mapping = getattr(self, 'can_bus_mapping', None)
+                            bus_id = mapping.raw_to_bus.get(raw_channel, raw_channel) if mapping else raw_channel
+                            t0 = t0_per_bus.get(raw_channel, t0_per_bus.get(0, msg.timestamp))
                             rel_t = msg.timestamp - t0
 
                             if bus_filter is not None and bus_id not in bus_filter:

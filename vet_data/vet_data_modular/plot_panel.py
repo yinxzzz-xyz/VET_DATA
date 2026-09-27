@@ -44,4 +44,11 @@ class PlotPanelMixin:
 
     def _plot_height_changed(self, value):
         self.plot_min_height = value
-        if self.plot_widgets: self.plot_selected_signals()
+        for plot in tuple(getattr(self, "plot_widgets", ())):
+            if plot is None:
+                continue
+            try:
+                plot.setMinimumHeight(value)
+            except RuntimeError:
+                # A queued height signal can arrive while Qt is destroying plots.
+                continue

@@ -1,7 +1,7 @@
 """High-performance signal selection, filtering, values and ordering."""
 
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QSignalBlocker, Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QHBoxLayout, QListWidget, QListWidgetItem, QPushButton,
@@ -13,17 +13,23 @@ KEY_ROLE = Qt.ItemDataRole.UserRole
 NAME_ROLE = Qt.ItemDataRole.UserRole + 1
 VALUE_ROLE = Qt.ItemDataRole.UserRole + 2
 COMMENT_ROLE = Qt.ItemDataRole.UserRole + 3
+SELECTED_TEXT_COLOR = QColor("#2c3e50")
 
 
 class SignalItemDelegate(QStyledItemDelegate):
+    @staticmethod
+    def text_color(option):
+        if option.state & QStyle.StateFlag.State_Selected:
+            return SELECTED_TEXT_COLOR
+        return option.palette.text().color()
+
     def paint(self, painter, option, index):
         # The model's display text is intentionally empty, so the base delegate
         # paints selection/focus/checkbox without duplicating our columns.
         super().paint(painter, option, index)
         painter.save()
         item = self.parent().item(index.row())
-        text_color = option.palette.highlightedText().color() if option.state & QStyle.StateFlag.State_Selected else option.palette.text().color()
-        painter.setPen(text_color)
+        painter.setPen(self.text_color(option))
         name = item.data(NAME_ROLE) or item.text()
         value = item.data(VALUE_ROLE)
         comment = item.data(COMMENT_ROLE) or ""
@@ -61,6 +67,7 @@ class SignalPanelMixin:
         self._current_cursor_time = None
         self._mouse_in_plot = False
         self._sig_value_cache = {}
+        self._last_signal_list_snapshot = None
         self._signal_panel_ready = True
 
         group = next((g for g in self.findChildren(QWidget) if getattr(g, "title", lambda: "")() == "可用信号"), None)
@@ -102,9 +109,52 @@ class SignalPanelMixin:
         self.signal_list_widget.itemChanged.connect(lambda _item: self._selection_changed())
         self.signal_list_widget.model().rowsMoved.connect(self._signal_rows_moved)
 
+    def _signal_display_name(self, key):
+        info = self.signals[key]
+        name = info.get("display_name", key)
+        bus_id = info.get("bus_id")
+        if bus_id is not None and "[" not in name:
+            bus_name = self.can_bus_data.get(bus_id, {}).get("name", f"Bus {bus_id}")
+            name = f"{name} [\U0001F68C {bus_name}]"
+        return name
+
+    def _signal_list_default_key(self, key):
+        info = self.signals[key]
+        kind = 0 if key.startswith("MATH_") else 1 if key.startswith("CAN_") else 2
+        return kind, info.get("display_name", key).lower()
+
+    def _ordered_signal_keys(self):
+        return sorted(
+            self.signals,
+            key=lambda key: (
+                self._user_signal_order.get(key, 10**9),
+                self._signal_list_default_key(key),
+            ),
+        )
+
+    def _signal_list_snapshot(self):
+        signals = tuple(
+            (
+                key,
+                info.get("name", ""),
+                info.get("display_name", key),
+                info.get("comment", "") or "",
+                info.get("bus_id"),
+                self.can_bus_data.get(info.get("bus_id"), {}).get("name")
+                if info.get("bus_id") is not None else None,
+                self._signal_list_default_key(key)[0],
+            )
+            for key, info in self.signals.items()
+        )
+        return signals, tuple(sorted(self._user_signal_order.items()))
+
     def refresh_signal_list_ui(self):
         if not getattr(self, "_signal_panel_ready", False):
             return super().refresh_signal_list_ui()
+        snapshot = self._signal_list_snapshot()
+        if snapshot == self._last_signal_list_snapshot:
+            self.set_buttons_enabled(bool(self.signals))
+            return
         checked = set(self.get_selected_signals())
         self.signal_list_widget.blockSignals(True)
         self.signal_list_widget.setUpdatesEnabled(False)
@@ -113,22 +163,14 @@ class SignalPanelMixin:
         valid = set(self.signals)
         self._user_signal_order = {k: v for k, v in self._user_signal_order.items() if k in valid}
 
-        def default_key(key):
-            info = self.signals[key]
-            kind = 0 if key.startswith("MATH_") else 1 if key.startswith("CAN_") else 2
-            return kind, info.get("display_name", key).lower()
-        keys = sorted(self.signals, key=lambda k: (self._user_signal_order.get(k, 10**9), default_key(k)))
+        keys = self._ordered_signal_keys()
         self.lat_combo.blockSignals(True); self.lon_combo.blockSignals(True)
         lat_key = self.lat_combo.currentData(); lon_key = self.lon_combo.currentData()
         self.lat_combo.clear(); self.lon_combo.clear()
         self.search_index = {}
         for key in keys:
             info = self.signals[key]
-            name = info.get("display_name", key)
-            bus_id = info.get("bus_id")
-            if bus_id is not None and "[" not in name:
-                bus_name = self.can_bus_data.get(bus_id, {}).get("name", f"Bus {bus_id}")
-                name = f"{name} [🚌 {bus_name}]"
+            name = self._signal_display_name(key)
             comment = info.get("comment", "") or ""
             item = QListWidgetItem("")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
@@ -148,6 +190,93 @@ class SignalPanelMixin:
         self._selection_changed(replot=False)
         self._apply_signal_filter()
         self.set_buttons_enabled(bool(self.signals))
+        self._last_signal_list_snapshot = self._signal_list_snapshot()
+
+    def _move_signal_item(self, key, target_row):
+        item = self.signal_widgets[key]["checkbox"].item
+        source_row = self.signal_list_widget.row(item)
+        if source_row == target_row:
+            return
+        item = self.signal_list_widget.takeItem(source_row)
+        self.signal_list_widget.insertItem(target_row, item)
+
+    def _sync_combo_metadata(self, combo, names):
+        rows = {combo.itemData(row): row for row in range(combo.count())}
+        for key, name in names.items():
+            row = rows.get(key)
+            if row is not None:
+                combo.setItemText(row, name)
+
+    def update_signal_metadata_ui(self, key):
+        return self.update_signal_metadata_batch((key,))
+
+    def update_signal_metadata_batch(self, keys):
+        """Update existing signal metadata without recreating list items."""
+        if not getattr(self, "_signal_panel_ready", False):
+            self.refresh_signal_list_ui()
+            return False
+        keys = tuple(dict.fromkeys(keys))
+        if not keys:
+            return True
+        if any(key not in self.signals or key not in self.signal_widgets for key in keys):
+            self.refresh_signal_list_ui()
+            return False
+
+        current_item = self.signal_list_widget.currentItem()
+        scroll_value = self.signal_list_widget.verticalScrollBar().value()
+        lat_key = self.lat_combo.currentData()
+        lon_key = self.lon_combo.currentData()
+        names = {}
+
+        self.signal_list_widget.blockSignals(True)
+        self.signal_list_widget.setUpdatesEnabled(False)
+        self.lat_combo.blockSignals(True)
+        self.lon_combo.blockSignals(True)
+        try:
+            for key in keys:
+                info = self.signals[key]
+                name = self._signal_display_name(key)
+                comment = info.get("comment", "") or ""
+                item = self.signal_widgets[key]["checkbox"].item
+                item.setData(NAME_ROLE, name)
+                item.setData(COMMENT_ROLE, comment)
+                item.setToolTip(comment)
+                self.search_index[key] = f"{info.get('name','')} {name} {comment}".lower()
+                names[key] = name
+
+            self._sync_combo_metadata(self.lat_combo, names)
+            self._sync_combo_metadata(self.lon_combo, names)
+
+            desired_keys = self._ordered_signal_keys()
+            desired_rows = {key: row for row, key in enumerate(desired_keys)}
+            if len(keys) == 1:
+                self._move_signal_item(keys[0], desired_rows[keys[0]])
+            elif any(
+                self.signal_list_widget.item(row).data(KEY_ROLE) != key
+                for row, key in enumerate(desired_keys)
+            ):
+                items = {}
+                for row in range(self.signal_list_widget.count() - 1, -1, -1):
+                    item = self.signal_list_widget.takeItem(row)
+                    items[item.data(KEY_ROLE)] = item
+                for desired_key in desired_keys:
+                    self.signal_list_widget.addItem(items[desired_key])
+
+            if current_item is not None:
+                self.signal_list_widget.setCurrentItem(current_item)
+            for combo, selected in ((self.lat_combo, lat_key), (self.lon_combo, lon_key)):
+                row = combo.findData(selected)
+                if row >= 0:
+                    combo.setCurrentIndex(row)
+            self._apply_signal_filter()
+            self.signal_list_widget.verticalScrollBar().setValue(scroll_value)
+            self._last_signal_list_snapshot = self._signal_list_snapshot()
+        finally:
+            self.lat_combo.blockSignals(False)
+            self.lon_combo.blockSignals(False)
+            self.signal_list_widget.blockSignals(False)
+            self.signal_list_widget.setUpdatesEnabled(True)
+        return True
 
     def search_signals(self, text):
         self._search_pending_text = text.strip().lower()
@@ -200,6 +329,7 @@ class SignalPanelMixin:
 
     def _update_signal_list_values(self):
         if self._current_cursor_time is None or not self._mouse_in_plot or self._view_mode != "selected": return
+        value_updates = []
         for i in range(self.signal_list_widget.count()):
             item = self.signal_list_widget.item(i)
             if item.checkState() != Qt.CheckState.Checked: continue
@@ -216,10 +346,22 @@ class SignalPanelMixin:
             else:
                 try: shown = "NaN" if np.isnan(value) else f"{value:.3f}"
                 except TypeError: shown = str(value)
-            item.setData(VALUE_ROLE, shown)
+            value_updates.append((item, shown))
+        blocker = QSignalBlocker(self.signal_list_widget)
+        try:
+            for item, shown in value_updates:
+                item.setData(VALUE_ROLE, shown)
+        finally:
+            del blocker
         self.signal_list_widget.viewport().update()
 
     def _clear_signal_values(self):
         if not hasattr(self, "signal_list_widget"): return
-        for i in range(self.signal_list_widget.count()): self.signal_list_widget.item(i).setData(VALUE_ROLE, None)
+        blocker = QSignalBlocker(self.signal_list_widget)
+        try:
+            for i in range(self.signal_list_widget.count()):
+                self.signal_list_widget.item(i).setData(VALUE_ROLE, None)
+        finally:
+            del blocker
         self._sig_value_cache.clear()
+        self.signal_list_widget.viewport().update()

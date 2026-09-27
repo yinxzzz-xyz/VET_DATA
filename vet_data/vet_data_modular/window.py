@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from PyQt6.QtWidgets import QDialog, QFileDialog, QLabel, QMessageBox, QPushButton
+from PyQt6.QtWidgets import (
+    QDialog, QFileDialog, QInputDialog, QLabel, QMessageBox, QPushButton,
+)
 
 from .blf_slice_dialog import BlfSliceDialog
 from .blf_slice_progress import (
@@ -28,7 +30,11 @@ from .math_channel import SearchableMathChannelDialog  # retains legacy compatib
 from .plot_panel import PlotPanelMixin
 from .signal_panel import SignalPanelMixin
 from .signal_resolver import SignalResolver
-from .workers import BusyLoadDialog, DataLoadWorker, FormulaRestoreWorker
+from .workers import (
+    BusyLoadDialog, CanBusDetectionDialog, CanBusDetectionWorker,
+    CsvExportSignal, CsvExportSnapshot, CsvExportWorker, DataLoadWorker,
+    FormulaRestoreWorker, normalized_can_path,
+)
 
 
 class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, baseline.MDFPlotter):
@@ -37,6 +43,10 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         super().__init__()
         self.setWindowTitle("VET_DATA merged modular")
         self._data_load_worker = None; self._data_load_dialog = None
+        self._can_bus_detection_worker = None; self._can_bus_detection_dialog = None
+        self.can_bus_mapping = None
+        self.can_detection_snapshot = None
+        self._can_detection_generation = 0
         self._blf_slice_dialog = None; self._blf_slice_worker = None; self._blf_slice_progress = None
         self._blf_slice_result = None
         self._close_after_load = False; self._close_after_blf_slice = False
@@ -47,10 +57,94 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._formula_restore_background_enabled = True
         self._close_after_formula_restore = False
         self._formula_editor_dialog = None
+        self._csv_export_worker = None
+        self._csv_export_dialog = None
+        self._close_after_csv_export = False
         self.math_channel_button.setText("➕ 创建自定义公式计算通道")
         self.math_channel_button.setToolTip("使用多信号公式、数学函数、导数和积分创建通道")
         self._setup_signal_panel(); self._setup_plot_panel(); self._setup_collapsible_panels()
         self._setup_blf_slice_entry()
+
+    def export_selected_signals_to_csv(self):
+        if self._csv_export_worker is not None and self._csv_export_worker.isRunning():
+            QMessageBox.information(self, "导出CSV", "已有 CSV 导出任务正在运行。")
+            return
+        selected_signals = self.get_selected_signals()
+        if not selected_signals:
+            QMessageBox.warning(self, "导出CSV", "请选择至少一个信号进行导出。")
+            return
+        file_name, _ = QFileDialog.getSaveFileName(
+            self, "导出CSV", "selected_signals.csv", "CSV Files (*.csv)"
+        )
+        if not file_name:
+            return
+
+        target_frequency, ok = QInputDialog.getDouble(
+            self, "重采样频率", "请输入目标重采样频率 (Hz):",
+            value=10.0, min=0.1, max=10000.0, decimals=2,
+        )
+        if not ok or target_frequency <= 0:
+            return
+
+        export_signals = []
+        for unique_key in selected_signals:
+            signal_info = self.signals.get(unique_key)
+            if not signal_info:
+                continue
+            signal = self._get_signal(signal_info)
+            if signal is not None and len(signal.timestamps) > 0:
+                export_signals.append(CsvExportSignal(
+                    str(signal_info["display_name"]), signal
+                ))
+        if not export_signals:
+            QMessageBox.warning(self, "导出CSV", "无法获取信号数据。")
+            return
+
+        snapshot = CsvExportSnapshot(
+            str(Path(file_name).resolve()), float(target_frequency),
+            tuple(export_signals),
+        )
+        worker = CsvExportWorker(snapshot, self)
+        dialog = BusyLoadDialog(self)
+        dialog.setWindowTitle("导出 CSV")
+        dialog.set_status("正在准备 CSV 导出…")
+        worker.progress.connect(lambda _value, text: dialog.set_status(text))
+        worker.completed.connect(self._complete_csv_export)
+        worker.error.connect(self._fail_csv_export)
+        worker.cancelled.connect(self._cancel_csv_export)
+        worker.finished.connect(lambda: self._cleanup_csv_export(worker, dialog))
+        self._csv_export_worker = worker
+        self._csv_export_dialog = dialog
+        worker.start()
+        dialog.show()
+
+    def _complete_csv_export(self, output_path):
+        if not self._close_after_csv_export:
+            QMessageBox.information(
+                self, "导出CSV成功", f"成功导出信号到 {output_path}"
+            )
+
+    def _fail_csv_export(self, message):
+        if not self._close_after_csv_export:
+            QMessageBox.critical(self, "导出CSV失败", message)
+
+    def _cancel_csv_export(self):
+        pass
+
+    def _cleanup_csv_export(self, worker, dialog):
+        if worker is not self._csv_export_worker:
+            dialog.close()
+            dialog.deleteLater()
+            worker.deleteLater()
+            return
+        self._csv_export_worker = None
+        self._csv_export_dialog = None
+        dialog.close()
+        dialog.deleteLater()
+        worker.deleteLater()
+        if self._close_after_csv_export:
+            self._close_after_csv_export = False
+            self.close()
 
     def _formula_context_token(self):
         return (self._formula_context_generation, self.mdf_path, id(self.mdf_file))
@@ -424,12 +518,43 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
     def load_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择数据文件", "", "支持的数据文件 (*.mdf *.mf4 *.blf *.asc *.trc *.csv *.vbo);;所有文件 (*)")
         if not path: return
+        previous_worker = self._can_bus_detection_worker
+        if previous_worker is not None and previous_worker.isRunning():
+            previous_worker.cancel()
+        self._can_detection_generation += 1
+        detection_generation = self._can_detection_generation
+        self.can_detection_snapshot = None
         suffix = Path(path).suffix.lower()
         if suffix in {".blf", ".asc", ".trc"}:
-            # CAN parsing already has the baseline's determinate ParseWorker dialog.
             self._formula_context_generation += 1
             self.mdf_path = path; self.current_file_label.setText(f"当前文件: {Path(path).name}")
-            self.load_can_bus_info(path); self.create_bus_config_ui()
+            self.can_bus_data.clear()
+            self.can_bus_mapping = None
+            self.set_buttons_enabled(False)
+            dialog = CanBusDetectionDialog(self)
+            worker = CanBusDetectionWorker(path, self)
+            self._can_bus_detection_dialog = dialog
+            self._can_bus_detection_worker = worker
+            dialog.cancel_requested.connect(worker.cancel)
+            worker.status.connect(dialog.set_status)
+            worker.result.connect(
+                lambda result, generation=detection_generation, owner=worker:
+                self._finish_can_bus_detection(result, generation, owner)
+            )
+            worker.error.connect(
+                lambda message, generation=detection_generation, owner=worker:
+                self._fail_can_bus_detection(message, generation, owner)
+            )
+            worker.cancelled.connect(
+                lambda generation=detection_generation, owner=worker:
+                self._cancel_can_bus_detection(generation, owner)
+            )
+            worker.finished.connect(
+                lambda generation=detection_generation, owner=worker, owner_dialog=dialog:
+                self._cleanup_can_bus_detection(generation, owner, owner_dialog)
+            )
+            dialog.show()
+            worker.start()
             return
         self.set_buttons_enabled(False)
         self._data_load_dialog = BusyLoadDialog(self); self._data_load_dialog.show()
@@ -453,6 +578,8 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.calculated_signal_definitions.clear()
         self._formula_restore_report = None
         self.can_bus_data.clear(); self.db_per_bus.clear(); self.bus_protocols.clear(); self.can_bus_signals.clear()
+        self.can_bus_mapping = None
+        self.can_detection_snapshot = None
         self.clear_bus_config(); self._sig_value_cache.clear(); self._user_signal_order.clear()
         self.refresh_signal_list_ui(); self.load_config()
         self._close_load_dialog(); self._data_load_worker = None
@@ -466,7 +593,70 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         if self._data_load_dialog is not None:
             self._data_load_dialog.close(); self._data_load_dialog.deleteLater(); self._data_load_dialog = None
 
+    def _is_current_can_detection(self, generation, worker):
+        return (
+            generation == self._can_detection_generation
+            and worker is self._can_bus_detection_worker
+        )
+
+    def _finish_can_bus_detection(self, result, generation, worker):
+        if not self._is_current_can_detection(generation, worker):
+            return
+        if result.snapshot.file_identity.path != normalized_can_path(self.mdf_path):
+            return
+        self.can_bus_data.clear()
+        self.can_bus_data.update(result)
+        self.can_bus_mapping = result.mapping
+        self.can_detection_snapshot = result.snapshot
+        self.bus_loaded = True
+        self._print_bus_info()
+        self.create_bus_config_ui()
+
+    def _fail_can_bus_detection(self, message, generation, worker):
+        if not self._is_current_can_detection(generation, worker):
+            return
+        self.can_detection_snapshot = None
+        QMessageBox.critical(self, "加载文件失败", message)
+
+    def _cancel_can_bus_detection(self, generation, worker):
+        if not self._is_current_can_detection(generation, worker):
+            return
+        self.can_detection_snapshot = None
+        self.current_file_label.setText("当前文件: 未选择")
+
+    def _cleanup_can_bus_detection(self, generation, worker, dialog):
+        if not self._is_current_can_detection(generation, worker):
+            dialog.close()
+            dialog.deleteLater()
+            worker.deleteLater()
+            return
+        self._can_bus_detection_worker = None
+        if self._can_bus_detection_dialog is not None:
+            self._can_bus_detection_dialog.close()
+            self._can_bus_detection_dialog.deleteLater()
+            self._can_bus_detection_dialog = None
+        self.set_buttons_enabled(True)
+        if worker is not None:
+            worker.deleteLater()
+        if self._close_after_load:
+            self._close_after_load = False
+            self.close()
+
     def closeEvent(self, event):
+        if self._csv_export_worker is not None and self._csv_export_worker.isRunning():
+            self._csv_export_worker.cancel()
+            self._close_after_csv_export = True
+            if self._csv_export_dialog is not None:
+                self._csv_export_dialog.set_status("正在安全停止 CSV 导出…")
+            event.ignore()
+            return
+        if self._can_bus_detection_worker is not None and self._can_bus_detection_worker.isRunning():
+            self._can_bus_detection_worker.cancel()
+            self._close_after_load = True
+            if self._can_bus_detection_dialog is not None:
+                self._can_bus_detection_dialog.set_status("正在安全停止 CAN 总线探测…")
+            event.ignore()
+            return
         if self._blf_slice_worker is not None and self._blf_slice_worker.isRunning():
             self._blf_slice_worker.cancel()
             self._close_after_blf_slice = True

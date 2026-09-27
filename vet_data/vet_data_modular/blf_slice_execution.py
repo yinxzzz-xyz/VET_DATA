@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import math
 import os
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime
+from heapq import heapify, heappop, heappush
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable
@@ -193,6 +195,81 @@ class _TargetState:
     started: bool = False
 
 
+class _WindowMatcher:
+    """Find matching target states while preserving closed-window semantics."""
+
+    def __init__(self, states: list[_TargetState]) -> None:
+        self._states = states
+        self._starts = sorted(
+            (float(state.plan.window.start), index)
+            for index, state in enumerate(states)
+        )
+        self._start_position = 0
+        self._active_indices: list[int] = []
+        self._active_states: list[_TargetState] = []
+        self._active_index_set: set[int] = set()
+        self._ends: list[tuple[float, int]] = []
+        self._previous_timestamp: float | None = None
+
+    def matching_states(self, timestamp: float) -> list[_TargetState]:
+        """Return matches in original state order, rebuilding after reversals."""
+        if self._previous_timestamp is not None and timestamp < self._previous_timestamp:
+            self._rebuild(timestamp)
+        else:
+            self._advance(timestamp)
+        self._previous_timestamp = timestamp
+        return self._active_states
+
+    def _advance(self, timestamp: float) -> None:
+        while (
+            self._start_position < len(self._starts)
+            and self._starts[self._start_position][0] <= timestamp
+        ):
+            _, index = self._starts[self._start_position]
+            self._activate(index)
+            self._start_position += 1
+
+        # Windows are closed: a state remains active when end == timestamp.
+        while self._ends and self._ends[0][0] < timestamp:
+            _, index = heappop(self._ends)
+            self._deactivate(index)
+
+    def _rebuild(self, timestamp: float) -> None:
+        self._active_indices = [
+            index
+            for index, state in enumerate(self._states)
+            if state.plan.window.start <= timestamp <= state.plan.window.end
+        ]
+        self._active_states = [self._states[index] for index in self._active_indices]
+        self._active_index_set = set(self._active_indices)
+        self._ends = [
+            (float(self._states[index].plan.window.end), index)
+            for index in self._active_indices
+        ]
+        heapify(self._ends)
+        self._start_position = bisect_right(
+            self._starts,
+            (timestamp, len(self._states)),
+        )
+
+    def _activate(self, index: int) -> None:
+        if index in self._active_index_set:
+            return
+        self._active_index_set.add(index)
+        position = bisect_right(self._active_indices, index)
+        self._active_indices.insert(position, index)
+        self._active_states.insert(position, self._states[index])
+        heappush(self._ends, (float(self._states[index].plan.window.end), index))
+
+    def _deactivate(self, index: int) -> None:
+        if index not in self._active_index_set:
+            return
+        self._active_index_set.remove(index)
+        position = bisect_left(self._active_indices, index)
+        self._active_indices.pop(position)
+        self._active_states.pop(position)
+
+
 def execute_slice(
     task: SliceTask,
     plan: SliceExecutionPlan,
@@ -225,6 +302,7 @@ def execute_slice(
                     state.cancelled = True
             break
         relevant = [states[target_id] for target_id in scan.target_ids]
+        matcher = _WindowMatcher(relevant)
         for state in relevant:
             state.started = True
         reader = None
@@ -240,7 +318,15 @@ def execute_slice(
                     break
                 if scanned % progress_interval == 0:
                     _emit_progress(progress_callback, scan.path, file_index, len(plan.source_scans), scanned)
-                _dispatch_message(task, message, relevant, writer_factory, owned, allocator)
+                _dispatch_message(
+                    task,
+                    message,
+                    relevant,
+                    matcher,
+                    writer_factory,
+                    owned,
+                    allocator,
+                )
         except Exception as exc:
             detail = f"source_read_or_process_error:{scan.path}:{type(exc).__name__}: {exc}"
             for state in relevant:
@@ -296,6 +382,7 @@ def _dispatch_message(
     task: SliceTask,
     message: Any,
     states: list[_TargetState],
+    matcher: _WindowMatcher,
     writer_factory: Callable[[Path], Any],
     owned: OwnedTemporaryFiles,
     allocator: OutputNameAllocator,
@@ -307,7 +394,7 @@ def _dispatch_message(
             state.warnings.append("ignored_invalid_timestamp")
         return
     timestamp = float(blf_timestamp_to_utc_timestamp(float(raw_timestamp), task.blf_utc_offset))
-    matching = [state for state in states if state.plan.window.start <= timestamp <= state.plan.window.end]
+    matching = matcher.matching_states(timestamp)
     if not matching:
         return
     if not hasattr(message, "is_remote_frame") or not hasattr(message, "is_error_frame"):

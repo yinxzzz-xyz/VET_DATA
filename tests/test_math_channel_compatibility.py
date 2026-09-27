@@ -8,6 +8,7 @@ future formula engine.
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +29,15 @@ from vet_data_modular.workers import LoadResult
 
 
 APP = QApplication.instance() or QApplication([])
+
+
+def _wait_for_csv_export(window, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while window._csv_export_worker is not None and time.monotonic() < deadline:
+        APP.processEvents()
+        time.sleep(0.005)
+    APP.processEvents()
+    assert window._csv_export_worker is None
 
 
 def _info(name):
@@ -249,6 +259,7 @@ class LegacyMathChannelCompatibilityTests(unittest.TestCase):
                  patch.object(baseline.QInputDialog, "getDouble", return_value=(1.0, True)), \
                  patch.object(baseline.QMessageBox, "information"):
                 self.window.export_selected_signals_to_csv()
+                _wait_for_csv_export(self.window)
             exported = pd.read_csv(path)
         self.assertEqual(list(exported.columns), ["timestamp", "Calc Export"])
         np.testing.assert_allclose(exported["Calc Export"], [5, 6, 7])
