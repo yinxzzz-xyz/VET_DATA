@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from PyQt6.QtWidgets import (
     QDialog, QFileDialog, QInputDialog, QLabel, QMessageBox, QPushButton,
+    QSplitter,
 )
 
 from .blf_slice_dialog import BlfSliceDialog
@@ -26,6 +27,9 @@ from .legacy import baseline
 from .formula_editor import FormulaEditorDialog
 from .formula_parser import FormulaError
 from .formula_validator import parse_and_validate_formula
+from .gui_state import (
+    create_gui_settings, restore_main_window_state, save_main_window_state,
+)
 from .math_channel import SearchableMathChannelDialog  # retains legacy compatibility
 from .plot_panel import PlotPanelMixin
 from .signal_panel import SignalPanelMixin
@@ -39,7 +43,7 @@ from .workers import (
 
 class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, baseline.MDFPlotter):
     """26.09.01 baseline plus the v10 interaction enhancements."""
-    def __init__(self):
+    def __init__(self, gui_settings=None):
         super().__init__()
         self.setWindowTitle("VET_DATA merged modular")
         self._data_load_worker = None; self._data_load_dialog = None
@@ -64,6 +68,16 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.math_channel_button.setToolTip("使用多信号公式、数学函数、导数和积分创建通道")
         self._setup_signal_panel(); self._setup_plot_panel(); self._setup_collapsible_panels()
         self._setup_blf_slice_entry()
+        self._gui_settings = gui_settings if gui_settings is not None else create_gui_settings()
+        self._pending_splitter_sizes = restore_main_window_state(
+            self, self.main_splitter, self._gui_settings
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._pending_splitter_sizes is not None:
+            self.main_splitter.setSizes(list(self._pending_splitter_sizes))
+            self._pending_splitter_sizes = None
 
     def export_selected_signals_to_csv(self):
         if self._csv_export_worker is not None and self._csv_export_worker.isRunning():
@@ -447,6 +461,14 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             found = cls._find_layout_containing(child.layout(), widget) if child else None
             if found is not None:
                 return found
+            if isinstance(child, QSplitter):
+                for child_index in range(child.count()):
+                    splitter_child = child.widget(child_index)
+                    found = cls._find_layout_containing(
+                        splitter_child.layout(), widget
+                    )
+                    if found is not None:
+                        return found
         return None
 
     def open_blf_slice_dialog(self):
@@ -682,5 +704,6 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                 self._data_load_dialog.set_status("正在安全停止文件读取…")
             event.ignore()
             return
+        save_main_window_state(self, self.main_splitter, self._gui_settings)
         self._close_load_dialog()
         super().closeEvent(event)

@@ -2531,7 +2531,8 @@ class MDFPlotter(QWidget):
         main_layout = QHBoxLayout(self)
 
         # ====== 左侧面板 ======
-        left_panel = QVBoxLayout()
+        self.left_panel_widget = QWidget()
+        left_panel = QVBoxLayout(self.left_panel_widget)
         left_panel.setContentsMargins(5, 5, 5, 5)
 
         file_select_layout = QHBoxLayout()
@@ -2701,18 +2702,18 @@ class MDFPlotter(QWidget):
         button_layout.addWidget(self.save_data_button)
 
         # ====== 使用 QSplitter ======
-        left_splitter = QSplitter(Qt.Orientation.Vertical)
-        left_splitter.addWidget(signal_groupbox)
-        left_splitter.addWidget(bus_groupbox)
-        left_splitter.setSizes([400, 250])
-        left_splitter.setChildrenCollapsible(False)
+        self.left_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.left_splitter.addWidget(signal_groupbox)
+        self.left_splitter.addWidget(bus_groupbox)
+        self.left_splitter.setSizes([400, 250])
+        self.left_splitter.setChildrenCollapsible(False)
 
         left_panel.addLayout(file_select_layout)
         left_panel.addWidget(self.search_box)
         left_panel.addLayout(select_buttons_layout)
         left_panel.addLayout(config_buttons_layout)
         left_panel.addWidget(self.math_channel_button)
-        left_panel.addWidget(left_splitter)
+        left_panel.addWidget(self.left_splitter)
         left_panel.addWidget(map_groupbox)
         left_panel.addLayout(button_layout)
         left_panel.setStretch(5, 1)
@@ -2739,8 +2740,18 @@ class MDFPlotter(QWidget):
         scroll_area_right.setWidget(self.plot_container)
         right_panel_layout.addWidget(scroll_area_right)
 
-        main_layout.addLayout(left_panel, 1)
-        main_layout.addWidget(right_panel, 3)
+        self.left_panel_widget.setMinimumWidth(320)
+        right_panel.setMinimumWidth(480)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(8)
+        self.main_splitter.addWidget(self.left_panel_widget)
+        self.main_splitter.addWidget(right_panel)
+        self.main_splitter.setSizes([360, 1080])
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.handle(1).setCursor(Qt.CursorShape.SplitHCursor)
+        main_layout.addWidget(self.main_splitter)
 
         # ====== 信号连接 ======
         self.load_file_button.clicked.connect(self.load_file_dialog)
