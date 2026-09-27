@@ -7,9 +7,9 @@ import numpy as np
 from PyQt6.QtCore import QMimeData, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QKeyEvent, QKeySequence, QTextCharFormat, QTextCursor, QTextFormat
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QTextEdit,
-    QVBoxLayout,
+    QVBoxLayout, QWidget, QSplitter, QSizePolicy,
 )
 
 from .calculated_signal import (
@@ -17,6 +17,7 @@ from .calculated_signal import (
 )
 from .formula_parser import FormulaError
 from .formula_validator import ALLOWED_FUNCTIONS, parse_and_validate_formula
+from .theme import DEFAULT_THEME, build_formula_editor_stylesheet
 from .workers import FormulaCalculationWorker
 
 
@@ -422,70 +423,169 @@ class FormulaEditorDialog(QDialog):
 
     def _build_ui(self):
         self.setWindowTitle("创建自定义公式计算通道")
-        self.resize(850, 700)
+        self.setProperty("uiDialog", "formulaEditor")
+        self.setMinimumSize(720, 620)
+        self.resize(900, 760)
+        self.setStyleSheet(build_formula_editor_stylesheet(DEFAULT_THEME))
         root = QVBoxLayout(self)
-        form = QFormLayout()
+        root.setContentsMargins(
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+        )
+        root.setSpacing(DEFAULT_THEME.spacing.small)
+
+        def create_section(object_name, title):
+            section = QWidget()
+            section.setObjectName(object_name)
+            section.setProperty("uiFormulaSection", "true")
+            section_layout = QVBoxLayout(section)
+            section_layout.setContentsMargins(
+                DEFAULT_THEME.spacing.small, DEFAULT_THEME.spacing.small,
+                DEFAULT_THEME.spacing.small, DEFAULT_THEME.spacing.small,
+            )
+            section_layout.setSpacing(DEFAULT_THEME.spacing.xsmall)
+            heading = QLabel(title)
+            heading.setProperty("uiFormulaHeading", "true")
+            section_layout.addWidget(heading)
+            return section, section_layout
+
+        self.basic_section, basic_layout = create_section(
+            "formulaBasicSection", "A. 基本信息"
+        )
+        form = QGridLayout()
+        form.setHorizontalSpacing(DEFAULT_THEME.spacing.medium)
+        form.setVerticalSpacing(DEFAULT_THEME.spacing.xsmall)
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("例如：WheelPower")
         self.unit_edit = QLineEdit()
         self.unit_edit.setPlaceholderText("可选，例如：kW、m/s²、rpm/s")
-        form.addRow("新信号名称：", self.name_edit)
-        form.addRow("结果单位：", self.unit_edit)
-        root.addLayout(form)
+        name_label = QLabel("新信号名称")
+        unit_label = QLabel("结果单位")
+        name_label.setProperty("uiFormulaCaption", "true")
+        unit_label.setProperty("uiFormulaCaption", "true")
+        form.addWidget(name_label, 0, 0)
+        form.addWidget(unit_label, 0, 1)
+        form.addWidget(self.name_edit, 1, 0)
+        form.addWidget(self.unit_edit, 1, 1)
+        form.setColumnStretch(0, 1)
+        form.setColumnStretch(1, 1)
+        basic_layout.addLayout(form)
+        root.addWidget(self.basic_section)
 
-        root.addWidget(QLabel("公式："))
+        self.editor_section, editor_layout = create_section(
+            "formulaEditorSection", "B. 公式编辑"
+        )
+        formula_label = QLabel("公式")
+        formula_label.setProperty("uiFormulaCaption", "true")
+        editor_layout.addWidget(formula_label)
         self.formula_edit = AtomicFormulaEdit()
+        self.formula_edit.setObjectName("formulaExpressionEditor")
+        self.formula_edit.setProperty("uiFormulaCore", "true")
         self.formula_edit.setPlaceholderText("从下方列表插入信号，例如：(VehicleSpeed + Torque)^2")
-        self.formula_edit.setMinimumHeight(110)
-        root.addWidget(self.formula_edit)
+        self.formula_edit.setMinimumHeight(130)
+        self.formula_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        editor_layout.addWidget(self.formula_edit, 2)
 
-        content = QGridLayout()
-        content.addWidget(QLabel("搜索信号："), 0, 0)
+        self.signal_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.signal_splitter.setObjectName("formulaSignalSplitter")
+        self.signal_splitter.setProperty("uiFormulaSplitter", "true")
+        self.signal_splitter.setChildrenCollapsible(False)
+
+        available_panel = QWidget()
+        available_layout = QVBoxLayout(available_panel)
+        available_layout.setContentsMargins(0, 0, 0, 0)
+        available_layout.setSpacing(DEFAULT_THEME.spacing.xsmall)
+        available_title = QLabel("可用信号")
+        available_title.setProperty("uiFormulaCaption", "true")
+        available_layout.addWidget(available_title)
+        search_row = QHBoxLayout()
+        search_label = QLabel("搜索")
+        search_label.setProperty("uiFormulaCaption", "true")
+        search_row.addWidget(search_label)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("输入部分名称，大小写不敏感")
-        content.addWidget(self.search_edit, 0, 1)
+        search_row.addWidget(self.search_edit, 1)
+        available_layout.addLayout(search_row)
         self.signal_list = QListWidget()
-        self.signal_list.setMinimumHeight(210)
-        content.addWidget(self.signal_list, 1, 0, 1, 2)
+        self.signal_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        available_layout.addWidget(self.signal_list, 1)
         self.insert_signal_button = QPushButton("插入信号")
-        content.addWidget(self.insert_signal_button, 2, 0, 1, 2)
-        self.binding_title = QLabel("已选信号：")
-        content.addWidget(self.binding_title, 0, 2)
-        self.binding_list = QListWidget()
-        self.binding_list.setMinimumWidth(330)
-        content.addWidget(self.binding_list, 1, 2, 2, 1)
-        root.addLayout(content)
+        self.insert_signal_button.setProperty("uiRole", "secondary")
+        available_layout.addWidget(self.insert_signal_button)
 
-        root.addWidget(QLabel("插入函数："))
+        selected_panel = QWidget()
+        selected_layout = QVBoxLayout(selected_panel)
+        selected_layout.setContentsMargins(0, 0, 0, 0)
+        selected_layout.setSpacing(DEFAULT_THEME.spacing.xsmall)
+        self.binding_title = QLabel("已选信号：")
+        self.binding_title.setProperty("uiFormulaCaption", "true")
+        selected_layout.addWidget(self.binding_title)
+        self.binding_list = QListWidget()
+        self.binding_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        selected_layout.addWidget(self.binding_list, 1)
+        available_panel.setMinimumWidth(280)
+        selected_panel.setMinimumWidth(220)
+        self.signal_splitter.addWidget(available_panel)
+        self.signal_splitter.addWidget(selected_panel)
+        self.signal_splitter.setStretchFactor(0, 3)
+        self.signal_splitter.setStretchFactor(1, 2)
+        self.signal_splitter.setSizes([520, 330])
+        editor_layout.addWidget(self.signal_splitter, 2)
+
+        function_label = QLabel("插入函数")
+        function_label.setProperty("uiFormulaCaption", "true")
+        editor_layout.addWidget(function_label)
         functions = QGridLayout()
+        functions.setSpacing(DEFAULT_THEME.spacing.xsmall)
         self.function_buttons = {}
         for index, function in enumerate(FUNCTION_NAMES):
             button = QPushButton(function)
+            button.setProperty("uiRole", "formulaFunction")
             button.setToolTip(f"插入 {function}() 并将光标定位到括号内")
             button.clicked.connect(lambda _checked=False, name=function: self.insert_function(name))
-            functions.addWidget(button, index // 7, index % 7)
+            functions.addWidget(button, index // 5, index % 5)
             self.function_buttons[function] = button
-        root.addLayout(functions)
+        for column in range(5):
+            functions.setColumnStretch(column, 1)
+        editor_layout.addLayout(functions)
+        root.addWidget(self.editor_section, 1)
 
+        self.validation_section, validation_layout = create_section(
+            "formulaValidationSection", "C. 验证与生成"
+        )
         actions = QHBoxLayout()
         self.validate_button = QPushButton("验证公式")
         self.preview_button = QPushButton("预览/诊断")
+        self.validate_button.setProperty("uiRole", "secondary")
+        self.preview_button.setProperty("uiRole", "secondary")
         actions.addWidget(self.validate_button)
         actions.addWidget(self.preview_button)
         actions.addStretch()
-        root.addLayout(actions)
+        validation_layout.addLayout(actions)
         self.diagnostic_output = QPlainTextEdit()
+        self.diagnostic_output.setObjectName("formulaDiagnosticOutput")
         self.diagnostic_output.setReadOnly(True)
-        self.diagnostic_output.setMaximumHeight(150)
-        root.addWidget(self.diagnostic_output)
+        self.diagnostic_output.setMinimumHeight(90)
+        self.diagnostic_output.setMaximumHeight(170)
+        self.diagnostic_output.setPlaceholderText("验证、预览和计算诊断将在此处显示")
+        validation_layout.addWidget(self.diagnostic_output)
 
         bottom = QHBoxLayout()
         bottom.addStretch()
         self.generate_button = QPushButton("生成通道")
         self.cancel_button = QPushButton("取消")
+        self.generate_button.setProperty("uiRole", "primary")
+        self.cancel_button.setProperty("uiRole", "secondary")
         bottom.addWidget(self.generate_button)
         bottom.addWidget(self.cancel_button)
-        root.addLayout(bottom)
+        validation_layout.addLayout(bottom)
+        root.addWidget(self.validation_section)
 
         self.search_edit.textChanged.connect(self.filter_signals)
         self.search_edit.returnPressed.connect(self.insert_selected_signal)
@@ -506,9 +606,10 @@ class FormulaEditorDialog(QDialog):
             key=lambda key: (str(self.available_signals[key].get("display_name", key)).casefold(), key),
         )
         for key in ordered:
-            item = QListWidgetItem(self.signal_display(key))
+            display = self.signal_display(key)
+            item = QListWidgetItem(display)
             item.setData(SIGNAL_KEY_ROLE, key)
-            item.setToolTip(f"Unique key: {key}")
+            item.setToolTip(display)
             self.signal_list.addItem(item)
         self.filter_signals(self.search_edit.text())
 
@@ -590,7 +691,11 @@ class FormulaEditorDialog(QDialog):
             self.formula_edit.refresh_atom_labels(self._visible_atom_label)
             self.binding_list.clear()
             for key in self.formula_edit.referenced_keys():
-                self.binding_list.addItem(self.signal_display(key))
+                display = self.signal_display(key)
+                item = QListWidgetItem(display)
+                item.setData(SIGNAL_KEY_ROLE, key)
+                item.setToolTip(display)
+                self.binding_list.addItem(item)
         finally:
             self._syncing_atoms = False
 

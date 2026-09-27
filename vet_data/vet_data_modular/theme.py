@@ -330,6 +330,79 @@ QHeaderView::section {{
 """.strip()
 
 
+def build_formula_editor_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
+    """Return token-driven styling for the formula definition workflow."""
+    c, f = theme.colors, theme.fonts
+    controls, padding = theme.controls, theme.padding
+    return f"""
+QDialog[uiDialog="formulaEditor"] {{ background-color: {c.background}; }}
+QWidget[uiFormulaSection="true"] {{
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+}}
+QLabel[uiFormulaHeading="true"] {{
+    color: {c.text_primary};
+    font-size: {f.subtitle}px;
+    font-weight: 600;
+}}
+QLabel[uiFormulaCaption="true"] {{
+    color: {c.text_secondary};
+    font-size: {f.small}px;
+    font-weight: 600;
+}}
+QLineEdit, QTextEdit[uiFormulaCore="true"], QPlainTextEdit, QListWidget {{
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+    selection-background-color: {c.selection};
+    selection-color: {c.selection_text};
+}}
+QLineEdit {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+}}
+QTextEdit[uiFormulaCore="true"] {{
+    padding: {padding.standard}px;
+    font-size: {f.body}px;
+}}
+QPlainTextEdit {{
+    padding: {padding.compact}px;
+    font-size: {f.small}px;
+}}
+QListWidget {{ font-size: {f.small}px; }}
+QListWidget::item {{ min-height: 22px; padding: 1px {padding.compact}px; }}
+QPushButton[uiRole="primary"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.surface};
+    background-color: {c.primary};
+    border: 1px solid {c.primary};
+    border-radius: {controls.corner_radius}px;
+    font-weight: 600;
+}}
+QPushButton[uiRole="secondary"], QPushButton[uiRole="formulaFunction"] {{
+    min-height: {controls.compact_height}px;
+    padding: 0 {padding.compact}px;
+    color: {c.secondary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+}}
+QPushButton[uiRole="formulaFunction"] {{ font-size: {f.small}px; }}
+QPushButton:disabled {{
+    color: {c.disabled_text};
+    background-color: {c.disabled_background};
+    border-color: {c.border};
+}}
+QSplitter[uiFormulaSplitter="true"]::handle {{
+    background-color: {c.border};
+    width: {theme.spacing.xsmall}px;
+}}
+""".strip()
+
+
 def apply_application_theme(
     application: QApplication, theme: ThemeTokens = DEFAULT_THEME
 ) -> None:
@@ -351,6 +424,7 @@ __all__ = [
     "apply_application_theme",
     "build_application_stylesheet",
     "build_can_config_stylesheet",
+    "build_formula_editor_stylesheet",
     "build_main_window_stylesheet",
     "build_signal_filter_stylesheet",
     "semantic_button_stylesheet",
