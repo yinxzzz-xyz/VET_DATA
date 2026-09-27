@@ -102,7 +102,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             self.save_config_button, self.load_config_button,
             self.math_channel_button, self.export_button,
             self.save_data_button, self.blf_slice_button,
-            self.show_map_button,
+            self.show_map_button, self.arxml2dbc_btn,
         )
         for button in primary_buttons:
             button.setProperty("uiRole", "primary")
@@ -318,8 +318,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                 widget = self.bus_config_widgets[bus_id]
                 widget.name_edit.setText(self.can_bus_data[bus_id]["name"])
                 if protocol:
-                    widget.protocol_label.setText(os.path.basename(protocol))
-                    widget.protocol_label.setStyleSheet("color: #27ae60; font-size: 9px;")
+                    widget.set_protocol_display(os.path.basename(protocol))
                     widget.protocol_path = protocol
 
     @staticmethod

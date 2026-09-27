@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QInputDialog, QMessageBox, QComboBox,
                              QFrame, QProgressBar,
                              QSplitter, QSizePolicy, QTreeWidget, QTreeWidgetItem,
-                             QTextEdit)
+                             QTextEdit, QHeaderView)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 import numpy as np
@@ -35,6 +35,10 @@ import time
 import multiprocessing
 
 from .signal_resolver import SignalResolutionError, SignalResolver
+from .theme import (
+    DEFAULT_THEME, build_can_config_stylesheet,
+    build_signal_filter_stylesheet,
+)
 from .workers import (
     CanDetectionSnapshot,
     capture_can_file_identity,
@@ -181,9 +185,15 @@ class SignalFilterDialog(QDialog):
     def init_ui(self):
         self.setWindowTitle(f"筛选信号 - {self.bus_name}")
         self.resize(800, 650)
+        self.setProperty("uiDialog", "signalFilter")
+        self.setStyleSheet(build_signal_filter_stylesheet(DEFAULT_THEME))
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(3)
+        layout.setContentsMargins(
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+        )
+        layout.setSpacing(DEFAULT_THEME.spacing.xsmall)
 
         # 统计信息 - 显示存在的ID数量
         total_msgs = len(self.db.messages)
@@ -192,10 +202,10 @@ class SignalFilterDialog(QDialog):
 
         info_text = f"数据库包含 {total_msgs} 个消息, 共 {total_sigs} 个信号"
         if existing_count > 0:
-            info_text += f" | 🟢 日志中存在 {existing_count} 个消息ID"
-        info_label = QLabel(info_text)
-        info_label.setStyleSheet("color: #2c3e50; font-weight: bold; padding: 3px; font-size: 11px;")
-        layout.addWidget(info_label)
+            info_text += f" | 日志中存在 {existing_count} 个消息 ID"
+        self.info_label = QLabel(info_text)
+        self.info_label.setProperty("uiTextRole", "summary")
+        layout.addWidget(self.info_label)
 
         # 搜索框
         search_layout = QHBoxLayout()
@@ -208,14 +218,14 @@ class SignalFilterDialog(QDialog):
         # 按钮行
         btn_layout = QHBoxLayout()
         self.select_all_btn.setText("✅ 全选 (当前筛选)")
-        self.select_all_btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 4px;")
         self.deselect_all_btn.setText("❌ 全部取消")
-        self.deselect_all_btn.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold; padding: 4px;")
+        self.select_all_btn.setProperty("uiRole", "secondary")
+        self.deselect_all_btn.setProperty("uiRole", "secondary")
         self.select_all_btn.clicked.connect(self.select_all)
         self.deselect_all_btn.clicked.connect(self.deselect_all)
 
         self.selection_count_label.setText("已选: 0 / 0")
-        self.selection_count_label.setStyleSheet("color: #27ae60; font-weight: bold; font-size: 11px;")
+        self.selection_count_label.setProperty("uiTextRole", "selection")
 
         btn_layout.addWidget(self.select_all_btn)
         btn_layout.addWidget(self.deselect_all_btn)
@@ -227,80 +237,14 @@ class SignalFilterDialog(QDialog):
         self.tree.setHeaderLabels(["信号名", "ID", "帧名", "端序", "位数", "注释"])
         self.tree.setIndentation(15)
         self.tree.setAlternatingRowColors(True)
-        self.tree.setColumnWidth(0, 200)
-        self.tree.setColumnWidth(1, 80)
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.tree.setColumnWidth(2, 180)
-        self.tree.setColumnWidth(3, 70)
-        self.tree.setColumnWidth(4, 50)
-        self.tree.setColumnWidth(5, 150)
-
-        # 修改样式表：移除所有 color 设置，让 setForeground 生效
-        self.tree.setStyleSheet("""
-            QTreeWidget {
-                border: 1px solid #ddd;
-                font-size: 11px;
-                alternate-background-color: #f8f9fa;
-                show-decoration-selected: 0;
-            }
-            QTreeWidget::item {
-                padding: 1px 2px;
-                height: 18px;
-                border: none;
-                background-color: transparent;
-            }
-            QTreeWidget::item:selected {
-                background-color: rgba(52, 152, 219, 0.15);
-            }
-            QTreeWidget::item:selected:active {
-                background-color: rgba(52, 152, 219, 0.15);
-            }
-            QTreeWidget::item:hover {
-                background-color: transparent;
-            }
-            QTreeWidget::item:selected:hover {
-                background-color: rgba(52, 152, 219, 0.15);
-            }
-            QTreeWidget::item:!selected:hover {
-                background-color: transparent;
-            }
-            QTreeWidget::item:selected:!active {
-                background-color: rgba(52, 152, 219, 0.10);
-            }
-            QTreeWidget::indicator {
-                width: 14px;
-                height: 14px;
-                margin-right: 4px;
-            }
-            QTreeWidget::indicator:checked {
-                background-color: #4CAF50;
-                border: 1px solid #388E3C;
-                border-radius: 2px;
-            }
-            QTreeWidget::indicator:unchecked {
-                background-color: white;
-                border: 1px solid #bbb;
-                border-radius: 2px;
-            }
-            QTreeWidget::indicator:indeterminate {
-                background-color: #FFD700;
-                border: 1px solid #DAA520;
-                border-radius: 2px;
-            }
-            QTreeWidget::indicator:hover {
-                border-color: #4CAF50;
-            }
-            QHeaderView::section {
-                background-color: #e8ecf1;
-                padding: 2px 5px;
-                font-weight: bold;
-                font-size: 10px;
-                border: none;
-                border-right: 1px solid #ddd;
-            }
-            QHeaderView::section:last {
-                border-right: none;
-            }
-        """)
 
         self.tree.itemClicked.connect(self.on_item_clicked)
         self.tree.itemChanged.connect(self.on_item_changed)
@@ -309,10 +253,9 @@ class SignalFilterDialog(QDialog):
         # 底部按钮
         btn_layout2 = QHBoxLayout()
         self.select_btn.setText("✅ 使用选中的信号")
-        self.select_btn.setStyleSheet(
-            "background-color: #27ae60; color: white; font-weight: bold; font-size: 12px; padding: 8px;")
         self.cancel_btn.setText("取消")
-        self.cancel_btn.setStyleSheet("font-size: 12px; padding: 8px;")
+        self.select_btn.setProperty("uiRole", "primary")
+        self.cancel_btn.setProperty("uiRole", "secondary")
         btn_layout2.addWidget(self.select_btn)
         btn_layout2.addWidget(self.cancel_btn)
         layout.addLayout(btn_layout2)
@@ -388,13 +331,11 @@ class SignalFilterDialog(QDialog):
             # 设置帧名（第0列）
             frame_item.setText(0, f"📦 {frame_name}")
 
-            # 如果该ID在数据中存在，帧名用绿色 - 使用 setForeground 确保生效
             if frame_exists:
-                frame_item.setForeground(0, QColor(0, 128, 0))  # darkGreen
                 frame_item.setToolTip(0, f"该帧ID (0x{frame_id:X}) 在日志中存在 ✓")
             else:
-                frame_item.setForeground(0, QColor(0, 0, 139))  # darkBlue
                 frame_item.setToolTip(0, f"该帧ID (0x{frame_id:X}) 在日志中不存在")
+            frame_item.setToolTip(2, frame_name)
 
             frame_item.setText(1, frame_id_hex)
 
@@ -409,7 +350,6 @@ class SignalFilterDialog(QDialog):
             # "已选 X 个" 用绿色显示
             if frame_checked_count > 0:
                 frame_item.setText(2, f"({total_sigs} 个信号，已选 {frame_checked_count} 个)")
-                frame_item.setForeground(2, QColor(0, 128, 0))  # darkGreen
             else:
                 frame_item.setText(2, f"({total_sigs} 个信号)")
 
@@ -445,6 +385,9 @@ class SignalFilterDialog(QDialog):
                 sig_item.setText(3, endian)
                 sig_item.setText(4, str(sig.length))
                 sig_item.setText(5, sig_comment[:50] + ('...' if len(sig_comment) > 50 else ''))
+                sig_item.setToolTip(0, sig_name)
+                sig_item.setToolTip(2, frame_name)
+                sig_item.setToolTip(5, sig_comment)
 
                 self.signal_items.append(sig_item)
                 self.item_keys.append(key)
@@ -560,14 +503,10 @@ class SignalFilterDialog(QDialog):
             if key.startswith(f"{frame_id}_") and is_selected:
                 checked_count += 1
 
-        # 更新显示文本，"已选 X 个"用绿色
         if checked_count > 0:
             frame_item.setText(2, f"({total_count} 个信号，已选 {checked_count} 个)")
-            frame_item.setForeground(2, Qt.GlobalColor.darkGreen)
         else:
             frame_item.setText(2, f"({total_count} 个信号)")
-            # 恢复默认颜色
-            frame_item.setForeground(2, Qt.GlobalColor.black)
 
         # 更新勾选状态（如果需要）
         if update_checkbox:
@@ -597,10 +536,11 @@ class SignalFilterDialog(QDialog):
         total = len(self._selected_state)
         selected = sum(1 for v in self._selected_state.values() if v)
         self.selection_count_label.setText(f"已选: {selected} / {total}")
-        if selected == 0:
-            self.selection_count_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
-        else:
-            self.selection_count_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+        self.selection_count_label.setProperty(
+            "summaryState", "selected" if selected else "empty"
+        )
+        self.selection_count_label.style().unpolish(self.selection_count_label)
+        self.selection_count_label.style().polish(self.selection_count_label)
 
     def get_selected_signals_by_frame(self):
         """按帧分组返回选中的信号"""
@@ -1151,6 +1091,61 @@ class ARXMLConverterDialog(QDialog):
         event.accept()
 
 
+CAN_COLUMN_WIDTHS = (52, 40, 42, 36, 68, 34)
+
+
+def _refresh_dynamic_style(widget):
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+    widget.update()
+
+
+class ElidedLabel(QLabel):
+    """Compact label that keeps its complete value available as a tooltip."""
+
+    def __init__(self, text="", parent=None):
+        self._full_text = ""
+        super().__init__("", parent)
+        self.setText(text)
+
+    def setText(self, text):
+        self._full_text = str(text)
+        self.setToolTip(self._full_text)
+        self._update_elided_text()
+
+    def fullText(self):
+        return self._full_text
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_elided_text()
+
+    def _update_elided_text(self):
+        width = max(0, self.contentsRect().width() - 2)
+        display = self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideMiddle, width
+        )
+        QLabel.setText(self, display)
+
+
+def create_bus_config_header(parent=None):
+    header = QWidget(parent)
+    header.setObjectName("busConfigHeader")
+    header.setProperty("uiCanHeader", "true")
+    layout = QGridLayout(header)
+    layout.setContentsMargins(2, 2, 2, 2)
+    layout.setHorizontalSpacing(1)
+    labels = ("Bus", "CAN类型", "ID数量", "协议状态", "操作", "状态")
+    for column, (text, width) in enumerate(zip(labels, CAN_COLUMN_WIDTHS)):
+        label = QLabel(text)
+        label.setProperty("uiCanHeaderCell", "true")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setMinimumWidth(width)
+        layout.addWidget(label, 0, column)
+    layout.setColumnStretch(3, 1)
+    return header
+
+
 class BusConfigWidget(QWidget):
     """单个总线的配置组件"""
     bus_id_changed = pyqtSignal(int, str)
@@ -1170,7 +1165,7 @@ class BusConfigWidget(QWidget):
         self.name_edit = QLineEdit()
         self.type_label = QLabel()
         self.id_count_label = QLabel()
-        self.protocol_label = QLabel()
+        self.protocol_label = ElidedLabel()
         self.select_protocol_btn = QPushButton()
         self.protocol_clear_btn = QPushButton()
         self.parse_btn = QPushButton()
@@ -1178,74 +1173,87 @@ class BusConfigWidget(QWidget):
         self.init_ui()
 
     def init_ui(self):
-        layout = QHBoxLayout()
-        layout.setContentsMargins(5, 4, 5, 4)
-        layout.setSpacing(5)
+        self.setObjectName(f"busConfigRow{self.bus_id}")
+        self.setProperty("uiCanRow", "true")
+        self.setStyleSheet(build_can_config_stylesheet(DEFAULT_THEME))
+        layout = QGridLayout()
+        layout.setContentsMargins(2, 3, 2, 3)
+        layout.setHorizontalSpacing(1)
+        layout.setVerticalSpacing(1)
 
         self.id_label.setText(f"Bus {self.bus_id}")
-        self.id_label.setMinimumWidth(50)
-        self.id_label.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 11px;")
-        layout.addWidget(self.id_label)
+        self.id_label.setProperty("uiCanCell", "true")
+        self.id_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.id_label, 0, 0)
 
         self.name_edit.setPlaceholderText(f"Bus {self.bus_id}")
-        self.name_edit.setMinimumWidth(80)
+        self.name_edit.setProperty("uiCanCell", "bus")
+        self.name_edit.setToolTip(f"Bus {self.bus_id}")
         self.name_edit.textChanged.connect(self.on_name_changed)
-        layout.addWidget(self.name_edit)
+        self.name_edit.textChanged.connect(self.name_edit.setToolTip)
+        layout.addWidget(self.name_edit, 1, 0)
 
         self.type_label.setText("CAN2.0")
-        self.type_label.setMinimumWidth(55)
-        self.type_label.setStyleSheet("color: #2980b9; font-size: 10px; font-weight: bold;")
-        layout.addWidget(self.type_label)
+        self.type_label.setProperty("uiCanCell", "true")
+        self.type_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.type_label, 0, 1, 2, 1)
 
         self.id_count_label.setText("0 IDs")
-        self.id_count_label.setMinimumWidth(50)
-        self.id_count_label.setStyleSheet("color: #7f8c8d; font-size: 10px;")
-        layout.addWidget(self.id_count_label)
+        self.id_count_label.setProperty("uiCanCell", "true")
+        self.id_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.id_count_label, 0, 2, 2, 1)
 
         self.protocol_label.setText("未配置")
-        self.protocol_label.setMinimumWidth(120)
-        self.protocol_label.setStyleSheet("color: #e74c3c; font-size: 9px;")
-        self.protocol_label.setWordWrap(True)
-        layout.addWidget(self.protocol_label)
+        self.protocol_label.setProperty("uiCanCell", "protocol")
+        self.protocol_label.setProperty("statusKind", "missing")
+        self.protocol_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.protocol_label, 0, 3, 2, 1)
 
         self.select_protocol_btn.setText("选择协议")
-        self.select_protocol_btn.setFixedWidth(65)
-        self.select_protocol_btn.setStyleSheet(
-            "QPushButton { background-color: #3498db; color: white; font-size: 9px; }")
+        self.select_protocol_btn.setToolTip("选择 DBC 协议文件")
+        self.select_protocol_btn.setProperty("uiRole", "secondary")
+        self.select_protocol_btn.setFixedWidth(46)
         self.select_protocol_btn.clicked.connect(self.select_protocol)
-        layout.addWidget(self.select_protocol_btn)
 
         self.protocol_clear_btn.setText("✕")
-        self.protocol_clear_btn.setFixedWidth(25)
         self.protocol_clear_btn.setToolTip("清除协议")
-        self.protocol_clear_btn.setStyleSheet("""
-                    QPushButton { 
-                        background-color: #e74c3c; 
-                        color: white; 
-                        font-size: 10px; 
-                        font-weight: bold;
-                        border-radius: 3px;
-                    }
-                    QPushButton:hover { background-color: #c0392b; }
-                """)
+        self.protocol_clear_btn.setProperty("uiRole", "secondary")
+        self.protocol_clear_btn.setFixedWidth(20)
         self.protocol_clear_btn.clicked.connect(self.clear_protocol)
         self.protocol_clear_btn.setVisible(False)
-        layout.addWidget(self.protocol_clear_btn)
 
         self.parse_btn.setText("解析")
-        self.parse_btn.setFixedWidth(45)
-        self.parse_btn.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-size: 9px; }")
+        self.parse_btn.setProperty("uiRole", "primary")
         self.parse_btn.clicked.connect(lambda: self.parse_requested.emit(self.bus_id))
-        layout.addWidget(self.parse_btn)
+        action_widget = QWidget()
+        action_layout = QGridLayout(action_widget)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(2)
+        action_layout.addWidget(self.select_protocol_btn, 0, 0)
+        action_layout.addWidget(self.protocol_clear_btn, 0, 1)
+        action_layout.addWidget(self.parse_btn, 1, 0, 1, 2)
+        layout.addWidget(action_widget, 0, 4, 2, 1)
 
-        self.status_indicator.setText("⚪")
-        self.status_indicator.setFixedWidth(18)
-        layout.addWidget(self.status_indicator)
+        self.status_indicator.setProperty("uiCanCell", "status")
+        self.status_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_indicator, 0, 5, 2, 1)
+
+        for column, width in enumerate(CAN_COLUMN_WIDTHS):
+            layout.setColumnMinimumWidth(column, width)
+        layout.setColumnStretch(3, 1)
 
         self.setLayout(layout)
+        self.set_status('idle')
 
     def on_name_changed(self, text):
         self.bus_id_changed.emit(self.bus_id, text.strip() if text.strip() else f"Bus {self.bus_id}")
+
+    def set_protocol_display(self, text):
+        self.protocol_label.setText(text)
+        self.protocol_label.setProperty(
+            "statusKind", "missing" if text == "未配置" else "configured"
+        )
+        _refresh_dynamic_style(self.protocol_label)
 
     def select_protocol(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1287,15 +1295,13 @@ class BusConfigWidget(QWidget):
             filtered_db = self.filter_dbc_signals(db, bus_name)
 
             if filtered_db is not db:
-                self.protocol_label.setStyleSheet("color: #27ae60; font-size: 9px;")
                 if self.protocol_clear_btn:
                     self.protocol_clear_btn.setVisible(True)
                 self.protocol_changed.emit(self.bus_id, self.protocol_path)
                 self._cached_filtered_db = filtered_db
             else:
                 self.protocol_path = file_path
-                self.protocol_label.setText(os.path.basename(file_path))
-                self.protocol_label.setStyleSheet("color: #27ae60; font-size: 9px;")
+                self.set_protocol_display(os.path.basename(file_path))
                 if self.protocol_clear_btn:
                     self.protocol_clear_btn.setVisible(True)
                 self.protocol_changed.emit(self.bus_id, file_path)
@@ -1311,8 +1317,7 @@ class BusConfigWidget(QWidget):
     def clear_protocol(self):
         self.protocol_path = ""
         self.arxml_sub_bus = ""
-        self.protocol_label.setText("未配置")
-        self.protocol_label.setStyleSheet("color: #e74c3c; font-size: 9px;")
+        self.set_protocol_display("未配置")
         if self.protocol_clear_btn:
             self.protocol_clear_btn.setVisible(False)
         self.protocol_removed.emit(self.bus_id)
@@ -1321,39 +1326,32 @@ class BusConfigWidget(QWidget):
     def set_id_count(self, count, parsed_count=None):
         if parsed_count is not None and parsed_count > 0:
             self.id_count_label.setText(f"{parsed_count}/{count} IDs")
-            self.id_count_label.setStyleSheet("color: #27ae60; font-size: 10px; font-weight: bold;")
         elif count > 0:
             self.id_count_label.setText(f"{count} IDs")
-            self.id_count_label.setStyleSheet("color: #2c3e50; font-size: 10px; font-weight: bold;")
         else:
             self.id_count_label.setText("0 IDs")
-            self.id_count_label.setStyleSheet("color: #95a5a6; font-size: 10px;")
 
     def set_bus_type(self, is_fd):
         if is_fd:
             self.type_label.setText("CANFD")
-            self.type_label.setStyleSheet("color: #e67e22; font-size: 10px; font-weight: bold;")
         else:
             self.type_label.setText("CAN2.0")
-            self.type_label.setStyleSheet("color: #2980b9; font-size: 10px; font-weight: bold;")
 
     def set_status(self, status, extra_info=""):
         if status == 'idle':
-            self.status_indicator.setText("⚪")
-            self.status_indicator.setStyleSheet("color: #95a5a6;")
+            self.status_indicator.setText("就绪")
             self.status_indicator.setToolTip("就绪")
         elif status == 'loading':
-            self.status_indicator.setText("🔄")
-            self.status_indicator.setStyleSheet("color: #f39c12;")
+            self.status_indicator.setText("解析中")
             self.status_indicator.setToolTip("解析中...")
         elif status == 'success':
-            self.status_indicator.setText("🟢")
-            self.status_indicator.setStyleSheet("color: #27ae60;")
+            self.status_indicator.setText("完成")
             self.status_indicator.setToolTip(f"解析完成{extra_info}")
         elif status == 'error':
-            self.status_indicator.setText("🔴")
-            self.status_indicator.setStyleSheet("color: #e74c3c;")
+            self.status_indicator.setText("失败")
             self.status_indicator.setToolTip("解析失败")
+        self.status_indicator.setProperty("statusKind", status)
+        _refresh_dynamic_style(self.status_indicator)
 
     def get_bus_display_name(self):
         name = self.name_edit.text().strip()
@@ -1505,8 +1503,7 @@ class BusConfigWidget(QWidget):
                     "已取消保存筛选后的DBC文件，将使用筛选后的数据库进行解析，但不会保存到文件。"
                 )
                 self.protocol_path = original_path + " [已筛选-内存]"
-                self.protocol_label.setText(os.path.basename(original_path) + " [已筛选-内存]")
-                self.protocol_label.setStyleSheet("color: #27ae60; font-size: 9px;")
+                self.set_protocol_display(os.path.basename(original_path) + " [已筛选-内存]")
                 self._filtered_dbc_path = None
                 return
 
@@ -1536,8 +1533,7 @@ class BusConfigWidget(QWidget):
                 json.dump(filter_info, f, indent=2, ensure_ascii=False)
 
             self.protocol_path = save_path
-            self.protocol_label.setText(os.path.basename(save_path) + " [已筛选]")
-            self.protocol_label.setStyleSheet("color: #27ae60; font-size: 9px;")
+            self.set_protocol_display(os.path.basename(save_path) + " [已筛选]")
             self._filtered_dbc_path = save_path
 
             print(f"📄 筛选信息: {info_path}")
@@ -1560,8 +1556,7 @@ class BusConfigWidget(QWidget):
                 f"保存筛选后的DBC失败:\n{str(e)}\n\n将使用筛选后的数据库进行解析，但不会保存到文件。"
             )
             self.protocol_path = original_path + " [已筛选-内存]"
-            self.protocol_label.setText(os.path.basename(original_path) + " [已筛选-内存]")
-            self.protocol_label.setStyleSheet("color: #27ae60; font-size: 9px;")
+            self.set_protocol_display(os.path.basename(original_path) + " [已筛选-内存]")
             self._filtered_dbc_path = None
 
     def _generate_dbc_content(self, db):
@@ -2591,31 +2586,29 @@ class MDFPlotter(QWidget):
         bus_layout = QVBoxLayout()
         bus_layout.setSpacing(2)
 
-        bus_scroll = QScrollArea()
-        bus_scroll.setWidgetResizable(True)
-        bus_scroll.setMinimumHeight(150)
-        bus_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        bus_scroll.setStyleSheet("""
-            QScrollArea {
-                border: none;
-                background-color: transparent;
-            }
-        """)
+        self.bus_header = create_bus_config_header()
+        self.bus_header.setStyleSheet(build_can_config_stylesheet(DEFAULT_THEME))
+        bus_layout.addWidget(self.bus_header)
+
+        self.bus_scroll = QScrollArea()
+        self.bus_scroll.setObjectName("busConfigScrollArea")
+        self.bus_scroll.setWidgetResizable(True)
+        self.bus_scroll.setMinimumHeight(150)
+        self.bus_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.bus_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         self.bus_container = QWidget()
         self.bus_container_layout = QVBoxLayout()
         self.bus_container_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.bus_container_layout.setSpacing(2)
+        self.bus_container_layout.setContentsMargins(0, 0, 0, 0)
         self.bus_container.setLayout(self.bus_container_layout)
-        bus_scroll.setWidget(self.bus_container)
-        bus_layout.addWidget(bus_scroll)
+        self.bus_scroll.setWidget(self.bus_container)
+        bus_layout.addWidget(self.bus_scroll)
 
         # ARXML2DBC 按钮
         bus_btn_layout = QHBoxLayout()
         self.arxml2dbc_btn = QPushButton("🔧 ARXML2DBC")
-        self.arxml2dbc_btn.setStyleSheet(
-            "QPushButton { background-color: #9b59b6; color: white; font-weight: bold; padding: 4px; }"
-        )
         self.arxml2dbc_btn.setToolTip("启动 ARXML 转 DBC 工具")
         self.arxml2dbc_btn.clicked.connect(self.open_arxml_converter)
         bus_btn_layout.addWidget(self.arxml2dbc_btn)
@@ -4876,9 +4869,9 @@ class MDFPlotter(QWidget):
                         if bus_id in self.bus_config_widgets:
                             self.bus_config_widgets[bus_id].name_edit.setText(self.can_bus_data[bus_id]['name'])
                             if protocol:
-                                self.bus_config_widgets[bus_id].protocol_label.setText(os.path.basename(protocol))
-                                self.bus_config_widgets[bus_id].protocol_label.setStyleSheet(
-                                    "color: #27ae60; font-size: 9px;")
+                                self.bus_config_widgets[bus_id].set_protocol_display(
+                                    os.path.basename(protocol)
+                                )
                                 self.bus_config_widgets[bus_id].protocol_path = protocol
 
             math_defs = config_data.get("math_channels", {})
