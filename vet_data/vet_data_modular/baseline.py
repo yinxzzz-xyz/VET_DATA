@@ -36,7 +36,7 @@ import multiprocessing
 
 from .signal_resolver import SignalResolutionError, SignalResolver
 from .theme import (
-    DEFAULT_THEME, build_can_config_stylesheet,
+    DEFAULT_THEME, build_arxml_converter_stylesheet, build_can_config_stylesheet,
     build_signal_filter_stylesheet,
 )
 from .workers import (
@@ -669,127 +669,113 @@ class ARXMLConverterDialog(QDialog):
         self.conversion_error.connect(self._on_error)
 
     def init_ui(self):
+        self.setProperty("uiDialog", "arxmlConverter")
+        self.setMinimumSize(640, 520)
+        self.resize(720, 620)
+        self.setStyleSheet(build_arxml_converter_stylesheet(DEFAULT_THEME))
         layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout.setContentsMargins(
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+            DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
+        )
+        layout.setSpacing(DEFAULT_THEME.spacing.small)
 
         # 标题
-        title_label = QLabel("🔧 ARXML 转 DBC 工具")
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50; padding: 5px;")
-        layout.addWidget(title_label)
+        self.title_label = QLabel("🔧 ARXML 转 DBC 工具")
+        self.title_label.setProperty("uiArxmlTitle", "true")
+        layout.addWidget(self.title_label)
 
         # 说明
-        desc_label = QLabel("DBC 文件将自动保存到 ARXML 文件所在目录的 dbc_output 文件夹中")
-        desc_label.setStyleSheet("color: #7f8c8d; font-size: 11px; padding: 0 5px 10px 5px;")
-        desc_label.setWordWrap(True)
-        layout.addWidget(desc_label)
+        self.desc_label = QLabel("DBC 文件将自动保存到 ARXML 文件所在目录的 dbc_output 文件夹中")
+        self.desc_label.setProperty("uiTextRole", "secondary")
+        self.desc_label.setWordWrap(True)
+        layout.addWidget(self.desc_label)
 
-        # ===== ARXML 文件选择 =====
-        arxml_group = QGroupBox("选择 ARXML 文件")
-        arxml_group.setStyleSheet("""
-            QGroupBox { font-weight: bold; font-size: 12px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px 0 5px; }
-        """)
-        arxml_layout = QVBoxLayout()
-
-        arxml_file_layout = QHBoxLayout()
+        # ===== 输入与只读输出 =====
+        self.path_group = QGroupBox("输入与输出")
+        self.path_group.setObjectName("arxmlPathSection")
+        self.path_group.setProperty("uiArxmlSection", "true")
+        path_layout = QGridLayout(self.path_group)
+        path_layout.setHorizontalSpacing(DEFAULT_THEME.spacing.small)
+        path_layout.setVerticalSpacing(DEFAULT_THEME.spacing.xsmall)
         self.arxml_path_edit.setPlaceholderText("请选择 ARXML 文件...")
         self.arxml_path_edit.setReadOnly(True)
-        self.arxml_select_btn.setText("浏览")
-        self.arxml_select_btn.setStyleSheet("background-color: #3498db; color: white; padding: 5px 15px;")
+        self.arxml_path_edit.setProperty("uiReadonly", "true")
+        self.arxml_path_edit.textChanged.connect(self.arxml_path_edit.setToolTip)
+        self.arxml_select_btn.setText("浏览...")
+        self.arxml_select_btn.setProperty("uiRole", "secondary")
         self.arxml_select_btn.clicked.connect(self.select_arxml)
-
-        arxml_file_layout.addWidget(self.arxml_path_edit, 3)
-        arxml_file_layout.addWidget(self.arxml_select_btn, 1)
-        arxml_layout.addLayout(arxml_file_layout)
-
-        arxml_group.setLayout(arxml_layout)
-        layout.addWidget(arxml_group)
-
-        # ===== DBC 输出信息（只读显示） =====
-        dbc_group = QGroupBox("DBC 输出路径（自动生成）")
-        dbc_group.setStyleSheet("""
-            QGroupBox { font-weight: bold; font-size: 12px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px 0 5px; }
-        """)
-        dbc_layout = QVBoxLayout()
-
         self.dbc_path_edit.setPlaceholderText("选择 ARXML 文件后自动生成...")
         self.dbc_path_edit.setReadOnly(True)
-        self.dbc_path_edit.setStyleSheet("background-color: #f0f0f0;")
-        dbc_layout.addWidget(self.dbc_path_edit)
+        self.dbc_path_edit.setProperty("uiReadonly", "true")
+        self.dbc_path_edit.textChanged.connect(self.dbc_path_edit.setToolTip)
+        path_layout.addWidget(QLabel("ARXML 输入"), 0, 0)
+        path_layout.addWidget(self.arxml_path_edit, 0, 1)
+        path_layout.addWidget(self.arxml_select_btn, 0, 2)
+        path_layout.addWidget(QLabel("DBC 输出"), 1, 0)
+        path_layout.addWidget(self.dbc_path_edit, 1, 1)
+        path_layout.setColumnStretch(1, 1)
+        layout.addWidget(self.path_group)
 
-        dbc_group.setLayout(dbc_layout)
-        layout.addWidget(dbc_group)
-
-        # 转换按钮
+        # ===== 转换与状态 =====
+        self.conversion_group = QGroupBox("转换")
+        self.conversion_group.setObjectName("arxmlConversionSection")
+        self.conversion_group.setProperty("uiArxmlSection", "true")
+        conversion_layout = QVBoxLayout(self.conversion_group)
+        conversion_layout.setSpacing(DEFAULT_THEME.spacing.xsmall)
+        conversion_actions = QHBoxLayout()
         self.convert_btn.setText("开始转换")
-        self.convert_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60;
-                color: white;
-                font-weight: bold;
-                font-size: 13px;
-                padding: 8px 25px;
-                border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #2ecc71; }
-            QPushButton:disabled { background-color: #95a5a6; }
-        """)
+        self.convert_btn.setProperty("uiRole", "primary")
         self.convert_btn.clicked.connect(self.start_conversion)
         self.convert_btn.setEnabled(False)
-        layout.addWidget(self.convert_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        # 状态栏
-        status_layout = QHBoxLayout()
-        status_layout.addWidget(QLabel("状态:"))
-        self.status_label.setText("就绪")
-        self.status_label.setStyleSheet("font-weight: bold;")
-        status_layout.addWidget(self.status_label)
-        status_layout.addStretch()
-        layout.addLayout(status_layout)
+        conversion_actions.addWidget(self.convert_btn)
+        conversion_actions.addSpacing(DEFAULT_THEME.spacing.medium)
+        conversion_actions.addWidget(QLabel("状态:"))
+        self.status_label.setProperty("uiArxmlStatus", "true")
+        conversion_actions.addWidget(self.status_label)
+        conversion_actions.addStretch()
+        conversion_layout.addLayout(conversion_actions)
+        self._set_conversion_status("就绪", "idle")
 
         # 进度条 - 无限模式（与附件一致）
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
+        conversion_layout.addWidget(self.progress_bar)
+        layout.addWidget(self.conversion_group)
 
         # 日志
-        log_group = QGroupBox("转换日志")
-        log_group.setStyleSheet("""
-            QGroupBox { font-weight: bold; font-size: 12px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px 0 5px; }
-        """)
-        log_layout = QVBoxLayout()
+        self.log_group = QGroupBox("转换日志")
+        self.log_group.setObjectName("arxmlLogSection")
+        self.log_group.setProperty("uiArxmlSection", "true")
+        log_layout = QVBoxLayout(self.log_group)
         self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet("""
-            QTextEdit {
-                font-family: Consolas, monospace;
-                font-size: 10px;
-                background-color: #2c3e50;
-                color: #ecf0f1;
-                border: 1px solid #34495e;
-                border-radius: 3px;
-            }
-        """)
-        self.log_text.setMinimumHeight(120)
+        self.log_text.setProperty("uiArxmlLog", "true")
+        self.log_text.setMinimumHeight(160)
         log_layout.addWidget(self.log_text)
-        log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
+        layout.addWidget(self.log_group, 1)
 
         # 底部按钮
         btn_layout = QHBoxLayout()
         self.clear_log_btn.setText("清空日志")
+        self.clear_log_btn.setProperty("uiRole", "secondary")
         self.clear_log_btn.clicked.connect(self.clear_log)
         btn_layout.addWidget(self.clear_log_btn)
         btn_layout.addStretch()
         self.open_folder_btn.setText("📁 打开输出文件夹")
+        self.open_folder_btn.setProperty("uiRole", "secondary")
         self.open_folder_btn.setEnabled(False)
         self.open_folder_btn.clicked.connect(self.open_output_folder)
         btn_layout.addWidget(self.open_folder_btn)
         self.close_btn.setText("关闭")
+        self.close_btn.setProperty("uiRole", "secondary")
         self.close_btn.clicked.connect(self.close)
         btn_layout.addWidget(self.close_btn)
         layout.addLayout(btn_layout)
+
+    def _set_conversion_status(self, text, kind):
+        self.status_label.setText(text)
+        self.status_label.setProperty("statusKind", kind)
+        _refresh_dynamic_style(self.status_label)
 
     def select_arxml(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -859,8 +845,7 @@ class ARXMLConverterDialog(QDialog):
         self.is_running = True
         self.convert_btn.setEnabled(False)
         self.open_folder_btn.setEnabled(False)
-        self.status_label.setText("转换中...")
-        self.status_label.setStyleSheet("color: #f39c12; font-weight: bold;")
+        self._set_conversion_status("转换中...", "running")
         self.progress_bar.setVisible(True)
 
         # 删除可能存在的旧输出文件
@@ -1030,8 +1015,7 @@ class ARXMLConverterDialog(QDialog):
         self.convert_btn.setEnabled(True)
         self.open_folder_btn.setEnabled(True)
         self.update_convert_button()
-        self.status_label.setText("转换成功！")
-        self.status_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+        self._set_conversion_status("转换成功！", "success")
 
         abs_path = os.path.abspath(self.dbc_path)
 
@@ -1063,8 +1047,7 @@ class ARXMLConverterDialog(QDialog):
         self.progress_bar.setVisible(False)
         self.convert_btn.setEnabled(True)
         self.update_convert_button()
-        self.status_label.setText("转换失败")
-        self.status_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+        self._set_conversion_status("转换失败", "error")
         self.log(f"❌ 转换失败: {error_msg}")
         self.log("=" * 50)
         QMessageBox.critical(self, "错误", f"转换失败：\n{error_msg}")
@@ -2609,6 +2592,7 @@ class MDFPlotter(QWidget):
         # ARXML2DBC 按钮
         bus_btn_layout = QHBoxLayout()
         self.arxml2dbc_btn = QPushButton("🔧 ARXML2DBC")
+        self.arxml2dbc_btn.setProperty("uiToolEntry", "true")
         self.arxml2dbc_btn.setToolTip("启动 ARXML 转 DBC 工具")
         self.arxml2dbc_btn.clicked.connect(self.open_arxml_converter)
         bus_btn_layout.addWidget(self.arxml2dbc_btn)

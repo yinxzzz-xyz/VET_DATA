@@ -496,6 +496,91 @@ QScrollArea {{ border: none; background-color: transparent; }}
 """.strip()
 
 
+def build_arxml_converter_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
+    """Return token-driven styling for the embedded ARXML-to-DBC tool."""
+    c, f = theme.colors, theme.fonts
+    controls, padding, spacing = theme.controls, theme.padding, theme.spacing
+    return f"""
+QDialog[uiDialog="arxmlConverter"] {{ background-color: {c.background}; }}
+QLabel[uiArxmlTitle="true"] {{
+    color: {c.text_primary};
+    font-size: {f.title}px;
+    font-weight: 600;
+}}
+QLabel[uiTextRole="secondary"] {{
+    color: {c.text_secondary};
+    font-size: {f.small}px;
+}}
+QGroupBox[uiArxmlSection="true"] {{
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+    margin-top: {spacing.small}px;
+    padding-top: {spacing.small}px;
+}}
+QGroupBox[uiArxmlSection="true"]::title {{
+    subcontrol-origin: margin;
+    left: {spacing.small}px;
+    padding: 0 {padding.compact}px;
+    font-weight: 600;
+}}
+QLineEdit {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+}}
+QLineEdit[uiReadonly="true"] {{ background-color: {c.background}; }}
+QPushButton[uiRole="primary"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.surface};
+    background-color: {c.primary};
+    border: 1px solid {c.primary};
+    border-radius: {controls.corner_radius}px;
+    font-weight: 600;
+}}
+QPushButton[uiRole="secondary"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.secondary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+}}
+QPushButton:disabled {{
+    color: {c.disabled_text};
+    background-color: {c.disabled_background};
+    border-color: {c.border};
+}}
+QLabel[uiArxmlStatus="true"] {{ color: {c.text_secondary}; font-weight: 600; }}
+QLabel[uiArxmlStatus="true"][statusKind="running"] {{ color: {c.warning}; }}
+QLabel[uiArxmlStatus="true"][statusKind="success"] {{ color: {c.success}; }}
+QLabel[uiArxmlStatus="true"][statusKind="error"] {{ color: {c.danger}; }}
+QProgressBar {{
+    min-height: {controls.compact_height}px;
+    color: {c.text_primary};
+    background-color: {c.disabled_background};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+    text-align: center;
+}}
+QProgressBar::chunk {{ background-color: {c.primary}; }}
+QTextEdit[uiArxmlLog="true"] {{
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+    padding: {padding.compact}px;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: {f.small}px;
+}}
+""".strip()
+
+
 def apply_application_theme(
     application: QApplication, theme: ThemeTokens = DEFAULT_THEME
 ) -> None:
@@ -516,6 +601,7 @@ __all__ = [
     "ThemeTokens",
     "apply_application_theme",
     "build_application_stylesheet",
+    "build_arxml_converter_stylesheet",
     "build_can_config_stylesheet",
     "build_blf_slice_stylesheet",
     "build_formula_editor_stylesheet",
