@@ -482,7 +482,7 @@ class FormulaEditorDialog(QDialog):
         self.formula_edit.setObjectName("formulaExpressionEditor")
         self.formula_edit.setProperty("uiFormulaCore", "true")
         self.formula_edit.setPlaceholderText("从下方列表插入信号，例如：(VehicleSpeed + Torque)^2")
-        self.formula_edit.setMinimumHeight(130)
+        self.formula_edit.setMinimumHeight(120)
         self.formula_edit.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -492,6 +492,7 @@ class FormulaEditorDialog(QDialog):
         self.signal_splitter.setObjectName("formulaSignalSplitter")
         self.signal_splitter.setProperty("uiFormulaSplitter", "true")
         self.signal_splitter.setChildrenCollapsible(False)
+        self.signal_splitter.setMinimumHeight(190)
 
         available_panel = QWidget()
         available_layout = QVBoxLayout(available_panel)
@@ -536,7 +537,7 @@ class FormulaEditorDialog(QDialog):
         self.signal_splitter.setStretchFactor(0, 3)
         self.signal_splitter.setStretchFactor(1, 2)
         self.signal_splitter.setSizes([520, 330])
-        editor_layout.addWidget(self.signal_splitter, 2)
+        editor_layout.addWidget(self.signal_splitter, 3)
 
         function_label = QLabel("插入函数")
         function_label.setProperty("uiFormulaCaption", "true")

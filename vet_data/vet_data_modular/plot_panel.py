@@ -5,6 +5,9 @@ from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSpinBox, QWidget
 
 
 class PlotPanelMixin:
+    _STATS_HIDE_WIDTH = 300
+    _STATS_SHOW_WIDTH = 340
+
     def _setup_plot_panel(self):
         self.plot_min_height = 150
         panel = next((g for g in self.findChildren(QWidget) if getattr(g, "title", lambda: "")() == "信号曲线"), None)
@@ -33,6 +36,53 @@ class PlotPanelMixin:
         for plot in self.plot_widgets:
             plot.setMinimumHeight(self.plot_min_height)
             plot.getViewBox().setMouseEnabled(x=True, y=True)
+            self._register_plot_stats_responsiveness(plot)
+
+    def _register_plot_stats_responsiveness(self, plot):
+        """Keep statistics readable using the individual plot's usable width."""
+        view_box = plot.getViewBox()
+        plot._stats_are_visible = True
+        plot._stats_last_width = self._plot_usable_width(plot)
+        view_box.sigResized.connect(
+            lambda *_args, widget=plot: self._plot_stats_resize_changed(widget)
+        )
+        self._plot_stats_visibility_changed(plot)
+
+    def _plot_stats_resize_changed(self, plot):
+        """Ignore height-only changes so plot-height controls remain side-effect free."""
+        try:
+            width = self._plot_usable_width(plot)
+            previous = float(getattr(plot, "_stats_last_width", width))
+            plot._stats_last_width = width
+            if abs(width - previous) >= 1.0:
+                self._plot_stats_visibility_changed(plot)
+        except RuntimeError:
+            return
+
+    def _plot_usable_width(self, plot):
+        view_box = plot.getViewBox()
+        return float(view_box.sceneBoundingRect().width()) if view_box is not None else 0.0
+
+    def _plot_stats_visibility_changed(self, plot):
+        try:
+            stats_item = plot.stats_text_item
+            width = self._plot_usable_width(plot)
+            visible = bool(getattr(plot, "_stats_are_visible", True))
+            if width <= 0:
+                return visible
+            if visible and width < self._STATS_HIDE_WIDTH:
+                visible = False
+            elif not visible and width > self._STATS_SHOW_WIDTH:
+                visible = True
+            plot._stats_are_visible = visible
+            stats_item.setVisible(visible)
+            return visible
+        except RuntimeError:
+            return False
+
+    def _update_stats(self, plot):
+        self._plot_stats_visibility_changed(plot)
+        super()._update_stats(plot)
 
     def update_cursor_positions(self, evt):
         super().update_cursor_positions(evt)

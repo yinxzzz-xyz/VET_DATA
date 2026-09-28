@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Condition, Event
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtWidgets import QSizePolicy
 from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QHeaderView, QLabel, QProgressBar, QPushButton,
     QTableWidget, QTableWidgetItem, QVBoxLayout,
@@ -27,6 +28,26 @@ from .theme import DEFAULT_THEME, build_blf_slice_stylesheet
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+TASK_STATUS_TEXT = {
+    TaskStatus.PENDING: "等待执行",
+    TaskStatus.RUNNING: "执行中",
+    TaskStatus.COMPLETED: "已完成",
+    TaskStatus.PARTIAL_COMPLETED: "部分完成",
+    TaskStatus.CANCELLED: "已取消",
+    TaskStatus.FAILED: "失败",
+}
+
+CONDITION_STATUS_TEXT = {
+    ConditionStatus.COMPLETE: "完成",
+    ConditionStatus.PARTIAL: "部分完成",
+    ConditionStatus.NO_DATA: "无数据",
+    ConditionStatus.FAILED: "失败",
+    ConditionStatus.CANCELLED: "已取消",
+    ConditionStatus.NOT_PROCESSED: "未处理",
+    ConditionStatus.NOT_SELECTED: "未选择",
+}
 
 
 class BlfSliceWorker(QThread):
@@ -273,7 +294,7 @@ class BlfSliceResultDialog(QDialog):
             DEFAULT_THEME.spacing.medium, DEFAULT_THEME.spacing.medium,
         )
         layout.setSpacing(DEFAULT_THEME.spacing.small)
-        self.status_label = QLabel(f"任务状态：{result.status.value}")
+        self.status_label = QLabel(f"任务状态：{TASK_STATUS_TEXT[result.status]}")
         self.output_label = QLabel(f"输出目录：{result.task.output_dir}")
         self.report_label = QLabel(f"报告位置：{result.report_path or '未生成'}")
         self.status_label.setProperty("uiTextRole", "status")
@@ -281,6 +302,7 @@ class BlfSliceResultDialog(QDialog):
             label.setProperty("uiTextRole", "secondary")
             label.setToolTip(label.text())
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.status_label)
         layout.addWidget(self.output_label)
         layout.addWidget(self.report_label)
@@ -295,7 +317,7 @@ class BlfSliceResultDialog(QDialog):
         for row, condition_result in enumerate(result.condition_results):
             values = (
                 condition_result.condition.name,
-                condition_result.status.value,
+                CONDITION_STATUS_TEXT[condition_result.status],
                 str(condition_result.message_count),
                 "\n".join(str(path) for path in condition_result.output_files) or "无",
                 "；".join(condition_result.warnings) or "无",
@@ -315,5 +337,6 @@ class BlfSliceResultDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Close).setProperty(
             "uiRole", "secondary"
         )
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)

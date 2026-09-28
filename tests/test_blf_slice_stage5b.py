@@ -211,7 +211,10 @@ class Stage5bResultDialogTests(unittest.TestCase):
         result = TaskResult(task, TaskStatus.PARTIAL_COMPLETED, results, report_path=root / "report.md")
         dialog = BlfSliceResultDialog(result)
         self.assertEqual(dialog.table.rowCount(), 5)
-        self.assertEqual([dialog.table.item(row, 1).text() for row in range(5)], [status.value for status in statuses])
+        self.assertEqual(
+            [dialog.table.item(row, 1).text() for row in range(5)],
+            ["完成", "无数据", "部分完成", "失败", "已取消"],
+        )
         self.assertEqual(dialog.table.item(0, 2).text(), "10")
         self.assertIn("result.blf", dialog.table.item(0, 3).text())
         self.assertEqual(dialog.table.item(2, 4).text(), "warning")

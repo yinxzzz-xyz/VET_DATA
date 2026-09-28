@@ -218,7 +218,8 @@ class BlfRelatedDialogsUi6Tests(unittest.TestCase):
         )
         dialog = BlfSliceResultDialog(result)
         try:
-            self.assertEqual(dialog.table.item(0, 1).text(), ConditionStatus.COMPLETE.value)
+            self.assertEqual(dialog.table.item(0, 1).text(), "完成")
+            self.assertEqual(dialog.status_label.text(), "任务状态：已完成")
             self.assertEqual(dialog.table.item(0, 2).text(), "42")
             self.assertEqual(
                 dialog.table.item(0, 3).toolTip(), "output\\long-result-file-name.blf"
@@ -227,6 +228,7 @@ class BlfRelatedDialogsUi6Tests(unittest.TestCase):
                 QDialogButtonBox.StandardButton.Close
             )
             self.assertEqual(close_button.property("uiRole"), "secondary")
+            self.assertEqual(close_button.text(), "关闭")
         finally:
             dialog.deleteLater()
 
