@@ -67,6 +67,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._csv_export_worker = None
         self._csv_export_dialog = None
         self._close_after_csv_export = False
+        self._close_after_arxml_conversion = False
         self.math_channel_button.setText("➕ 创建自定义公式计算通道")
         self.math_channel_button.setToolTip("使用多信号公式、数学函数、导数和积分创建通道")
         self._setup_signal_panel(); self._setup_plot_panel(); self._setup_collapsible_panels()
@@ -702,6 +703,18 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             self.close()
 
     def closeEvent(self, event):
+        converter = getattr(self, "_arxml_converter", None)
+        arxml_worker = getattr(converter, "_conversion_worker", None)
+        if arxml_worker is not None and arxml_worker.isRunning():
+            if not self._close_after_arxml_conversion:
+                self._close_after_arxml_conversion = True
+                arxml_worker.finished.connect(self.close)
+            converter._close_after_conversion = True
+            converter.show()
+            converter.raise_()
+            event.ignore()
+            return
+        self._close_after_arxml_conversion = False
         if self._csv_export_worker is not None and self._csv_export_worker.isRunning():
             self._csv_export_worker.cancel()
             self._close_after_csv_export = True

@@ -8,7 +8,6 @@ VET_DATA_v26.08.25_CAN_MultiBus_UI - 支持容器帧解析
 import subprocess
 import sys
 import os
-import threading
 
 import asammdf
 import pyqtgraph as pg
@@ -633,6 +632,132 @@ class MathChannelDialog(QDialog):
         }
 
 
+def _convert_arxml_to_dbc(arxml_path, dbc_path, log_callback):
+    """Run the existing canmatrix conversion without accessing Qt widgets."""
+    arxml_file = os.path.abspath(arxml_path)
+    dbc_file = os.path.abspath(dbc_path)
+
+    log_callback("=" * 50)
+    log_callback("🔧 ARXML → DBC 转换开始")
+    log_callback(f"输入文件: {arxml_file}")
+    log_callback(f"输出文件: {dbc_file}")
+
+    output_dir = os.path.dirname(dbc_file)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    if os.path.exists(dbc_file):
+        try:
+            os.remove(dbc_file)
+            log_callback("🗑️ 已删除旧的 DBC 文件")
+        except Exception as exc:
+            log_callback(f"⚠️ 删除旧文件失败: {exc}")
+
+    try:
+        import canmatrix
+        import canmatrix.convert
+        import canmatrix.formats
+        import canmatrix.formats.arxml
+        log_callback(f"✅ canmatrix 版本: {getattr(canmatrix, '__version__', 'unknown')}")
+    except ImportError as exc:
+        log_callback(f"❌ 导入 canmatrix 失败: {exc}")
+        raise RuntimeError("请确保已安装 canmatrix: pip install canmatrix") from exc
+
+    if not os.path.exists(arxml_file):
+        raise FileNotFoundError(f"ARXML 文件不存在: {arxml_file}")
+    if os.path.getsize(arxml_file) == 0:
+        raise ValueError(f"ARXML 文件为空: {arxml_file}")
+
+    log_callback("🔄 正在转换 (使用 canmatrix.convert.convert)...")
+    try:
+        canmatrix.convert.convert(
+            arxml_file,
+            dbc_file,
+            dbcExportEncoding="ascii",
+            ignoreEncodingErrors="ignore",
+        )
+        log_callback("✅ canmatrix.convert.convert() 调用完成")
+    except Exception as exc:
+        log_callback(f"⚠️ 转换调用失败: {exc}")
+        try:
+            log_callback("🔄 尝试分步加载...")
+            db = canmatrix.formats.loadp(arxml_file)
+            if db:
+                log_callback(f"✅ 加载成功: {len(db)} 个 CAN 总线")
+                canmatrix.formats.dump(dbc_file, db, dbcExportEncoding="ascii")
+                log_callback("✅ 分步保存成功")
+            else:
+                raise RuntimeError("加载 ARXML 返回空数据库")
+        except Exception as fallback_exc:
+            log_callback(f"❌ 分步加载也失败: {fallback_exc}")
+            raise RuntimeError(f"转换失败: {fallback_exc}") from fallback_exc
+
+    def check_output(filepath):
+        if not os.path.exists(filepath):
+            return False, "文件不存在"
+        if os.path.getsize(filepath) == 0:
+            return False, "文件为空"
+        try:
+            with open(filepath, 'r', encoding='utf-8') as stream:
+                if 'BO_' not in stream.read():
+                    return False, "文件中没有找到 BO_ (消息定义)"
+            return True, ""
+        except Exception as exc:
+            return False, f"读取失败: {exc}"
+
+    success, message = check_output(dbc_file)
+    if success:
+        file_size = os.path.getsize(dbc_file)
+        log_callback(f"✅ 转换成功！文件大小: {file_size} 字节")
+        try:
+            with open(dbc_file, 'r', encoding='utf-8') as stream:
+                message_count = stream.read().count('BO_')
+            log_callback(f"📊 包含 {message_count} 个消息定义")
+        except Exception:
+            pass
+        return
+
+    candidates = []
+    try:
+        for filename in os.listdir(output_dir):
+            if filename.lower().endswith('.dbc'):
+                candidate = os.path.join(output_dir, filename)
+                if os.path.getsize(candidate) > 0:
+                    candidates.append(filename)
+    except Exception:
+        pass
+    if candidates:
+        log_callback(f"✅ 在输出目录找到 DBC 文件: {', '.join(candidates)}")
+        return
+    raise RuntimeError(f"转换完成但未生成有效的 DBC 文件: {message}")
+
+
+class ARXMLConversionWorker(QThread):
+    """Execute canmatrix work off the GUI thread and report through signals."""
+
+    log_emitted = pyqtSignal(str)
+    succeeded = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, arxml_path, dbc_path, parent=None):
+        super().__init__(parent)
+        self.arxml_path = str(arxml_path)
+        self.dbc_path = str(dbc_path)
+
+    def run(self):
+        try:
+            _convert_arxml_to_dbc(
+                self.arxml_path, self.dbc_path, self.log_emitted.emit
+            )
+        except Exception as exc:
+            import traceback
+            self.log_emitted.emit("❌ ARXML → DBC 转换异常:")
+            self.log_emitted.emit(traceback.format_exc())
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit()
+
+
 class ARXMLConverterDialog(QDialog):
     """ARXML 转 DBC 工具对话框
 
@@ -651,6 +776,8 @@ class ARXMLConverterDialog(QDialog):
         self.dbc_path = ""
         self.process = None
         self.is_running = False
+        self._conversion_worker = None
+        self._close_after_conversion = False
         self.arxml_path_edit = QLineEdit()
         self.arxml_select_btn = QPushButton()
         self.dbc_path_edit = QLineEdit()
@@ -823,7 +950,6 @@ class ARXMLConverterDialog(QDialog):
         cursor = self.log_text.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self.log_text.setTextCursor(cursor)
-        QApplication.processEvents()
 
     def start_conversion(self):
         if not self.arxml_path or not os.path.exists(self.arxml_path):
@@ -859,143 +985,38 @@ class ARXMLConverterDialog(QDialog):
         self.log(f"开始转换: {os.path.basename(self.arxml_path)}")
         self.log(f"输出路径: {self.dbc_path}")
 
-        # 在新线程中执行转换（与附件完全一致）
-        threading.Thread(target=self._run_conversion, daemon=True).start()
+        worker = ARXMLConversionWorker(self.arxml_path, self.dbc_path, self)
+        worker.log_emitted.connect(self.log)
+        worker.succeeded.connect(self.conversion_success)
+        worker.failed.connect(self.conversion_error)
+        worker.finished.connect(
+            lambda owner=worker: self._conversion_worker_finished(owner)
+        )
+        self._conversion_worker = worker
+        self.arxml_select_btn.setEnabled(False)
+        worker.start()
 
     def _run_conversion(self):
-        """
-        后台执行 ARXML -> DBC
-        使用 canmatrix Python API 直接转换，避免子进程问题
-        """
+        """Compatibility entry for synchronous callers; production uses QThread."""
         try:
-            arxml_file = os.path.abspath(self.arxml_path)
-            dbc_file = os.path.abspath(self.dbc_path)
-
-            self.log("=" * 50)
-            self.log("🔧 ARXML → DBC 转换开始")
-            self.log(f"输入文件: {arxml_file}")
-            self.log(f"输出文件: {dbc_file}")
-
-            # 确保输出目录存在
-            output_dir = os.path.dirname(dbc_file)
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
-
-            # 删除可能存在的旧文件
-            if os.path.exists(dbc_file):
-                try:
-                    os.remove(dbc_file)
-                    self.log("🗑️ 已删除旧的 DBC 文件")
-                except Exception as e:
-                    self.log(f"⚠️ 删除旧文件失败: {e}")
-
-            # 导入 canmatrix（显式导入所有需要的子模块）
-            try:
-                import canmatrix
-                import canmatrix.convert
-                import canmatrix.formats
-                import canmatrix.formats.arxml  # 关键：确保 ARXML 格式被加载
-                self.log(f"✅ canmatrix 版本: {getattr(canmatrix, '__version__', 'unknown')}")
-            except ImportError as e:
-                self.log(f"❌ 导入 canmatrix 失败: {e}")
-                raise RuntimeError(f"请确保已安装 canmatrix: pip install canmatrix")
-
-            # 检查 ARXML 文件是否存在且可读
-            if not os.path.exists(arxml_file):
-                raise FileNotFoundError(f"ARXML 文件不存在: {arxml_file}")
-
-            if os.path.getsize(arxml_file) == 0:
-                raise ValueError(f"ARXML 文件为空: {arxml_file}")
-
-            # 转换进度日志
-            self.log("🔄 正在转换 (使用 canmatrix.convert.convert)...")
-            QApplication.processEvents()
-
-            # ===== 执行转换 =====
-            # 参数与 canmatrix-convert 命令行保持一致：
-            #   canmatrix-convert input.arxml output.dbc
-            #   --dbcExportEncoding ascii
-            #   --ignoreEncodingErrors
-            try:
-                canmatrix.convert.convert(
-                    arxml_file,
-                    dbc_file,
-                    dbcExportEncoding="ascii",
-                    ignoreEncodingErrors="ignore"
-                )
-                self.log("✅ canmatrix.convert.convert() 调用完成")
-            except Exception as e:
-                self.log(f"⚠️ 转换调用失败: {e}")
-                # 尝试更基础的调用方式
-                try:
-                    # 加载 ARXML
-                    self.log("🔄 尝试分步加载...")
-                    db = canmatrix.formats.loadp(arxml_file)
-                    if db:
-                        self.log(f"✅ 加载成功: {len(db)} 个 CAN 总线")
-                        # 保存为 DBC
-                        canmatrix.formats.dump(dbc_file, db, dbcExportEncoding="ascii")
-                        self.log("✅ 分步保存成功")
-                    else:
-                        raise RuntimeError("加载 ARXML 返回空数据库")
-                except Exception as e2:
-                    self.log(f"❌ 分步加载也失败: {e2}")
-                    raise RuntimeError(f"转换失败: {e2}")
-
-            # ===== 检查输出 =====
-            def check_output(filepath):
-                """检查 DBC 文件是否有效"""
-                if not os.path.exists(filepath):
-                    return False, "文件不存在"
-                if os.path.getsize(filepath) == 0:
-                    return False, "文件为空"
-                # 检查 DBC 文件基本格式
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if 'BO_' not in content:
-                            return False, "文件中没有找到 BO_ (消息定义)"
-                    return True, ""
-                except Exception as e:
-                    return False, f"读取失败: {e}"
-
-            success, msg = check_output(dbc_file)
-            if success:
-                file_size = os.path.getsize(dbc_file)
-                self.log(f"✅ 转换成功！文件大小: {file_size} 字节")
-                # 统计消息数量
-                try:
-                    with open(dbc_file, 'r', encoding='utf-8') as f:
-                        msg_count = f.read().count('BO_')
-                    self.log(f"📊 包含 {msg_count} 个消息定义")
-                except:
-                    pass
-                self.conversion_success.emit()
-            else:
-                # 检查是否在输出目录中生成了其他 DBC 文件
-                output_dir = os.path.dirname(dbc_file)
-                candidates = []
-                try:
-                    for fname in os.listdir(output_dir):
-                        if fname.lower().endswith('.dbc'):
-                            full_path = os.path.join(output_dir, fname)
-                            if os.path.getsize(full_path) > 0:
-                                candidates.append(fname)
-                except Exception:
-                    pass
-
-                if candidates:
-                    self.log(f"✅ 在输出目录找到 DBC 文件: {', '.join(candidates)}")
-                    self.conversion_success.emit()
-                else:
-                    raise RuntimeError(f"转换完成但未生成有效的 DBC 文件: {msg}")
-
-        except Exception as e:
+            _convert_arxml_to_dbc(self.arxml_path, self.dbc_path, self.log)
+        except Exception as exc:
             import traceback
-            error_msg = traceback.format_exc()
             self.log("❌ ARXML → DBC 转换异常:")
-            self.log(error_msg)
-            self.conversion_error.emit(str(e))
+            self.log(traceback.format_exc())
+            self.conversion_error.emit(str(exc))
+            return
+        self.conversion_success.emit()
+
+    def _conversion_worker_finished(self, worker):
+        if worker is not self._conversion_worker:
+            worker.deleteLater()
+            return
+        self._conversion_worker = None
+        worker.deleteLater()
+        if self._close_after_conversion:
+            self._close_after_conversion = False
+            self.close()
 
     def _run_conversion_module(self):
         """兼容旧代码的入口。
@@ -1011,6 +1032,7 @@ class ARXMLConverterDialog(QDialog):
     def _on_success(self):
         """转换成功"""
         self.is_running = False
+        self.arxml_select_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.convert_btn.setEnabled(True)
         self.open_folder_btn.setEnabled(True)
@@ -1044,6 +1066,7 @@ class ARXMLConverterDialog(QDialog):
     def _on_error(self, error_msg):
         """转换失败"""
         self.is_running = False
+        self.arxml_select_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.convert_btn.setEnabled(True)
         self.update_convert_button()
@@ -1055,6 +1078,12 @@ class ARXMLConverterDialog(QDialog):
     def closeEvent(self, event):
         """关闭窗口时清理资源"""
         print("🔄 关闭 ARXML 转换工具...")
+
+        if self._conversion_worker is not None and self._conversion_worker.isRunning():
+            self._close_after_conversion = True
+            self.log("转换仍在进行，完成后将安全关闭窗口。")
+            event.ignore()
+            return
 
         # 如果有正在运行的进程，尝试终止
         if self.process and self.process.poll() is None:

@@ -69,10 +69,11 @@ class ArxmlConverterUi7Tests(unittest.TestCase):
 
     def test_busy_failure_success_progress_log_and_button_states(self):
         self._select_file()
-        with patch.object(baseline.threading, "Thread") as thread_type:
+        with patch.object(baseline.ARXMLConversionWorker, "start") as start:
             self.dialog.convert_btn.click()
-        thread_type.assert_called_once()
-        thread_type.return_value.start.assert_called_once()
+        start.assert_called_once()
+        worker = self.dialog._conversion_worker
+        self.assertIsInstance(worker, baseline.ARXMLConversionWorker)
         self.assertTrue(self.dialog.is_running)
         self.assertFalse(self.dialog.convert_btn.isEnabled())
         self.assertFalse(self.dialog.open_folder_btn.isEnabled())
@@ -83,6 +84,7 @@ class ArxmlConverterUi7Tests(unittest.TestCase):
 
         with patch.object(baseline.QMessageBox, "critical"):
             self.dialog._on_error("failed")
+        self.dialog._conversion_worker_finished(worker)
         self.assertFalse(self.dialog.is_running)
         self.assertTrue(self.dialog.convert_btn.isEnabled())
         self.assertFalse(self.dialog.progress_bar.isVisible())
