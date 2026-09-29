@@ -7,11 +7,13 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, Qt, pyqtSignal
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialogButtonBox, QGroupBox
 
 from vet_data_modular.blf_slice_dialog import (
-    OTHER_OFFSET, BlfSliceDialog, DuplicateSelectionDialog, selected_offset,
+    OTHER_OFFSET, BlfSliceDialog, DuplicateSelectionDialog,
+    condition_table_help_text, selected_offset,
 )
 from vet_data_modular.blf_slice_models import (
     ConditionResult, ConditionSpec, ConditionStatus, InputMode, SliceTask,
@@ -112,6 +114,95 @@ class BlfSliceMainDialogUi6Tests(unittest.TestCase):
         self.assertEqual(self.dialog.output_edit.text(), str(output))
         self.assertIn(str(output), self.dialog.output_hint.text())
         self.assertEqual(self.dialog.output_edit.toolTip(), str(output))
+
+    def test_condition_table_help_button_and_documentation(self):
+        button = self.dialog.table_help_button
+        self.assertEqual(button.text(), "?")
+        self.assertEqual(button.toolTip(), "查看工况表格式说明")
+        self.assertEqual(button.focusPolicy(), Qt.FocusPolicy.StrongFocus)
+        self.assertLessEqual(button.height(), self.dialog.table_edit.sizeHint().height())
+
+        help_text = condition_table_help_text()
+        for expected in (
+            ".xlsx", ".csv", "记录时间", "记录内容", "向前秒数", "向后秒数",
+            "单元格为空", "当前默认值：60 秒", "其他附加列", "表头顺序不固定",
+            "Excel 日期时间单元格", "YYYY-MM-DD HH:MM:SS",
+        ):
+            self.assertIn(expected, help_text)
+
+        with patch(
+            "vet_data_modular.blf_slice_dialog.QMessageBox.information"
+        ) as information:
+            button.click()
+            information.assert_called_once_with(
+                self.dialog, "工况表格式说明", help_text
+            )
+            information.reset_mock()
+            button.setFocus()
+            QTest.keyClick(button, Qt.Key.Key_Return)
+            information.assert_called_once()
+            information.reset_mock()
+            QTest.keyClick(button, Qt.Key.Key_Space)
+            information.assert_called_once()
+
+    def test_invalid_table_errors_include_reason_and_retry_guidance(self):
+        cases = (
+            ("记录内容\n2026-09-11 22:27:00\n", "缺少必需表头: 记录时间"),
+            ("记录时间\n2026-09-11 22:27:00\n", "缺少必需表头: 记录内容"),
+            ("记录时间,记录内容,记录时间\n2026-09-11 22:27:00,测试,值\n", "必需表头重复: 记录时间"),
+        )
+        for index, (contents, reason) in enumerate(cases):
+            with self.subTest(reason=reason):
+                path = self.root / f"invalid-{index}.csv"
+                path.write_text(contents, encoding="utf-8-sig")
+                with patch(
+                    "vet_data_modular.blf_slice_dialog.QMessageBox.warning"
+                ) as warning:
+                    self.dialog.load_condition_table(path)
+                warning.assert_called_once()
+                title, message = warning.call_args.args[1:3]
+                self.assertEqual(title, "工况表无效")
+                self.assertIn(reason, message)
+                self.assertIn("请修改工况表格式后重试", message)
+                self.assertIsNone(self.dialog._table_result)
+
+    def test_table_browse_still_loads_and_narrow_layout_does_not_overlap(self):
+        with patch(
+            "vet_data_modular.blf_slice_dialog.QFileDialog.getOpenFileName",
+            return_value=(str(self.table), ""),
+        ):
+            self.dialog.table_path_row.browse_button.click()
+        self.assertEqual(self.dialog.table_edit.text(), str(self.table))
+        self.assertEqual(self.dialog.condition_table.rowCount(), 2)
+
+        self.dialog.show()
+        for width in (1050, self.dialog.minimumWidth()):
+            self.dialog.resize(width, 680)
+            APP.processEvents()
+            edit_rect = self.dialog.table_edit.rect()
+            edit_top_left = self.dialog.table_edit.mapTo(self.dialog, edit_rect.topLeft())
+            edit_bottom_right = self.dialog.table_edit.mapTo(self.dialog, edit_rect.bottomRight())
+            help_rect = self.dialog.table_help_button.rect()
+            help_top_left = self.dialog.table_help_button.mapTo(self.dialog, help_rect.topLeft())
+            help_bottom_right = self.dialog.table_help_button.mapTo(self.dialog, help_rect.bottomRight())
+            self.assertFalse(
+                self._rect(edit_top_left, edit_bottom_right).intersects(
+                    self._rect(help_top_left, help_bottom_right)
+                )
+            )
+            browse = self.dialog.table_path_row.browse_button
+            browse_top_left = browse.mapTo(self.dialog, browse.rect().topLeft())
+            browse_bottom_right = browse.mapTo(self.dialog, browse.rect().bottomRight())
+            self.assertFalse(
+                self._rect(edit_top_left, edit_bottom_right).intersects(
+                    self._rect(browse_top_left, browse_bottom_right)
+                )
+            )
+
+    @staticmethod
+    def _rect(top_left: QPoint, bottom_right: QPoint):
+        from PyQt6.QtCore import QRect
+        return QRect(top_left, bottom_right)
 
     def test_timezone_batch_table_selection_edit_status_and_tooltips(self):
         self._load_table()

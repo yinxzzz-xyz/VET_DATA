@@ -1286,6 +1286,13 @@ class BusConfigWidget(QWidget):
 
             db = cantools.database.load_file(file_path)
 
+            # The selected file path is parsing data, while any filtering
+            # suffix is display-only.  Reset the previous bus-local cache
+            # before building a replacement so a re-selection cannot reuse it.
+            self.protocol_path = file_path
+            self._cached_filtered_db = None
+            self._filtered_dbc_path = None
+
             bus_name = os.path.basename(file_path).replace('.dbc', '')
 
             # 调试：向上查找 MDFPlotter
@@ -1307,17 +1314,15 @@ class BusConfigWidget(QWidget):
             filtered_db = self.filter_dbc_signals(db, bus_name)
 
             if filtered_db is not db:
+                self._cached_filtered_db = filtered_db
                 if self.protocol_clear_btn:
                     self.protocol_clear_btn.setVisible(True)
                 self.protocol_changed.emit(self.bus_id, self.protocol_path)
-                self._cached_filtered_db = filtered_db
             else:
-                self.protocol_path = file_path
                 self.set_protocol_display(os.path.basename(file_path))
                 if self.protocol_clear_btn:
                     self.protocol_clear_btn.setVisible(True)
                 self.protocol_changed.emit(self.bus_id, file_path)
-                self._cached_filtered_db = None
 
         except ImportError as e:
             QMessageBox.warning(self, "依赖缺失", f"请安装 cantools 库: pip install cantools\n\n错误: {e}")
@@ -1328,6 +1333,8 @@ class BusConfigWidget(QWidget):
 
     def clear_protocol(self):
         self.protocol_path = ""
+        self._cached_filtered_db = None
+        self._filtered_dbc_path = None
         self.arxml_sub_bus = ""
         self.set_protocol_display("未配置")
         if self.protocol_clear_btn:
@@ -1427,70 +1434,126 @@ class BusConfigWidget(QWidget):
                 QMessageBox.warning(self, "筛选信号", "未选择任何信号，将使用所有信号")
                 return db
 
-            # ===== 自动检测并保留 Header 信号 =====
-            header_signals_by_frame = {}
-            for msg_def in db.messages:
-                frame_id = msg_def.frame_id
-                for sig in msg_def.signals:
-                    name_lower = sig.name.lower()
-                    if ('header_id' in name_lower or 'pdu_id' in name_lower or
-                            'header_dlc' in name_lower or 'pdu_len' in name_lower):
-                        if frame_id not in header_signals_by_frame:
-                            header_signals_by_frame[frame_id] = []
-                        header_signals_by_frame[frame_id].append(sig.name)
-
-            from cantools.database.can import Database, Message
-
-            new_db = Database()
-            total_original = 0
-            total_filtered = 0
-            auto_added = 0
-
-            for msg_def in db.messages:
-                frame_id = msg_def.frame_id
-                total_original += len(msg_def.signals)
-
-                header_names = header_signals_by_frame.get(frame_id, [])
-
-                selected_names = set()
-                if frame_id in selected_signals:
-                    selected_names = set(selected_signals[frame_id])
-
-                if not selected_names:
-                    continue
-
-                for hdr_name in header_names:
-                    if hdr_name not in selected_names:
-                        selected_names.add(hdr_name)
-                        auto_added += 1
-                        print(f"  🔄 自动保留Header信号: {hdr_name} (帧 0x{frame_id:X})")
-
-                new_msg = Message(
-                    frame_id=msg_def.frame_id,
-                    name=msg_def.name,
-                    length=msg_def.length,
-                    senders=msg_def.senders if hasattr(msg_def, 'senders') else [],
-                    signals=[],
-                    comment=msg_def.comment if hasattr(msg_def, 'comment') else None
-                )
-
-                for sig in msg_def.signals:
-                    if sig.name in selected_names:
-                        new_msg.signals.append(sig)
-                        total_filtered += 1
-
-                if new_msg.signals:
-                    new_db.messages.append(new_msg)
+            total_original = sum(len(message.signals) for message in db.messages)
+            new_db, auto_added = self._build_filtered_database(db, selected_signals)
+            total_filtered = sum(len(message.signals) for message in new_db.messages)
 
             print(f"✅ 信号筛选完成:")
             print(f"   原始: {len(db.messages)} 个消息, {total_original} 个信号")
             print(f"   保留: {len(new_db.messages)} 个消息, {total_filtered} 个信号")
             print(f"   自动添加Header信号: {auto_added} 个")
 
-            self._save_filtered_dbc_with_custom_name(new_db, self.protocol_path)
+            self._offer_save_filtered_dbc(new_db, self.protocol_path)
 
             return new_db
         return db
+
+    @staticmethod
+    def _build_filtered_database(db, selected_signals):
+        """Build a ready-to-decode cantools database from selected signal names."""
+        if not selected_signals:
+            return db, 0
+
+        from cantools.database.can import Database, Message
+
+        new_messages = []
+        auto_added = 0
+        for msg_def in db.messages:
+            selected_names = set(selected_signals.get(msg_def.frame_id, ()))
+            if not selected_names:
+                continue
+
+            for signal in msg_def.signals:
+                name_lower = signal.name.lower()
+                is_header = (
+                    'header_id' in name_lower
+                    or 'pdu_id' in name_lower
+                    or 'header_dlc' in name_lower
+                    or 'pdu_len' in name_lower
+                )
+                if is_header and signal.name not in selected_names:
+                    selected_names.add(signal.name)
+                    auto_added += 1
+                    print(
+                        f"  🔄 自动保留Header信号: {signal.name} "
+                        f"(帧 0x{msg_def.frame_id:X})"
+                    )
+
+            filtered_signals = [
+                signal for signal in msg_def.signals
+                if signal.name in selected_names
+            ]
+            if not filtered_signals:
+                continue
+
+            new_message = Message(
+                frame_id=msg_def.frame_id,
+                name=msg_def.name,
+                length=msg_def.length,
+                signals=filtered_signals,
+                contained_messages=(
+                    list(msg_def.contained_messages)
+                    if msg_def.contained_messages is not None
+                    else None
+                ),
+                header_id=msg_def.header_id,
+                header_byte_order=msg_def.header_byte_order,
+                unused_bit_pattern=msg_def.unused_bit_pattern,
+                comment=msg_def.comment,
+                senders=list(msg_def.senders),
+                send_type=msg_def.send_type,
+                cycle_time=msg_def.cycle_time,
+                dbc_specifics=msg_def.dbc,
+                autosar_specifics=msg_def.autosar,
+                is_extended_frame=msg_def.is_extended_frame,
+                is_fd=msg_def.is_fd,
+                bus_name=msg_def.bus_name,
+                signal_groups=(
+                    list(msg_def.signal_groups)
+                    if msg_def.signal_groups is not None
+                    else None
+                ),
+                protocol=msg_def.protocol,
+                sort_signals=None,
+            )
+            new_message.refresh()
+            new_messages.append(new_message)
+
+        new_db = Database(
+            messages=new_messages,
+            nodes=list(db.nodes),
+            buses=list(db.buses),
+            version=db.version,
+            dbc_specifics=db.dbc,
+            autosar_specifics=db.autosar,
+            frame_id_mask=getattr(db, '_frame_id_mask', None),
+            sort_signals=None,
+        )
+        new_db.refresh()
+        return new_db, auto_added
+
+    def _use_filtered_dbc_in_memory(self, original_path):
+        """Keep a filtered database for parsing without changing its source path."""
+        self.protocol_path = original_path
+        self.set_protocol_display(
+            os.path.basename(original_path) + " [已筛选-内存]"
+        )
+        self._filtered_dbc_path = None
+
+    def _offer_save_filtered_dbc(self, db, original_path):
+        """Ask before opening the filtered-DBC save dialog."""
+        choice = QMessageBox.question(
+            self,
+            "保存筛选后的DBC文件",
+            "是否将筛选后的 DBC 保存为新文件？\n\n"
+            "选择“否”将继续使用内存中的筛选结果，不会修改原 DBC。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self._save_filtered_dbc_with_custom_name(db, original_path)
+        else:
+            self._use_filtered_dbc_in_memory(original_path)
 
     def _save_filtered_dbc_with_custom_name(self, db, original_path):
         """保存筛选后的DBC，支持自定义文件名"""
@@ -1514,9 +1577,7 @@ class BusConfigWidget(QWidget):
                     "保存取消",
                     "已取消保存筛选后的DBC文件，将使用筛选后的数据库进行解析，但不会保存到文件。"
                 )
-                self.protocol_path = original_path + " [已筛选-内存]"
-                self.set_protocol_display(os.path.basename(original_path) + " [已筛选-内存]")
-                self._filtered_dbc_path = None
+                self._use_filtered_dbc_in_memory(original_path)
                 return
 
             if not save_path.endswith('.dbc'):
@@ -1567,9 +1628,7 @@ class BusConfigWidget(QWidget):
                 "保存失败",
                 f"保存筛选后的DBC失败:\n{str(e)}\n\n将使用筛选后的数据库进行解析，但不会保存到文件。"
             )
-            self.protocol_path = original_path + " [已筛选-内存]"
-            self.set_protocol_display(os.path.basename(original_path) + " [已筛选-内存]")
-            self._filtered_dbc_path = None
+            self._use_filtered_dbc_in_memory(original_path)
 
     def _generate_dbc_content(self, db):
         """生成DBC文件内容，保持信号顺序"""
@@ -1783,6 +1842,14 @@ class ParseProgressDialog(QDialog):
             self.cancel_btn.clicked.disconnect()
             self.cancel_btn.clicked.connect(self.close)
 
+    def set_empty_result(self, reason):
+        """Show an expected no-result outcome without claiming a worker crash."""
+        self.status_label.setText("❌ 未生成可用信号")
+        self.detail_label.setText(reason)
+        self.cancel_btn.setText("关闭")
+        self.cancel_btn.clicked.disconnect()
+        self.cancel_btn.clicked.connect(self.close)
+
     def on_cancel(self):
         self._cancelled = True
         self.status_label.setText("⏹ 正在取消...")
@@ -1869,9 +1936,13 @@ class ParseWorker(QThread):
 
             if header_id_sig and header_dlc_sig:
                 frame_id = msg_def.frame_id
+                frame_key = (
+                    frame_id,
+                    bool(getattr(msg_def, 'is_extended_frame', False)),
+                )
                 header_total_bits = header_id_sig.length + header_dlc_sig.length
 
-                self.container_frames_info[frame_id] = {
+                self.container_frames_info[frame_key] = {
                     'frame_id': frame_id,
                     'frame_name': msg_def.name,
                     'header_id_sig': header_id_sig,
@@ -1890,11 +1961,16 @@ class ParseWorker(QThread):
             return
 
         # ===== 第二步：为每个容器帧构建 multiplexer 信号映射 =====
-        for frame_id, frame_info in self.container_frames_info.items():
+        for frame_key, frame_info in self.container_frames_info.items():
+            frame_id = frame_info['frame_id']
             multiplexer_signals = {}
 
             for msg_def in db.messages:
-                if msg_def.frame_id != frame_id:
+                message_key = (
+                    msg_def.frame_id,
+                    bool(getattr(msg_def, 'is_extended_frame', False)),
+                )
+                if message_key != frame_key:
                     continue
 
                 # 打印信号信息以便调试
@@ -2089,7 +2165,8 @@ class ParseWorker(QThread):
             print(f"   是否多路复用: {self.is_multiplexer}")
             if self.is_multiplexer:
                 print(f"   检测到 {len(self.container_frames_info)} 个容器帧:")
-                for frame_id, info in self.container_frames_info.items():
+                for _frame_key, info in self.container_frames_info.items():
+                    frame_id = info['frame_id']
                     print(
                         f"     0x{frame_id:X} ({info['frame_name']}) - Header总位数: {info['header_total_bits']} bits")
                     print(f"     分组数: {len(info['multiplexer_signals'])}")
@@ -2103,20 +2180,21 @@ class ParseWorker(QThread):
 
             # ===== 构建消息映射 =====
             msg_shard = {}
-            msg_signal_map = {}
-
             for msg_def in self.db.messages:
                 frame_id = msg_def.frame_id
-                msg_shard[frame_id] = msg_def
+                message_key = (frame_id, bool(getattr(msg_def, 'is_extended_frame', False)))
+                msg_shard[message_key] = msg_def
                 print(f"  📨 注册消息: ID=0x{frame_id:X} ({frame_id}), 信号数={len(msg_def.signals)}")
 
-                sig_map = {}
-                for sig in msg_def.signals:
-                    sig_map[sig.name] = sig
-                msg_signal_map[frame_id] = sig_map
-
             print(f"\n总线 {self.bus_id}: 数据库中有 {len(msg_shard)} 个消息定义")
-            print(f"  消息ID列表: {[hex(i) for i in sorted(msg_shard.keys())]}")
+            message_labels = [
+                f"{hex(frame_id)}/{'EXT' if is_extended else 'STD'}"
+                for frame_id, is_extended in sorted(msg_shard.keys())
+            ]
+            print(
+                "  消息ID列表: "
+                f"{message_labels}"
+            )
 
             total_msgs = self.msg_count
             print(f"总线 {self.bus_id}: 探测消息总数: {total_msgs}")
@@ -2125,6 +2203,13 @@ class ParseWorker(QThread):
             pool = defaultdict(lambda: {'t': [], 'v': [], 'unit': '', 'comment': ''})
 
             total_messages_processed = 0
+            scanned_frames = 0
+            dbc_undefined_frames = 0
+            decoded_frames = 0
+            empty_decoded_frames = 0
+            truncated_frames = 0
+            decode_failed_frames = 0
+            decode_error_counts = defaultdict(int)
             total_signals_decoded = 0
             msg_ids_with_signals = set()
             matched_msg_ids = set()
@@ -2154,8 +2239,29 @@ class ParseWorker(QThread):
                 if raw_channel != self.target_raw_channel:
                     continue
 
+                scanned_frames += 1
+                if total_msgs > 0:
+                    progress = int(scanned_frames / total_msgs * 100)
+                    if progress > last_progress_percent:
+                        progress_to_show = min(99, progress)
+                        if progress_to_show > last_progress_percent:
+                            self.progress_updated.emit(
+                                self.bus_id,
+                                progress_to_show,
+                                f"扫描中... {scanned_frames:,} / {total_msgs:,} 条报文"
+                            )
+                            last_progress_percent = progress_to_show
+                    elif scanned_frames - last_progress_update >= progress_interval:
+                        self.progress_updated.emit(
+                            self.bus_id,
+                            min(99, last_progress_percent),
+                            f"扫描中... {scanned_frames:,} / {total_msgs:,} 条报文"
+                        )
+                        last_progress_update = scanned_frames
+
                 rel_t = msg.timestamp - t0
                 msg_id = msg.arbitration_id
+                is_extended_id = bool(getattr(msg, 'is_extended_id', False))
 
                 # ===== 专门打印 0x13E 帧 =====
                 if msg_id == 0x13E:
@@ -2163,18 +2269,28 @@ class ParseWorker(QThread):
                     print(f"🔍 [0x13E 帧] 时间: {rel_t:.6f}s, 数据长度: {len(msg.data)}, 数据: {msg.data.hex()}")
                     print(f"   raw_channel: {raw_channel}, bus_id: {self.bus_id}")
 
-                msg_def = msg_shard.get(msg_id)
+                message_key = (msg_id, is_extended_id)
+                msg_def = msg_shard.get(message_key)
                 if msg_def is None:
                     unmatched_msg_ids.add(msg_id)
+                    dbc_undefined_frames += 1
                     continue
 
                 matched_msg_ids.add(msg_id)
                 total_messages_processed += 1
+                frame_signals_before = total_signals_decoded
+                frame_decode_failed = False
+                is_truncated = (
+                    bool(getattr(msg, 'is_fd', False))
+                    and len(msg.data) < msg_def.length
+                )
+                if is_truncated:
+                    truncated_frames += 1
 
                 # ===== 检测是否为容器帧 =====
-                if self.is_multiplexer and msg_id in self.container_frames_info:
-                    container_frame_counts[msg_id] += 1
-                    frame_info = self.container_frames_info[msg_id]
+                if self.is_multiplexer and message_key in self.container_frames_info:
+                    container_frame_counts[message_key] += 1
+                    frame_info = self.container_frames_info[message_key]
                     header_total_bits = frame_info['header_total_bits']
                     multiplexer_signals = frame_info['multiplexer_signals']
                     header_bytes = (header_total_bits + 7) // 8
@@ -2183,7 +2299,7 @@ class ParseWorker(QThread):
                     data = msg.data
                     i = 0
                     data_len = len(data)
-                    current_count = container_frame_counts[msg_id]
+                    current_count = container_frame_counts[message_key]
 
                     # ===== 专门打印 0x13E 帧的详细信息 =====
                     if msg_id == 0x13E:
@@ -2354,8 +2470,8 @@ class ParseWorker(QThread):
                                         if current_count <= 10:
                                             print(f"      ❌ 解码信号 {sig_info['name']} 失败: {e}")
 
-                                total_signals_decoded += len(signals)
-                                msg_ids_with_signals.add(msg_id)
+                                if total_signals_decoded > frame_signals_before:
+                                    msg_ids_with_signals.add(msg_id)
 
                             else:
                                 if current_count <= 10 and header_id != 0:
@@ -2376,7 +2492,17 @@ class ParseWorker(QThread):
                 else:
                     # ===== 普通消息：解析所有信号 =====
                     try:
-                        decoded = msg_def.decode(msg.data, decode_choices=False)
+                        if is_truncated:
+                            decoded = msg_def.decode(
+                                msg.data,
+                                decode_choices=False,
+                                allow_truncated=True,
+                            )
+                        else:
+                            decoded = msg_def.decode(
+                                msg.data,
+                                decode_choices=False,
+                            )
                         for sig_name, sig_val in decoded.items():
                             if not isinstance(sig_val, (int, float)):
                                 continue
@@ -2389,43 +2515,17 @@ class ParseWorker(QThread):
                                     pack['unit'] = getattr(sig_obj, 'unit', '')
                                     pack['comment'] = f"ID: 0x{msg_id:X}"
                         total_signals_decoded += len(decoded)
-                        msg_ids_with_signals.add(msg_id)
-                    except Exception:
-                        sig_map = msg_signal_map.get(msg_id, {})
-                        for sig_name, sig_obj in sig_map.items():
-                            try:
-                                sig_val = sig_obj.decode(msg.data)
-                                if isinstance(sig_val, (int, float)):
-                                    pack = pool[sig_name]
-                                    pack['t'].append(rel_t)
-                                    pack['v'].append(float(sig_val))
-                                    if not pack['unit']:
-                                        pack['unit'] = getattr(sig_obj, 'unit', '')
-                                        pack['comment'] = f"ID: 0x{msg_id:X}"
-                                    total_signals_decoded += 1
-                                    msg_ids_with_signals.add(msg_id)
-                            except Exception:
-                                pass
+                        if decoded:
+                            msg_ids_with_signals.add(msg_id)
+                    except Exception as exc:
+                        frame_decode_failed = True
+                        decode_failed_frames += 1
+                        decode_error_counts[type(exc).__name__] += 1
 
-                # ===== 进度更新 =====
-                if total_msgs > 0:
-                    progress = int(total_messages_processed / total_msgs * 100)
-                    if progress > last_progress_percent:
-                        progress_to_show = min(99, progress)
-                        if progress_to_show > last_progress_percent:
-                            self.progress_updated.emit(
-                                self.bus_id,
-                                progress_to_show,
-                                f"处理中... {total_messages_processed:,} / {total_msgs:,} 条消息"
-                            )
-                            last_progress_percent = progress_to_show
-                    elif total_messages_processed - last_progress_update >= progress_interval:
-                        self.progress_updated.emit(
-                            self.bus_id,
-                            min(99, last_progress_percent),
-                            f"处理中... {total_messages_processed:,} / {total_msgs:,} 条消息"
-                        )
-                        last_progress_update = total_messages_processed
+                if total_signals_decoded > frame_signals_before:
+                    decoded_frames += 1
+                elif not frame_decode_failed:
+                    empty_decoded_frames += 1
 
             try:
                 reader.stop()
@@ -2442,12 +2542,23 @@ class ParseWorker(QThread):
             if unmatched_msg_ids:
                 print(f"  - 未匹配ID示例: {[hex(i) for i in list(unmatched_msg_ids)[:20]]}")
             print(f"  - 处理的报文总数: {total_messages_processed}")
+            print(f"  - 扫描总帧数: {scanned_frames}")
+            print(f"  - DBC 匹配帧数: {total_messages_processed}")
+            print(f"  - DBC 未定义帧数: {dbc_undefined_frames}")
+            print(f"  - 成功解码帧数: {decoded_frames}")
+            print(f"  - 解码成功但结果为空帧数: {empty_decoded_frames}")
+            print(f"  - truncated/长度不符帧数: {truncated_frames}")
+            print(f"  - 解码失败帧数: {decode_failed_frames}")
+            if decode_error_counts:
+                print(f"  - 解码失败类型汇总: {dict(decode_error_counts)}")
             print(f"  - 容器帧数量: {sum(container_frame_counts.values())}")
             if container_frame_counts:
                 print(f"  - 各容器帧计数:")
-                for frame_id, count in container_frame_counts.items():
-                    frame_name = self.container_frames_info[frame_id]['frame_name']
-                    print(f"     0x{frame_id:X} ({frame_name}): {count} 帧")
+                for frame_key, count in container_frame_counts.items():
+                    frame_id, is_extended = frame_key
+                    frame_name = self.container_frames_info[frame_key]['frame_name']
+                    frame_kind = "EXT" if is_extended else "STD"
+                    print(f"     0x{frame_id:X}/{frame_kind} ({frame_name}): {count} 帧")
             print(f"  - 成功解码的信号值: {total_signals_decoded}")
             print(f"  - 包含信号的CAN ID数: {len(msg_ids_with_signals)}")
             print(f"  - 成功注册的信号通道数: {len(pool)}")
@@ -2472,15 +2583,28 @@ class ParseWorker(QThread):
 
             stats = {
                 'messages_processed': total_messages_processed,
+                'scanned_frames': scanned_frames,
+                'dbc_matched_frames': total_messages_processed,
+                'dbc_undefined_frames': dbc_undefined_frames,
+                'decoded_frames': decoded_frames,
+                'empty_decoded_frames': empty_decoded_frames,
+                'truncated_frames': truncated_frames,
+                'decode_failed_frames': decode_failed_frames,
+                'decode_error_counts': dict(decode_error_counts),
                 'signals_decoded': total_signals_decoded,
+                'generated_signal_count': len(pool),
+                'dbc_message_count': len(self.db.messages),
+                'dbc_signal_count': sum(len(message.signals) for message in self.db.messages),
                 'msg_ids_with_signals': len(msg_ids_with_signals),
                 'matched_msg_ids': len(matched_msg_ids),
                 'unmatched_msg_ids': len(unmatched_msg_ids),
-                'container_frame_counts': dict(container_frame_counts),
+                'container_frame_counts': {
+                    frame_id | (0x80000000 if is_extended else 0): count
+                    for (frame_id, is_extended), count in container_frame_counts.items()
+                },
                 'pool': pool
             }
 
-            self.progress_updated.emit(self.bus_id, 100, "解析完成!")
             self.parse_finished.emit(self.bus_id, stats)
 
         except Exception as e:
@@ -2539,8 +2663,27 @@ class MDFPlotter(QWidget):
 
         # ====== 左侧面板 ======
         self.left_panel_widget = QWidget()
-        left_panel = QVBoxLayout(self.left_panel_widget)
+        left_panel_shell = QVBoxLayout(self.left_panel_widget)
+        left_panel_shell.setContentsMargins(0, 0, 0, 0)
+        left_panel_shell.setSpacing(0)
+
+        self.left_panel_scroll = QScrollArea()
+        self.left_panel_scroll.setObjectName("mainLeftPanelScrollArea")
+        self.left_panel_scroll.setWidgetResizable(True)
+        self.left_panel_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.left_panel_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.left_panel_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        self.left_panel_content = QWidget()
+        self.left_panel_content.setObjectName("mainLeftPanelContent")
+        left_panel = QVBoxLayout(self.left_panel_content)
         left_panel.setContentsMargins(5, 5, 5, 5)
+        self.left_panel_scroll.setWidget(self.left_panel_content)
+        left_panel_shell.addWidget(self.left_panel_scroll)
 
         file_select_layout = QHBoxLayout()
         self.current_file_label = QLabel("未选择数据文件")
@@ -2553,19 +2696,35 @@ class MDFPlotter(QWidget):
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("搜索信号...")
 
-        select_buttons_layout = QHBoxLayout()
+        self.top_action_layout = QHBoxLayout()
+        self.top_action_layout.setObjectName("topActionLayout")
+        self.top_action_layout.setSpacing(4)
+        self.top_action_layout.setContentsMargins(0, 0, 0, 0)
         self.select_all_button = QPushButton("全选")
         self.deselect_all_button = QPushButton("全部取消")
-        select_buttons_layout.addWidget(self.select_all_button)
-        select_buttons_layout.addWidget(self.deselect_all_button)
-
-        config_buttons_layout = QHBoxLayout()
         self.save_config_button = QPushButton("保存配置")
         self.load_config_button = QPushButton("加载配置")
-        config_buttons_layout.addWidget(self.save_config_button)
-        config_buttons_layout.addWidget(self.load_config_button)
+        for button in (
+            self.select_all_button, self.deselect_all_button,
+            self.save_config_button, self.load_config_button,
+        ):
+            button.setMinimumWidth(0)
+            self.top_action_layout.addWidget(button, 1)
 
         self.math_channel_button = QPushButton("➕ 创建计算通道 (加减乘除)")
+
+        self.top_primary_action_layout = QHBoxLayout()
+        self.top_primary_action_layout.setObjectName("topPrimaryActionLayout")
+        self.top_primary_action_layout.setSpacing(4)
+        self.top_primary_action_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_button = QPushButton("绘制所选信号")
+        self.export_button = QPushButton("导出为CSV")
+        self.save_data_button = QPushButton("数据截取")
+        for button in (
+            self.plot_button, self.export_button, self.save_data_button,
+        ):
+            button.setMinimumWidth(0)
+            self.top_primary_action_layout.addWidget(button, 1)
 
         # ====== 可用信号区域 ======
         signal_groupbox = QGroupBox("可用信号")
@@ -2650,13 +2809,11 @@ class MDFPlotter(QWidget):
         map_groupbox.setLayout(map_layout)
 
         # ====== 底部按钮 ======
-        button_layout = QHBoxLayout()
-        self.plot_button = QPushButton("绘制所选信号")
-        self.export_button = QPushButton("导出为CSV")
-        self.save_data_button = QPushButton("数据截取")
-        button_layout.addWidget(self.plot_button)
-        button_layout.addWidget(self.export_button)
-        button_layout.addWidget(self.save_data_button)
+        self.bottom_action_layout = QHBoxLayout()
+        self.bottom_action_layout.setObjectName("bottomActionLayout")
+        self.bottom_action_layout.setSpacing(4)
+        self.bottom_action_layout.setContentsMargins(0, 0, 0, 0)
+        self.bottom_action_layout.addWidget(self.math_channel_button, 2)
 
         # ====== 使用 QSplitter ======
         self.left_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -2667,13 +2824,12 @@ class MDFPlotter(QWidget):
 
         left_panel.addLayout(file_select_layout)
         left_panel.addWidget(self.search_box)
-        left_panel.addLayout(select_buttons_layout)
-        left_panel.addLayout(config_buttons_layout)
-        left_panel.addWidget(self.math_channel_button)
+        left_panel.addLayout(self.top_action_layout)
+        left_panel.addLayout(self.top_primary_action_layout)
         left_panel.addWidget(self.left_splitter)
         left_panel.addWidget(map_groupbox)
-        left_panel.addLayout(button_layout)
-        left_panel.setStretch(5, 1)
+        left_panel.addLayout(self.bottom_action_layout)
+        left_panel.setStretch(4, 1)
 
         # ====== 右侧面板 ======
         right_panel = QGroupBox("信号曲线")
@@ -3285,17 +3441,22 @@ class MDFPlotter(QWidget):
             widget = self.bus_config_widgets.get(bus_id)
             db = None
 
-            if protocol_info.lower().endswith('.dbc'):
+            cached_filtered_db = (
+                widget._cached_filtered_db
+                if widget and hasattr(widget, '_cached_filtered_db')
+                else None
+            )
+
+            if cached_filtered_db is not None:
+                db = cached_filtered_db
+                print("✅ 使用筛选后的DBC缓存")
+            elif protocol_info.lower().endswith('.dbc'):
                 try:
                     if cantools is None:
                         raise ImportError("cantools 库未安装")
 
-                    if widget and hasattr(widget, '_cached_filtered_db') and widget._cached_filtered_db is not None:
-                        db = widget._cached_filtered_db
-                        print("✅ 使用筛选后的DBC缓存")
-                    else:
-                        db = cantools.database.load_file(protocol_info)
-                        print(f"✅ DBC加载成功: {len(db.messages)} 个消息")
+                    db = cantools.database.load_file(protocol_info)
+                    print(f"✅ DBC加载成功: {len(db.messages)} 个消息")
                 except ImportError as e:
                     raise Exception(f"请安装 cantools 库: pip install cantools\n\n错误: {e}")
                 except Exception as e:
@@ -3356,12 +3517,38 @@ class MDFPlotter(QWidget):
         pool = stats.pop('pool', {})
 
         if not pool:
-            print(f"⚠️ 总线 {bus_id} 解析完成，但没有提取到任何信号数据")
+            if stats.get('dbc_signal_count', 0) == 0:
+                result_state = 'dbc_has_no_signals'
+                reason = "所选 DBC 未包含可解析信号，请检查 ARXML → DBC 转换结果。"
+            elif stats.get('dbc_matched_frames', 0) == 0:
+                result_state = 'no_matching_frames'
+                reason = "BLF 中未找到与所选 DBC 匹配的 CAN 报文，请检查 Bus/DBC 配置。"
+            elif (
+                stats.get('empty_decoded_frames', 0) > 0
+                and stats.get('decode_failed_frames', 0) == 0
+            ):
+                result_state = 'all_decodes_empty'
+                reason = "匹配报文解码未报错，但均未返回信号，请重新选择或生成筛选 DBC。"
+            else:
+                result_state = 'all_matching_frames_failed'
+                reason = "找到匹配报文，但均无法解码，请检查 DBC 报文长度及 CAN FD 定义。"
+            stats['result_state'] = result_state
+            stats['result_message'] = reason
+            print(f"⚠️ 总线 {bus_id} 未生成可用信号: {reason}")
             if bus_id in self.bus_config_widgets:
                 self.bus_config_widgets[bus_id].set_status('error')
             if bus_id in self.progress_dialogs:
-                self.progress_dialogs[bus_id].set_finished(False)
+                self.progress_dialogs[bus_id].set_empty_result(reason)
+            if bus_id in self.can_bus_data:
+                self.can_bus_data[bus_id]['parse_stats'] = stats
+            if bus_id in self.db_per_bus:
+                self.db_per_bus[bus_id]['parsed'] = False
+            if bus_id in self.parse_workers:
+                del self.parse_workers[bus_id]
             return
+
+        stats['result_state'] = 'success'
+        stats['result_message'] = ''
 
         bus_name = self.can_bus_data.get(bus_id, {}).get('name', f"Bus {bus_id}")
         self.register_can_signals(pool, bus_name, bus_id)
@@ -3379,6 +3566,7 @@ class MDFPlotter(QWidget):
             self.bus_config_widgets[bus_id].set_id_count(total_actual_ids, msg_ids_with_signals)
 
         if bus_id in self.progress_dialogs:
+            self.progress_dialogs[bus_id].update_progress(100, "解析完成!")
             self.progress_dialogs[bus_id].set_finished(True, stats)
             QTimer.singleShot(3000, lambda: self.close_progress_dialog(bus_id))
 

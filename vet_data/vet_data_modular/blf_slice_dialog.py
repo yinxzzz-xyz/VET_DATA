@@ -10,13 +10,17 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QButtonGroup, QComboBox, QDialog, QFileDialog, QFormLayout,
     QGroupBox, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem,
+    QPushButton, QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget, QScrollArea,
 )
 
 from .blf_slice_models import InputMode, SliceTask
 from .blf_slice_service import resolve_output_directory, validate_task
-from .blf_slice_table import TableParseError, TableParseResult, parse_condition_table
+from .blf_slice_table import (
+    DEFAULT_AFTER_SECONDS, DEFAULT_BEFORE_SECONDS, OPTIONAL_AFTER_HEADER,
+    OPTIONAL_BEFORE_HEADER, REQUIRED_HEADERS, TableParseError, TableParseResult,
+    parse_condition_table,
+)
 from .theme import DEFAULT_THEME, build_blf_slice_stylesheet
 
 
@@ -24,6 +28,53 @@ OTHER_OFFSET = "other"
 SPECIAL_UTC_OFFSET_MINUTES = (
     -570, -210, 210, 270, 330, 345, 390, 525, 570, 630, 765, 825,
 )
+
+
+def condition_table_help_text() -> str:
+    """Return format guidance using the parser's public headers and defaults."""
+    recorded_at_header, content_header = REQUIRED_HEADERS
+    return f"""工况表支持的文件格式：
+• Excel 工作簿：.xlsx
+• CSV 文件：.csv
+
+第一行必须是表头，并且必须包含以下两列（顺序不限、不能重复）：
+• {recorded_at_header}：工况发生时间
+• {content_header}：工况名称或工况描述
+
+可选表头：
+• {OPTIONAL_BEFORE_HEADER}：从工况时间向前扩展的切片秒数
+• {OPTIONAL_AFTER_HEADER}：从工况时间向后扩展的切片秒数
+
+默认规则：
+• 没有“{OPTIONAL_BEFORE_HEADER}”列或对应单元格为空时，使用当前默认值：{DEFAULT_BEFORE_SECONDS} 秒。
+• 没有“{OPTIONAL_AFTER_HEADER}”列或对应单元格为空时，使用当前默认值：{DEFAULT_AFTER_SECONDS} 秒。
+
+兼容规则：
+• 允许存在“序号、时间来源、纬度、经度”等其他附加列，附加列会被忽略，不会导致解析失败。
+• 表头顺序不固定，只要求必需表头存在且不重复。
+
+时间格式：
+• XLSX 可以使用真实的 Excel 日期时间单元格。
+• 文本时间须使用项目支持的完整日期时间格式，推荐：YYYY-MM-DD HH:MM:SS。
+• 同时兼容现有格式：YYYY/M/D H:MM（分钟精度会将秒补为 00）。
+
+示例：
+{recorded_at_header} | {content_header} | {OPTIONAL_BEFORE_HEADER} | {OPTIONAL_AFTER_HEADER}
+2026-09-11 22:27:00 | 加速测试 | 30 | 30
+2026-09-11 22:30:00 | 制动测试 |   |
+
+示例第二行的可选秒数为空，因此使用上述当前默认值。"""
+
+
+class _HelpToolButton(QToolButton):
+    """Compact help button that also activates explicitly on Enter."""
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+            self.click()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 def offset_label(offset: timedelta) -> str:
@@ -184,7 +235,23 @@ class BlfSliceDialog(QDialog):
         self.table_path_row = self._path_row(self.table_edit, self._choose_table)
         self.output_path_row = self._path_row(self.output_edit, self._choose_output)
         form.addRow("BLF 输入", self.input_path_row)
-        form.addRow("工况表", self.table_path_row)
+        self.table_label = QWidget()
+        table_label_layout = QHBoxLayout(self.table_label)
+        table_label_layout.setContentsMargins(0, 0, 0, 0)
+        table_label_layout.setSpacing(DEFAULT_THEME.spacing.xsmall)
+        table_label_layout.addWidget(QLabel("工况表"))
+        self.table_help_button = _HelpToolButton()
+        self.table_help_button.setObjectName("conditionTableHelpButton")
+        self.table_help_button.setText("?")
+        self.table_help_button.setToolTip("查看工况表格式说明")
+        self.table_help_button.setAccessibleName("查看工况表格式说明")
+        self.table_help_button.setAutoRaise(True)
+        self.table_help_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        help_size = self.table_edit.sizeHint().height()
+        self.table_help_button.setFixedSize(help_size, help_size)
+        self.table_help_button.clicked.connect(self._show_table_format_help)
+        table_label_layout.addWidget(self.table_help_button)
+        form.addRow(self.table_label, self.table_path_row)
         form.addRow("输出目录", self.output_path_row)
         self.output_hint = QLabel("未单独选择时使用 BLF 输入所在目录。")
         self.output_hint.setProperty("uiTextRole", "secondary")
@@ -309,6 +376,9 @@ class BlfSliceDialog(QDialog):
             self.output_edit.setText(path)
             self._set_output_hint(f"实际输出目录：{path}")
 
+    def _show_table_format_help(self):
+        QMessageBox.information(self, "工况表格式说明", condition_table_help_text())
+
     def _set_output_hint(self, text):
         self.output_hint.setText(text)
         self.output_hint.setToolTip(text)
@@ -324,7 +394,11 @@ class BlfSliceDialog(QDialog):
         except (TableParseError, OSError) as exc:
             self._table_result = None
             self.condition_table.setRowCount(0)
-            QMessageBox.warning(self, "工况表无效", str(exc))
+            QMessageBox.warning(
+                self,
+                "工况表无效",
+                f"{exc}\n\n请修改工况表格式后重试。",
+            )
             return
         self._table_result = result
         self.condition_table.setRowCount(len(result.conditions))

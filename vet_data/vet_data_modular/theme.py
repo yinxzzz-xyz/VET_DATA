@@ -180,8 +180,23 @@ QPushButton[uiRole="secondary"] {{
     border: 1px solid {c.secondary};
     border-radius: {controls.corner_radius}px;
 }}
+QPushButton[uiRole="signalView"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+}}
+QPushButton[uiRole="signalView"]:checked {{
+    color: {c.surface};
+    background-color: {c.primary};
+    border-color: {c.primary};
+    font-weight: 600;
+}}
 QPushButton[uiRole="primary"]:disabled,
-QPushButton[uiRole="secondary"]:disabled {{
+QPushButton[uiRole="secondary"]:disabled,
+QPushButton[uiRole="signalView"]:disabled {{
     color: {c.disabled_text};
     background-color: {c.disabled_background};
     border-color: {c.border};

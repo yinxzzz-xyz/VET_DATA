@@ -97,6 +97,15 @@ class CsvConditionTableTests(unittest.TestCase):
             result = parse_condition_table(path)
         self.assertEqual((result.conditions[0].before_seconds, result.conditions[0].after_seconds), (60, 60))
 
+    def test_required_header_duplicates_are_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(
+                folder,
+                "记录时间,记录内容,记录时间\n2026/6/29 9:05,测试,重复\n",
+            )
+            with self.assertRaisesRegex(TableParseError, "必需表头重复: 记录时间"):
+                parse_condition_table(path)
+
     def test_invalid_row_does_not_block_valid_rows(self):
         with tempfile.TemporaryDirectory() as folder:
             path = self._write(

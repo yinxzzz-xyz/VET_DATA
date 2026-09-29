@@ -103,5 +103,11 @@ class XlsxConditionTableTests(unittest.TestCase):
         self.assertEqual(result.conditions, ())
         self.assertEqual(len(result.discarded_rows), 2)
 
+    def test_project_example_workbook_parses(self):
+        path = Path(__file__).parents[1] / "测试数据" / "任务1_20260914_134451.xlsx"
+        result = parse_condition_table(path)
+        self.assertGreater(len(result.conditions), 0)
+        self.assertEqual(result.discarded_rows, ())
+
 if __name__ == "__main__":
     unittest.main()

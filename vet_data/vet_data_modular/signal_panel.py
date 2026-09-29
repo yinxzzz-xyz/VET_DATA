@@ -81,6 +81,7 @@ class SignalPanelMixin:
         self.reset_order_btn = QPushButton("↺ 恢复默认排序")
         for button in (self.view_all_btn, self.view_selected_btn):
             button.setCheckable(True)
+            button.setProperty("uiRole", "signalView")
         self.view_all_btn.setChecked(True)
         self.reset_order_btn.setVisible(False)
         row.addWidget(self.view_all_btn)

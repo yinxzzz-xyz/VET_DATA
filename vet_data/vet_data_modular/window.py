@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from PyQt6.QtWidgets import (
     QDialog, QFileDialog, QGroupBox, QInputDialog, QLabel, QMessageBox, QPushButton,
-    QSplitter,
+    QScrollArea, QSplitter,
 )
 
 from .blf_slice_dialog import BlfSliceDialog
@@ -84,11 +84,14 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.setProperty("uiSurface", "main")
         self.setStyleSheet(build_main_window_stylesheet(tokens))
         self.layout().setSpacing(tokens.spacing.small)
-        self.left_panel_widget.layout().setContentsMargins(
+        self.left_panel_content.layout().setContentsMargins(
             tokens.spacing.small, tokens.spacing.small,
             tokens.spacing.small, tokens.spacing.small,
         )
-        self.left_panel_widget.layout().setSpacing(tokens.spacing.small)
+        self.left_panel_content.layout().setSpacing(tokens.spacing.small)
+        self.top_action_layout.setSpacing(tokens.spacing.xsmall)
+        self.top_primary_action_layout.setSpacing(tokens.spacing.xsmall)
+        self.bottom_action_layout.setSpacing(tokens.spacing.xsmall)
         self.search_box.setProperty("uiControl", "main")
         self.search_box.setStyleSheet("")
         self.current_file_label.setProperty("uiTextRole", "secondary")
@@ -478,10 +481,10 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.blf_slice_button = QPushButton("BLF 工况切片")
         self.blf_slice_button.setToolTip("独立选择 BLF 和工况表并执行自动切片")
         self.blf_slice_button.clicked.connect(self.open_blf_slice_dialog)
-        layout = self._find_layout_containing(self.layout(), self.save_data_button)
+        layout = self._find_layout_containing(self.layout(), self.math_channel_button)
         if layout is None:
             raise RuntimeError("无法定位主窗口底部操作区")
-        layout.addWidget(self.blf_slice_button)
+        layout.addWidget(self.blf_slice_button, 1)
 
     @classmethod
     def _find_layout_containing(cls, layout, widget):
@@ -499,6 +502,12 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             found = cls._find_layout_containing(child.layout(), widget) if child else None
             if found is not None:
                 return found
+            if isinstance(child, QScrollArea) and child.widget() is not None:
+                found = cls._find_layout_containing(
+                    child.widget().layout(), widget
+                )
+                if found is not None:
+                    return found
             if isinstance(child, QSplitter):
                 for child_index in range(child.count()):
                     splitter_child = child.widget(child_index)
@@ -671,6 +680,10 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.bus_loaded = True
         self._print_bus_info()
         self.create_bus_config_ui()
+        if Path(self.mdf_path).suffix.casefold() == ".blf":
+            can_group = self.collapsible_groups.get("CAN通道配置")
+            if can_group is not None:
+                can_group.setChecked(True)
 
     def _fail_can_bus_detection(self, message, generation, worker):
         if not self._is_current_can_detection(generation, worker):
