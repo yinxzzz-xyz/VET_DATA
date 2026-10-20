@@ -244,6 +244,13 @@ class Stage5bPackagingConfigTests(unittest.TestCase):
         self.assertIn('"openpyxl.cell._writer"', spec)
         self.assertIn("console=False", spec)
 
+    def test_spec_excludes_incompatible_environment_icu_overrides(self):
+        spec = Path("VET_DATA.spec").read_text(encoding="utf-8")
+        self.assertIn('{"icuuc.dll", "icudt78.dll"}', spec)
+        self.assertIn(
+            'Path(entry[0]).name.lower() not in incompatible_icu_dlls', spec
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

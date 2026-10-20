@@ -49,6 +49,14 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# PyInstaller can collect this DLL from an unrelated Poppler runtime found in
+# the build environment. Qt6Core expects the Windows ICU exports, but that
+# Poppler DLL uses different, version-suffixed exports and shadows System32.
+# The app has no other binary dependency on these Poppler ICU files.
+incompatible_icu_dlls = {"icuuc.dll", "icudt78.dll"}
+a.binaries = a.binaries.__class__(
+    entry for entry in a.binaries if Path(entry[0]).name.lower() not in incompatible_icu_dlls
+)
 pyz = PYZ(a.pure)
 
 exe = EXE(
