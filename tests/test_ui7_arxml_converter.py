@@ -101,23 +101,22 @@ class ArxmlConverterUi7Tests(unittest.TestCase):
         self.dialog.clear_log_btn.click()
         self.assertEqual(self.dialog.log_text.toPlainText(), "")
 
-    def test_converter_keeps_existing_api_arguments_and_success_signal(self):
+    def test_converter_uses_project_model_export_and_success_signal(self):
         self._select_file()
         emitted = []
         self.dialog.conversion_success.connect(lambda: emitted.append(True))
 
-        def write_valid_dbc(_source, target, **_options):
-            Path(target).write_text("BO_ 1 Message: 8 Vector__XXX\n", encoding="utf-8")
+        def write_valid_dbc(_canmatrix, _source, target):
+            target = Path(target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("BO_ 1 Message: 8 Vector__XXX\n", encoding="utf-8")
 
-        with patch("canmatrix.convert.convert", side_effect=write_valid_dbc) as convert, \
+        with patch.object(baseline, "_convert_arxml_models_to_dbc", side_effect=write_valid_dbc) as convert, \
              patch.object(baseline.QMessageBox, "information"):
             self.dialog._run_conversion()
-        convert.assert_called_once_with(
-            str(self.arxml.resolve()),
-            str(self.root / "dbc_output" / f"{self.arxml.stem}.dbc"),
-            dbcExportEncoding="ascii",
-            ignoreEncodingErrors="ignore",
-        )
+        args = convert.call_args.args
+        self.assertEqual(args[1], str(self.arxml.resolve()))
+        self.assertEqual(args[2], str(self.root / "dbc_output" / f"{self.arxml.stem}.dbc"))
         self.assertEqual(emitted, [True])
         self.assertIn("转换成功", self.dialog.log_text.toPlainText())
 

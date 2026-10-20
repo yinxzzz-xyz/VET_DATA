@@ -632,6 +632,66 @@ class MathChannelDialog(QDialog):
         }
 
 
+def _prepare_dbc_signal_names(databases):
+    """Avoid canmatrix's 32-character DBC name truncation collisions."""
+    from collections import defaultdict
+
+    for database in databases.values():
+        for frame in database.frames:
+            names_by_export_name = defaultdict(dict)
+            for signal in frame.signals:
+                names_by_export_name[signal.name[:32]][signal.name] = signal
+
+            collisions = [
+                signals
+                for signals in names_by_export_name.values()
+                if len(signals) > 1
+            ]
+            if not collisions:
+                continue
+
+            if "SystemSignalLongSymbol" not in database.signal_defines:
+                database.add_signal_defines("SystemSignalLongSymbol", "STRING")
+
+            used_names = {signal.name[:32] for signal in frame.signals}
+            alias_index = 1
+            for signals in collisions:
+                for signal in signals.values():
+                    original_name = signal.name
+                    while True:
+                        alias = f"VET_SIG_{alias_index:06d}"
+                        alias_index += 1
+                        if alias not in used_names:
+                            break
+                    used_names.add(alias)
+                    signal.add_attribute("SystemSignalLongSymbol", original_name)
+                    signal.name = alias
+
+
+def _convert_arxml_models_to_dbc(canmatrix, arxml_file, dbc_file):
+    """Load, prepare and split-export ARXML databases like canmatrix.convert."""
+    databases = canmatrix.formats.loadp(arxml_file)
+    if not databases:
+        raise RuntimeError("加载 ARXML 返回空数据库")
+
+    # Match canmatrix.convert.convert()'s default PDU-container handling.
+    for database in databases.values():
+        for frame in list(database.frames):
+            if frame.is_pdu_container:
+                converted = canmatrix.convert.convert_pdu_container_to_multiplexed(frame)
+                database.del_frame(frame)
+                database.add_frame(converted)
+
+    _prepare_dbc_signal_names(databases)
+    canmatrix.formats.dumpp(
+        databases,
+        dbc_file,
+        export_type="dbc",
+        dbcExportEncoding="ascii",
+        ignoreEncodingErrors="ignore",
+    )
+
+
 def _convert_arxml_to_dbc(arxml_path, dbc_path, log_callback):
     """Run the existing canmatrix conversion without accessing Qt widgets."""
     arxml_file = os.path.abspath(arxml_path)
@@ -668,29 +728,13 @@ def _convert_arxml_to_dbc(arxml_path, dbc_path, log_callback):
     if os.path.getsize(arxml_file) == 0:
         raise ValueError(f"ARXML 文件为空: {arxml_file}")
 
-    log_callback("🔄 正在转换 (使用 canmatrix.convert.convert)...")
+    log_callback("🔄 正在转换 (使用 canmatrix ARXML 加载和 DBC 导出)...")
     try:
-        canmatrix.convert.convert(
-            arxml_file,
-            dbc_file,
-            dbcExportEncoding="ascii",
-            ignoreEncodingErrors="ignore",
-        )
-        log_callback("✅ canmatrix.convert.convert() 调用完成")
+        _convert_arxml_models_to_dbc(canmatrix, arxml_file, dbc_file)
+        log_callback("✅ canmatrix ARXML 加载和 DBC 导出完成")
     except Exception as exc:
         log_callback(f"⚠️ 转换调用失败: {exc}")
-        try:
-            log_callback("🔄 尝试分步加载...")
-            db = canmatrix.formats.loadp(arxml_file)
-            if db:
-                log_callback(f"✅ 加载成功: {len(db)} 个 CAN 总线")
-                canmatrix.formats.dump(dbc_file, db, dbcExportEncoding="ascii")
-                log_callback("✅ 分步保存成功")
-            else:
-                raise RuntimeError("加载 ARXML 返回空数据库")
-        except Exception as fallback_exc:
-            log_callback(f"❌ 分步加载也失败: {fallback_exc}")
-            raise RuntimeError(f"转换失败: {fallback_exc}") from fallback_exc
+        raise RuntimeError(f"转换失败: {exc}") from exc
 
     def check_output(filepath):
         if not os.path.exists(filepath):
