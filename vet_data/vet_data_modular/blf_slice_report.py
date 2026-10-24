@@ -451,6 +451,7 @@ def build_report_markdown(task_result: TaskResult) -> str:
         f"- 输出目录：`{task.output_dir}`",
         f"- BLF 时区：{_format_offset(task.blf_utc_offset)}",
         f"- 工况表时区：{_format_offset(task.table_utc_offset)}",
+        f"- 全局 BLF 时间偏移：{task.global_time_offset_seconds:+g} 秒",
         f"- Header/范围索引耗时：{task_result.index_duration_seconds:.3f} 秒",
         f"- 工况表有效行：{task_result.table_valid_rows}",
         f"- 工况表舍弃行：{task_result.table_discarded_rows}",
@@ -463,7 +464,7 @@ def build_report_markdown(task_result: TaskResult) -> str:
         counts[result.status] += 1
     lines.extend(f"- {status.value}：{counts[status]}" for status in ConditionStatus)
 
-    lines.extend(["", "## BLF 索引与实际范围", ""])
+    lines.extend(["", "## BLF 索引与实际范围", "", "索引时间范围是仅完成 BLF 时区转换后的基础范围；工况匹配、来源链和输出时间再按全局、单文件及对应工况行偏移校正。", ""])
     if not task_result.blf_index:
         lines.append("- 无索引记录")
     for entry in task_result.blf_index:
@@ -475,6 +476,7 @@ def build_report_markdown(task_result: TaskResult) -> str:
                 f"- Header UTC 范围：{_format_timestamp(entry.header_start_timestamp)} ～ {_format_timestamp(entry.header_stop_timestamp)}",
                 f"- Effective range 状态：{entry.time_range_status.value}",
                 f"- 实际 UTC 范围：{_format_timestamp(entry.effective_start_timestamp)} ～ {_format_timestamp(entry.effective_stop_timestamp)}",
+                f"- 单文件时间偏移：{dict(task.blf_time_offsets).get(os.path.normcase(str(entry.path.resolve(strict=False))), dict(task.blf_time_offsets).get(str(entry.path), 0.0)):+g} 秒",
                 f"- 扫描对象数：{entry.scanned_message_count}",
                 f"- 普通 CAN/CAN FD 帧：{entry.valid_frame_count}",
                 f"- 忽略 Remote/RTR：{entry.ignored_remote_frames}",
@@ -497,6 +499,7 @@ def build_report_markdown(task_result: TaskResult) -> str:
                 "",
                 f"- 原始名称：{condition.original_name}",
                 f"- 工况时间：{condition.recorded_at.isoformat(sep=' ')}",
+                f"- Excel 行级时间偏移：{condition.time_offset_seconds:+g} 秒",
                 f"- 前/后窗口：{condition.before_seconds} / {condition.after_seconds} 秒",
                 f"- 目标 UTC 窗口：{_format_timestamp(window.start)} ～ {_format_timestamp(window.end)}",
                 f"- 状态：{result.status.value}",

@@ -1,6 +1,7 @@
 """CSV and XLSX condition-table parsing for BLF slicing."""
 from __future__ import annotations
 import csv
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -13,6 +14,7 @@ from .blf_slice_models import (DEFAULT_AFTER_SECONDS, DEFAULT_BEFORE_SECONDS, HE
 REQUIRED_HEADERS = ("记录时间", "记录内容")
 OPTIONAL_BEFORE_HEADER = "向前秒数"
 OPTIONAL_AFTER_HEADER = "向后秒数"
+OPTIONAL_TIME_OFFSET_HEADER = "时间偏移"
 SUPPORTED_TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M")
 _INTEGER_PATTERN = re.compile(r"[+-]?\d+\Z")
 
@@ -98,17 +100,33 @@ def _parse_optional_seconds(value: Any, default: int, header: str) -> int:
         raise ValueError(f"{header}必须为整数")
     return int(text)
 
+def _parse_time_offset(value: Any) -> float:
+    if value is None or isinstance(value, str) and not value.strip():
+        return 0.0
+    if isinstance(value, bool):
+        raise ValueError("时间偏移必须为有限数值（秒）")
+    try:
+        result = float(value.strip() if isinstance(value, str) else value)
+    except (TypeError, ValueError):
+        raise ValueError("时间偏移必须为有限数值（秒）") from None
+    if not math.isfinite(result):
+        raise ValueError("时间偏移必须为有限数值（秒）")
+    return result
+
 def _validate_headers(headers: Sequence[Any]) -> dict[str, int]:
-    missing = [h for h in REQUIRED_HEADERS if h not in headers]
-    duplicated = [h for h in REQUIRED_HEADERS if headers.count(h) > 1]
+    normalized = [value.strip() if isinstance(value, str) else value for value in headers]
+    missing = [h for h in REQUIRED_HEADERS if h not in normalized]
+    duplicated = [h for h in REQUIRED_HEADERS if normalized.count(h) > 1]
     if missing:
         raise TableParseError(f"缺少必需表头: {', '.join(missing)}")
     if duplicated:
         raise TableParseError(f"必需表头重复: {', '.join(duplicated)}")
-    columns = {h: headers.index(h) for h in REQUIRED_HEADERS}
+    columns = {h: normalized.index(h) for h in REQUIRED_HEADERS}
     for header in (OPTIONAL_BEFORE_HEADER, OPTIONAL_AFTER_HEADER):
-        if header in headers:
-            columns[header] = headers.index(header)
+        if header in normalized:
+            columns[header] = normalized.index(header)
+    if OPTIONAL_TIME_OFFSET_HEADER in normalized:
+        columns[OPTIONAL_TIME_OFFSET_HEADER] = normalized.index(OPTIONAL_TIME_OFFSET_HEADER)
     return columns
 
 def _build_condition(values: Mapping[str, Any], row_number: int) -> ConditionSpec:
@@ -116,7 +134,7 @@ def _build_condition(values: Mapping[str, Any], row_number: int) -> ConditionSpe
     name = value if isinstance(value, str) else str(value or "")
     if not name.strip():
         raise ValueError("记录内容为空")
-    return ConditionSpec(row_number, name, name, _parse_recorded_at(values.get("记录时间")), _parse_optional_seconds(values.get(OPTIONAL_BEFORE_HEADER), DEFAULT_BEFORE_SECONDS, OPTIONAL_BEFORE_HEADER), _parse_optional_seconds(values.get(OPTIONAL_AFTER_HEADER), DEFAULT_AFTER_SECONDS, OPTIONAL_AFTER_HEADER))
+    return ConditionSpec(row_number, name, name, _parse_recorded_at(values.get("记录时间")), _parse_optional_seconds(values.get(OPTIONAL_BEFORE_HEADER), DEFAULT_BEFORE_SECONDS, OPTIONAL_BEFORE_HEADER), _parse_optional_seconds(values.get(OPTIONAL_AFTER_HEADER), DEFAULT_AFTER_SECONDS, OPTIONAL_AFTER_HEADER), time_offset_seconds=_parse_time_offset(values.get(OPTIONAL_TIME_OFFSET_HEADER)))
 
 def _parse_csv(path: Path) -> TableParseResult:
     text, encoding = _decode_csv(path)

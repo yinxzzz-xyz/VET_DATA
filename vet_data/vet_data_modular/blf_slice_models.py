@@ -99,6 +99,7 @@ class ConditionSpec:
     before_seconds: int = DEFAULT_BEFORE_SECONDS
     after_seconds: int = DEFAULT_AFTER_SECONDS
     selected: bool = True
+    time_offset_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,12 +114,15 @@ class SliceTask:
     started_at: datetime
     blf_utc_offset: timedelta = DEFAULT_UTC_OFFSET
     table_utc_offset: timedelta = DEFAULT_UTC_OFFSET
+    global_time_offset_seconds: float = 0.0
+    blf_time_offsets: tuple[tuple[str, float], ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_path", Path(self.input_path))
         object.__setattr__(self, "table_path", Path(self.table_path))
         object.__setattr__(self, "output_dir", Path(self.output_dir))
         object.__setattr__(self, "conditions", tuple(self.conditions))
+        object.__setattr__(self, "blf_time_offsets", tuple((str(path), float(value)) for path, value in self.blf_time_offsets))
 
 
 @dataclass(frozen=True, slots=True)

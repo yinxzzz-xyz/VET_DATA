@@ -153,6 +153,25 @@ class Stage4EndToEndTests(unittest.TestCase):
         self.assertEqual(len(item.output_files), 1)
         self.assertEqual([m.arbitration_id for m in can.BLFReader(item.output_files[0])], [0x100, 0x105, 0x106, 0x110])
 
+    def test_file_and_row_offset_shift_matching_and_written_timestamp(self):
+        source = self.root / "offset.blf"
+        self._write_blf(source, [self._message(10, 0x123)])
+        condition = ConditionSpec(2, "偏移", "偏移", self.base_dt + timedelta(seconds=160), 0, 0, time_offset_seconds=-30)
+        entry = self._entry(source, 10, 10)
+        window = build_condition_time_window(condition, timedelta(0))
+        match = ConditionCandidateMatch(window, (source,), effective_offsets=((str(source), 150.0),))
+        shifted_entry = replace(
+            entry,
+            effective_start_timestamp=self.base + 160,
+            effective_stop_timestamp=self.base + 160,
+        )
+        chains = SourceChainBuildResult((BlfSourceChain((shifted_entry,), ()),))
+        plan = build_slice_execution_plan((match,), chains, (condition,))
+        result = execute_slice(self._task(source, (condition,)), plan, (entry,))
+        messages = list(can.BLFReader(result.condition_results[0].output_files[0]))
+        self.assertEqual(result.condition_results[0].message_count, 1)
+        self.assertAlmostEqual(messages[0].timestamp, self.base + 160, places=3)
+
     def test_zero_valid_frames_creates_no_formal_or_part_file(self):
         source = self.root / "remote_only.blf"
         self._write_blf(source, [self._message(5, 0x100, b"", is_remote_frame=True, dlc=1)])

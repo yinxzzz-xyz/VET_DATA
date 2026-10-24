@@ -127,6 +127,7 @@ class BlfSliceMainDialogUi6Tests(unittest.TestCase):
             ".xlsx", ".csv", "记录时间", "记录内容", "向前秒数", "向后秒数",
             "单元格为空", "当前默认值：60 秒", "其他附加列", "表头顺序不固定",
             "Excel 日期时间单元格", "YYYY-MM-DD HH:MM:SS",
+            "时间偏移", "单位秒", "全局偏移", "当前 BLF 单文件偏移", "-30", "+180",
         ):
             self.assertIn(expected, help_text)
 
@@ -144,6 +145,13 @@ class BlfSliceMainDialogUi6Tests(unittest.TestCase):
             information.reset_mock()
             QTest.keyClick(button, Qt.Key.Key_Space)
             information.assert_called_once()
+
+    def test_global_calibration_cancel_keeps_existing_configuration(self):
+        self.dialog.global_time_offset_seconds = 12.5
+        with patch("vet_data_modular.blf_slice_dialog._time_offset_dialog", return_value=(99.0, False)):
+            self.dialog._edit_global_time_offset()
+        self.assertEqual(self.dialog.global_time_offset_seconds, 12.5)
+        self.assertEqual(self.dialog.time_calibration_button.text(), "时间校准：全局 0 秒")
 
     def test_invalid_table_errors_include_reason_and_retry_guidance(self):
         cases = (
@@ -245,7 +253,7 @@ class BlfSliceMainDialogUi6Tests(unittest.TestCase):
             self.dialog.condition_table.item(0, 2).toolTip(), "编辑后的长工况名称"
         )
         self.assertEqual(
-            self.dialog.condition_table.item(0, 6).toolTip(),
+            self.dialog.condition_table.item(0, 7).toolTip(),
             "时间格式应为 yyyy-MM-dd HH:mm:ss",
         )
         self.assertEqual(self.dialog.condition_table.verticalHeader().defaultSectionSize(), 30)

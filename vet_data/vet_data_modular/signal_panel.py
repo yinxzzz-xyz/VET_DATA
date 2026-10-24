@@ -13,6 +13,7 @@ KEY_ROLE = Qt.ItemDataRole.UserRole
 NAME_ROLE = Qt.ItemDataRole.UserRole + 1
 VALUE_ROLE = Qt.ItemDataRole.UserRole + 2
 COMMENT_ROLE = Qt.ItemDataRole.UserRole + 3
+AVAILABLE_ROLE = Qt.ItemDataRole.UserRole + 4
 SELECTED_TEXT_COLOR = QColor("#2c3e50")
 
 
@@ -29,7 +30,10 @@ class SignalItemDelegate(QStyledItemDelegate):
         super().paint(painter, option, index)
         painter.save()
         item = self.parent().item(index.row())
-        painter.setPen(self.text_color(option))
+        if item.data(AVAILABLE_ROLE) is False:
+            painter.setPen(QColor("#9e9e9e"))
+        else:
+            painter.setPen(self.text_color(option))
         name = item.data(NAME_ROLE) or item.text()
         value = item.data(VALUE_ROLE)
         comment = item.data(COMMENT_ROLE) or ""
@@ -113,7 +117,9 @@ class SignalPanelMixin:
         self.view_all_btn.clicked.connect(lambda: self._set_view_mode("all"))
         self.view_selected_btn.clicked.connect(lambda: self._set_view_mode("selected"))
         self.reset_order_btn.clicked.connect(self._reset_signal_order)
-        self.signal_list_widget.itemChanged.connect(lambda _item: self._selection_changed())
+        self.signal_list_widget.itemChanged.connect(
+            lambda item: self._selection_changed(item=item)
+        )
         self.signal_list_widget.model().rowsMoved.connect(self._signal_rows_moved)
 
     def _signal_display_name(self, key):
@@ -150,6 +156,8 @@ class SignalPanelMixin:
                 self.can_bus_data.get(info.get("bus_id"), {}).get("name")
                 if info.get("bus_id") is not None else None,
                 self._signal_list_default_key(key)[0],
+                info.get("available", True),
+                info.get("unavailable_reason", ""),
             )
             for key, info in self.signals.items()
         )
@@ -182,14 +190,16 @@ class SignalPanelMixin:
             info = self.signals[key]
             name = self._signal_display_name(key)
             comment = info.get("comment", "") or ""
+            unavailable_reason = info.get("unavailable_reason", "") or ""
             item = QListWidgetItem("")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
             item.setCheckState(Qt.CheckState.Checked if key in checked else Qt.CheckState.Unchecked)
             item.setData(KEY_ROLE, key); item.setData(NAME_ROLE, name); item.setData(COMMENT_ROLE, comment)
-            item.setToolTip(comment)
+            item.setData(AVAILABLE_ROLE, info.get("available", True))
+            item.setToolTip("\n".join(part for part in (comment, unavailable_reason) if part))
             self.signal_list_widget.addItem(item)
             self.signal_widgets[key] = {"checkbox": _CheckAdapter(item), "comment_label": None}
-            self.search_index[key] = f"{info.get('name','')} {name} {comment}".lower()
+            self.search_index[key] = f"{info.get('name','')} {name} {comment} {unavailable_reason}".lower()
             self.lat_combo.addItem(name, key); self.lon_combo.addItem(name, key)
         for combo, selected in ((self.lat_combo, lat_key), (self.lon_combo, lon_key)):
             idx = combo.findData(selected)
@@ -250,11 +260,12 @@ class SignalPanelMixin:
                 info = self.signals[key]
                 name = self._signal_display_name(key)
                 comment = info.get("comment", "") or ""
+                unavailable_reason = info.get("unavailable_reason", "") or ""
                 item = self.signal_widgets[key]["checkbox"].item
                 item.setData(NAME_ROLE, name)
                 item.setData(COMMENT_ROLE, comment)
-                item.setToolTip(comment)
-                self.search_index[key] = f"{info.get('name','')} {name} {comment}".lower()
+                item.setToolTip("\n".join(part for part in (comment, unavailable_reason) if part))
+                self.search_index[key] = f"{info.get('name','')} {name} {comment} {unavailable_reason}".lower()
                 names[key] = name
 
             self._sync_combo_metadata(self.lat_combo, names)
@@ -327,7 +338,7 @@ class SignalPanelMixin:
         if mode != "selected": self._clear_signal_values()
         self._apply_signal_filter()
 
-    def _selection_changed(self, replot=True):
+    def _selection_changed(self, replot=True, item=None):
         count = len(self.get_selected_signals())
         self.view_selected_btn.setText(f"已选信号 ({count})")
         if self._view_mode == "selected": self._apply_signal_filter()

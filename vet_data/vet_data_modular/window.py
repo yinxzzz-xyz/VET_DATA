@@ -2,10 +2,12 @@
 
 import json
 from dataclasses import replace
+import hashlib
 import os
 from pathlib import Path
 from uuid import uuid4
 
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
     QDialog, QFileDialog, QGroupBox, QInputDialog, QLabel, QMessageBox, QPushButton,
     QScrollArea, QSplitter,
@@ -34,7 +36,7 @@ from .gui_state import (
 )
 from .math_channel import SearchableMathChannelDialog  # retains legacy compatibility
 from .plot_panel import PlotPanelMixin
-from .signal_panel import SignalPanelMixin
+from .signal_panel import KEY_ROLE, SignalPanelMixin
 from .signal_resolver import SignalResolver
 from .theme import DEFAULT_THEME, build_main_window_stylesheet
 from .workers import (
@@ -68,6 +70,11 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._csv_export_dialog = None
         self._close_after_csv_export = False
         self._close_after_arxml_conversion = False
+        self._pending_can_config = None
+        self._pending_signal_restore = None
+        self._can_task_generation = 0
+        self._reusable_can_config = None
+        self._selected_can_config = {}
         self.math_channel_button.setText("➕ 创建自定义公式计算通道")
         self.math_channel_button.setToolTip("使用多信号公式、数学函数、导数和积分创建通道")
         self._setup_signal_panel(); self._setup_plot_panel(); self._setup_collapsible_panels()
@@ -249,14 +256,20 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         config = serialize_calculated_signal_config(
             tuple(self.calculated_signal_definitions.values())
         )
+        selected, identities = self._selected_can_config_payload()
         config.update({
-            "selected_signals": self.get_selected_signals(),
+            "selected_signals": selected,
+            "signal_identities": identities,
             "gps_lat_key": self.lat_combo.currentData(),
             "gps_lon_key": self.lon_combo.currentData(),
             "bus_config": {
                 str(bus_id): {
                     "name": data.get("name", f"Bus {bus_id}"),
                     "protocol": self.bus_protocols.get(bus_id, ""),
+                    "raw_channel": (
+                        self.can_bus_mapping.bus_to_raw.get(bus_id)
+                        if self.can_bus_mapping is not None else None
+                    ),
                 }
                 for bus_id, data in self.can_bus_data.items()
             },
@@ -264,9 +277,6 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         return config
 
     def save_signal_config(self):
-        if not self.get_selected_signals() and not self.calculated_signal_definitions:
-            QMessageBox.warning(self, "保存", "未选择任何信号。")
-            return
         file_path, _ = QFileDialog.getSaveFileName(
             self, "保存配置", "", "JSON Files (*.json)"
         )
@@ -309,8 +319,9 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._apply_formula_restore_report(report, managed_ids)
         return report
     def _apply_saved_bus_config(self, config_data):
+        unavailable = []
         for bus_id_str, config in config_data.get("bus_config", {}).items():
-            bus_id = int(bus_id_str)
+            bus_id = self._resolve_saved_bus_id(bus_id_str, config)
             if bus_id not in self.can_bus_data:
                 continue
             self.can_bus_data[bus_id]["name"] = config.get("name", f"Bus {bus_id}")
@@ -318,12 +329,271 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             if protocol:
                 self.bus_protocols[bus_id] = protocol
                 self.db_per_bus.setdefault(bus_id, {})
+                if not os.path.isfile(protocol) or not os.access(protocol, os.R_OK):
+                    unavailable.append((bus_id, protocol))
             if bus_id in self.bus_config_widgets:
                 widget = self.bus_config_widgets[bus_id]
                 widget.name_edit.setText(self.can_bus_data[bus_id]["name"])
                 if protocol:
                     widget.set_protocol_display(os.path.basename(protocol))
                     widget.protocol_path = protocol
+        return unavailable
+
+    def _resolve_saved_bus_id(self, saved_bus_id, config):
+        saved_bus_id = int(saved_bus_id)
+        raw_channel = config.get("raw_channel") if isinstance(config, dict) else None
+        if raw_channel is not None and self.can_bus_mapping is not None:
+            return self.can_bus_mapping.raw_to_bus.get(int(raw_channel), saved_bus_id)
+        return saved_bus_id
+
+    def _saved_configured_bus_ids(self, config_data):
+        return {
+            self._resolve_saved_bus_id(bus_id, item)
+            for bus_id, item in config_data.get("bus_config", {}).items()
+            if isinstance(item, dict) and item.get("protocol")
+            and self._resolve_saved_bus_id(bus_id, item) in self.can_bus_data
+        }
+
+    @staticmethod
+    def _identity_token(identity, bus_id=None):
+        if isinstance(identity, list):
+            if len(identity) == 1 and isinstance(identity[0], dict):
+                return MDFPlotter._identity_token(identity[0], bus_id)
+            return tuple(sorted(
+                MDFPlotter._identity_token(item, bus_id)
+                for item in identity
+                if isinstance(item, dict)
+            ))
+        if not isinstance(identity, dict):
+            return None
+        channel = (
+            ("raw", int(identity["raw_channel"]))
+            if identity.get("raw_channel") is not None
+            else ("bus", int(bus_id if bus_id is not None else identity.get("bus_id", -1)))
+        )
+        return (
+            channel,
+            int(identity.get("frame_id", -1)),
+            bool(identity.get("is_extended", False)),
+            str(identity.get("message_name", "")),
+            str(identity.get("signal_name", "")),
+        )
+
+    @classmethod
+    def _identity_alias_tokens(cls, identity, bus_id=None):
+        """Accept older bus-id identities while preferring raw-channel identity."""
+        primary = cls._identity_token(identity, bus_id)
+        aliases = [primary] if primary is not None else []
+        if isinstance(identity, dict) and identity.get("raw_channel") is not None:
+            legacy = dict(identity)
+            legacy.pop("raw_channel", None)
+            aliases.append(cls._identity_token(legacy, bus_id))
+        elif isinstance(identity, list) and identity:
+            legacy_items = [dict(item) for item in identity if isinstance(item, dict)]
+            for item in legacy_items:
+                item.pop("raw_channel", None)
+            if legacy_items:
+                aliases.append(cls._identity_token(legacy_items, bus_id))
+        return tuple(dict.fromkeys(token for token in aliases if token is not None))
+
+    def _selection_record_token(self, key, identity):
+        token = self._identity_token(identity) if identity else None
+        return token if token is not None else ("legacy", str(key))
+
+    def _load_selected_can_config(self, selected_keys, identity_map=None):
+        identity_map = identity_map or {}
+        self._selected_can_config.clear()
+        for key in selected_keys or ():
+            identity = identity_map.get(key)
+            token = self._selection_record_token(key, identity)
+            record = self._selected_can_config.setdefault(token, {})
+            record.update({"key": key, "identity": identity})
+
+    @staticmethod
+    def _enrich_config_identities(config_data):
+        bus_config = config_data.get("bus_config", {})
+        identities = config_data.get("signal_identities", {})
+        for value in identities.values():
+            items = value if isinstance(value, list) else [value]
+            for identity in items:
+                if not isinstance(identity, dict) or identity.get("raw_channel") is not None:
+                    continue
+                bus_id = identity.get("bus_id")
+                bus = bus_config.get(str(bus_id), {}) if bus_id is not None else {}
+                if isinstance(bus, dict) and bus.get("raw_channel") is not None:
+                    identity["raw_channel"] = int(bus["raw_channel"])
+        return identities
+
+    def _sync_selected_can_config(self):
+        visible = {
+            key for key, info in self.signals.items()
+            if info.get("signal_type") == "can" or key.startswith("CAN_")
+        }
+        selected = set(self.get_selected_signals())
+        for key in selected & visible:
+            info = self.signals.get(key, {})
+            identity = info.get("signal_identity") or info.get("config_identity")
+            saved_key = info.get("selection_key", key)
+            token = self._selection_record_token(saved_key, identity)
+            record = self._selected_can_config.setdefault(token, {})
+            record.update({"key": saved_key, "identity": identity, "ui_key": key})
+
+    def _selected_can_config_payload(self):
+        self._sync_selected_can_config()
+        selected = list(self.get_selected_signals())
+        identities = {}
+        for record in self._selected_can_config.values():
+            key = record["key"]
+            if key not in selected:
+                selected.append(key)
+            if record.get("identity"):
+                identities[key] = record["identity"]
+        for key in self.get_selected_signals():
+            info = self.signals.get(key, {})
+            identity = info.get("signal_identity") or info.get("config_identity")
+            if (info.get("signal_type") == "can" or key.startswith("CAN_")) and identity:
+                identities[info.get("selection_key", key)] = identity
+        return selected, identities
+
+    def _selection_changed(self, replot=True, item=None):
+        super()._selection_changed(replot=replot)
+        if replot:
+            if item is not None and item.checkState() != Qt.CheckState.Checked:
+                self._deselect_can_signal(item.data(KEY_ROLE))
+            self._sync_selected_can_config()
+
+    def _deselect_can_signal(self, key):
+        info = self.signals.get(key, {})
+        saved_key = info.get("selection_key", key)
+        identity = info.get("signal_identity") or info.get("config_identity")
+        token = self._selection_record_token(saved_key, identity)
+        self._selected_can_config.pop(token, None)
+
+    def _apply_can_selection(self, selected_keys, identity_map=None):
+        selected_keys = list(dict.fromkeys(selected_keys or ()))
+        identity_map = identity_map or {}
+        self._selected_can_config.clear()
+        self._load_selected_can_config(selected_keys, identity_map)
+        current_by_identity = {}
+        for key, info in self.signals.items():
+            identity = info.get("signal_identity")
+            if identity:
+                for token in self._identity_alias_tokens(identity, info.get("bus_id")):
+                    current_by_identity[token] = key
+        self.refresh_signal_list_ui()
+        undefined = []
+        for saved_key in selected_keys:
+            identity = identity_map.get(saved_key)
+            if identity is None:
+                identity = next((
+                    record.get("identity")
+                    for record in self._selected_can_config.values()
+                    if record.get("key") == saved_key
+                ), None)
+            target = next((
+                current_by_identity[token]
+                for token in self._identity_alias_tokens(identity)
+                if token in current_by_identity
+            ), None) if identity else None
+            if target is None and not identity and saved_key in self.signal_widgets:
+                target = saved_key
+            if target is None:
+                target = self._add_unavailable_config_signal(saved_key, identity)
+                undefined.append(saved_key)
+            if target in self.signal_widgets:
+                self.signals[target]["selection_key"] = saved_key
+                self.signals[target]["config_identity"] = identity
+                self.signal_widgets[target]["checkbox"].setChecked(True)
+                token = self._selection_record_token(saved_key, identity)
+                if token in self._selected_can_config:
+                    self._selected_can_config[token]["ui_key"] = target
+        if undefined:
+            QMessageBox.warning(
+                self, "部分信号当前不可用",
+                "以下已选信号在当前解析目录中暂未匹配，仍保留为已选配置；请检查 DBC 和通道映射：\n"
+                + "\n".join(undefined),
+            )
+        self.plot_selected_signals()
+        return undefined
+
+    def _identity_has_dbc_definition(self, identity):
+        tokens = set(self._identity_alias_tokens(identity))
+        for data in self.can_bus_data.values():
+            stats = data.get("parse_stats", {})
+            for candidates in stats.get("signal_identity", {}).values():
+                for candidate in self._identity_alias_tokens(candidates):
+                    if candidate in tokens:
+                        return True
+        return False
+
+    def _add_unavailable_config_signal(self, saved_key, identity):
+        token = self._selection_record_token(saved_key, identity)
+        suffix = hashlib.sha1(repr(token).encode("utf-8")).hexdigest()[:12]
+        key = saved_key if saved_key not in self.signals else f"CAN_CONFIG_{suffix}"
+        if key not in self.signals:
+            if isinstance(identity, list):
+                identities = [item for item in identity if isinstance(item, dict)]
+            elif isinstance(identity, dict):
+                identities = [identity]
+            else:
+                identities = []
+            label = next((item.get("signal_name") for item in identities if item.get("signal_name")), saved_key)
+            bus_id = next((item.get("bus_id") for item in identities if item.get("bus_id") is not None), None)
+            self.signals[key] = {
+                "name": key,
+                "display_name": f"🚌 {label}（当前不可用）",
+                "group": -88,
+                "channel": -88,
+                "comment": "当前数据中尚无对应解析结果；已保留用户选择。",
+                "bus_id": bus_id,
+                "signal_type": "can",
+                "signal_identity": identity,
+                "config_identity": identity,
+                "selection_key": saved_key,
+                "available": False,
+                "unavailable_reason": (
+                    "当前 BLF 缺少对应报文或信号解码失败"
+                    if self._identity_has_dbc_definition(identity)
+                    else "DBC 中未定义或信号身份无法匹配"
+                ),
+            }
+        self.refresh_signal_list_ui()
+        return key
+
+    def _restore_pending_can_config(self):
+        config = self._pending_can_config
+        if not config:
+            return
+        try:
+            unavailable = self._apply_saved_bus_config(config)
+            if unavailable:
+                details = "\n".join(f"Bus {bus}: {path}" for bus, path in unavailable)
+                QMessageBox.warning(
+                    self, "DBC 不可用",
+                    f"以下 DBC 文件不存在或不可读，请在 CAN 通道配置中重新选择：\n{details}",
+                )
+            self._pending_can_config = None
+            self._pending_signal_restore = {
+                "selected": list(config.get("selected_signals", ())),
+                "identities": config.get("signal_identities", {}),
+                "config": config,
+                "expected_buses": self._saved_configured_bus_ids(config),
+            }
+            self._add_pending_selection_rows()
+            self.auto_parse_enabled = True
+            readable_protocols = []
+            for bus_id, protocol in self.bus_protocols.items():
+                if os.path.isfile(protocol) and os.access(protocol, os.R_OK):
+                    readable_protocols.append(bus_id)
+                    QTimer.singleShot(0, lambda b=bus_id: self.start_parse_with_progress(b))
+            if not readable_protocols and not unavailable:
+                QMessageBox.warning(
+                    self, "需要选择 DBC",
+                    "配置已读取并保留。请在每个 CAN 通道中重新选择可读取的 DBC，然后点击“解析”。",
+                )
+        except Exception as exc:
+            self._pending_can_config = None
+            QMessageBox.critical(self, "配置应用失败", f"CAN 配置无法应用：{exc}")
 
     @staticmethod
     def _restore_summary(report):
@@ -343,8 +613,13 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._apply_saved_bus_config(config_data)
         self.refresh_signal_list_ui()
         selected_keys = set(config_data.get("selected_signals", ()))
-        for unique_key, widgets in self.signal_widgets.items():
-            widgets["checkbox"].setChecked(unique_key in selected_keys)
+        if Path(self.mdf_path).suffix.casefold() in {".blf", ".asc", ".trc"}:
+            self._apply_can_selection(
+                selected_keys, config_data.get("signal_identities", {})
+            )
+        else:
+            for unique_key, widgets in self.signal_widgets.items():
+                widgets["checkbox"].setChecked(unique_key in selected_keys)
         for combo, config_key in (
             (self.lat_combo, "gps_lat_key"), (self.lon_combo, "gps_lon_key")
         ):
@@ -352,7 +627,8 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             index = combo.findData(saved_key) if saved_key else -1
             if index >= 0:
                 combo.setCurrentIndex(index)
-        self.plot_selected_signals()
+        if Path(self.mdf_path).suffix.casefold() not in {".blf", ".asc", ".trc"}:
+            self.plot_selected_signals()
         summary = self._restore_summary(report)
         if report.failures:
             QMessageBox.warning(self, "计算通道恢复报告", summary)
@@ -380,12 +656,70 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         )
         if not file_name:
             return
-        if not self.signals:
-            QMessageBox.warning(self, "错误", "请先加载数据文件，再加载配置。")
-            return
         try:
             with open(file_name, "r", encoding="utf-8") as stream:
                 config_data = json.load(stream)
+            if not isinstance(config_data, dict):
+                raise ValueError("配置根节点必须是 JSON 对象")
+            if not isinstance(config_data.get("selected_signals", []), list):
+                raise ValueError("selected_signals 必须是数组")
+            if any(not isinstance(key, str) for key in config_data.get("selected_signals", [])):
+                raise ValueError("selected_signals 中的信号标识必须是字符串")
+            if not isinstance(config_data.get("bus_config", {}), dict):
+                raise ValueError("bus_config 必须是对象")
+            for bus, item in config_data.get("bus_config", {}).items():
+                try:
+                    int(bus)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"bus_config 包含无效通道编号：{bus}") from exc
+                if not isinstance(item, dict):
+                    raise ValueError(f"bus_config[{bus}] 必须是对象")
+                if any(not isinstance(item.get(field, ""), str) for field in ("name", "protocol")):
+                    raise ValueError(f"bus_config[{bus}] 的 name/protocol 必须是字符串")
+                if item.get("raw_channel") is not None and (
+                    isinstance(item["raw_channel"], bool)
+                    or not isinstance(item["raw_channel"], int)
+                    or item["raw_channel"] < 0
+                ):
+                    raise ValueError(f"bus_config[{bus}] 的 raw_channel 必须是非负整数")
+            if not isinstance(config_data.get("signal_identities", {}), dict):
+                raise ValueError("signal_identities 必须是对象")
+            if not isinstance(config_data.get("math_channels", {}), dict):
+                raise ValueError("math_channels 必须是对象")
+            self._enrich_config_identities(config_data)
+            if not self.mdf_path:
+                self._load_selected_can_config(config_data.get("selected_signals", ()), config_data.get("signal_identities", {}))
+                self._pending_can_config = config_data
+                QMessageBox.information(self, "配置已暂存", "配置已读取。加载 BLF 后会自动应用。")
+                return
+            if Path(self.mdf_path).suffix.casefold() in {".blf", ".asc", ".trc"} and not self.can_detection_snapshot:
+                self._load_selected_can_config(config_data.get("selected_signals", ()), config_data.get("signal_identities", {}))
+                self._pending_can_config = config_data
+                QMessageBox.information(self, "配置已暂存", "配置已读取，将在当前 CAN 文件探测完成后自动应用。")
+                return
+            if Path(self.mdf_path).suffix.casefold() in {".blf", ".asc", ".trc"}:
+                requested_protocols = {
+                    int(bus): item.get("protocol", "")
+                    for bus, item in config_data.get("bus_config", {}).items()
+                    if isinstance(item, dict)
+                }
+                if any(
+                    protocol and self.bus_protocols.get(bus, "") != protocol
+                    for bus, protocol in requested_protocols.items()
+                    if bus in self.can_bus_data
+                ):
+                    self._clear_can_parse_results_keep_detection()
+                    self._load_selected_can_config(config_data.get("selected_signals", ()), config_data.get("signal_identities", {}))
+                    self._pending_can_config = config_data
+                    self._restore_pending_can_config()
+                    return
+            if Path(self.mdf_path).suffix.casefold() in {".blf", ".asc", ".trc"} and not self.signals:
+                self._load_selected_can_config(config_data.get("selected_signals", ()), config_data.get("signal_identities", {}))
+                self._pending_can_config = config_data
+                self._restore_pending_can_config()
+                return
+            if not self.signals:
+                raise ValueError("当前数据文件尚无可用信号，配置已保留但不能应用")
             managed_ids, resolver = self._formula_restore_inputs()
             context = self._formula_context_token()
             if not self._formula_restore_background_enabled:
@@ -587,6 +921,29 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
     def load_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择数据文件", "", "支持的数据文件 (*.mdf *.mf4 *.blf *.asc *.trc *.csv *.vbo);;所有文件 (*)")
         if not path: return
+        if self.can_parsed_data:
+            self._sync_selected_can_config()
+        self._reusable_can_selection = {
+            record["key"]: record.get("identity")
+            for record in self._selected_can_config.values()
+        }
+        if self.can_bus_data:
+            self._reusable_can_config = {
+                "bus_config": {
+                    str(bus_id): {
+                        "name": data.get("name", f"Bus {bus_id}"),
+                        "protocol": self.bus_protocols.get(bus_id, ""),
+                        "raw_channel": (
+                            self.can_bus_mapping.bus_to_raw.get(bus_id)
+                            if self.can_bus_mapping is not None else None
+                        ),
+                    }
+                    for bus_id, data in self.can_bus_data.items()
+                }
+            }
+        self._can_task_generation += 1
+        self._parse_generation = self._can_task_generation
+        self._clear_current_can_state()
         previous_worker = self._can_bus_detection_worker
         if previous_worker is not None and previous_worker.isRunning():
             previous_worker.cancel()
@@ -595,6 +952,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.can_detection_snapshot = None
         suffix = Path(path).suffix.lower()
         if suffix in {".blf", ".asc", ".trc"}:
+            self._add_pending_selection_rows()
             self._formula_context_generation += 1
             self.mdf_path = path; self.current_file_label.setText(f"当前文件: {Path(path).name}")
             self.can_bus_data.clear()
@@ -634,12 +992,108 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
+    def _capture_current_can_selection(self):
+        self._sync_selected_can_config()
+        return {
+            record["key"]: record.get("identity")
+            for record in self._selected_can_config.values()
+        }
+
+    def _add_pending_selection_rows(self):
+        for record in self._selected_can_config.values():
+            saved_key = record["key"]
+            identity = record.get("identity")
+            token = self._selection_record_token(saved_key, identity)
+            suffix = hashlib.sha1(repr(token).encode("utf-8")).hexdigest()[:12]
+            key = saved_key if saved_key not in self.signals else f"CAN_CONFIG_{suffix}"
+            items = identity if isinstance(identity, list) else [identity]
+            items = [item for item in items if isinstance(item, dict)]
+            label = next((item.get("signal_name") for item in items if item.get("signal_name")), saved_key)
+            bus_id = next((item.get("bus_id") for item in items if item.get("bus_id") is not None), None)
+            self.signals[key] = {
+                "name": key,
+                "display_name": f"🚌 {label}（等待当前 BLF 解析）",
+                "group": -88,
+                "channel": -88,
+                "comment": "用户已选信号；当前 BLF 尚未解析。",
+                "bus_id": bus_id,
+                "signal_type": "can",
+                "signal_identity": identity,
+                "selection_key": saved_key,
+                "available": False,
+                "unavailable_reason": "等待当前 BLF 解析",
+                "pending_selection_placeholder": True,
+            }
+            self.refresh_signal_list_ui()
+            self.signal_widgets[key]["checkbox"].setChecked(True)
+            record["ui_key"] = key
+
+    def _clear_current_can_state(self):
+        for worker in tuple(getattr(self, "parse_workers", {}).values()):
+            try:
+                if worker.isRunning():
+                    worker.stop()
+                    worker.wait()
+            except RuntimeError:
+                pass
+        getattr(self, "parse_workers", {}).clear()
+        getattr(self, "_parsing_bus_ids", set()).clear()
+        self.signals.clear()
+        self.can_parsed_data.clear()
+        self.bus_signal_map.clear()
+        self.custom_math_data.clear()
+        self.clear_bus_config()
+        self.can_bus_data.clear()
+        self.db_per_bus.clear()
+        self.bus_protocols.clear()
+        self.can_bus_signals.clear()
+        self.can_bus_mapping = None
+        self.can_detection_snapshot = None
+        self.bus_loaded = False
+        for plot in self.plot_widgets:
+            plot.setParent(None)
+            plot.deleteLater()
+        self.plot_widgets.clear()
+        self.master_viewbox = None
+        self._sig_value_cache.clear()
+        self.refresh_signal_list_ui()
+        self._set_plot_empty_state("新文件尚未解析，等待 CAN 探测和信号解析")
+
+    def _clear_can_parse_results_keep_detection(self):
+        for worker in tuple(self.parse_workers.values()):
+            try:
+                if worker.isRunning():
+                    worker.stop()
+                    worker.wait()
+            except RuntimeError:
+                pass
+        self.parse_workers.clear()
+        self._parsing_bus_ids.clear()
+        for key in tuple(self.can_parsed_data):
+            self.can_parsed_data.pop(key, None)
+        self.bus_signal_map.clear()
+        self.custom_math_data.clear()
+        self.signals.clear()
+        self._sig_value_cache.clear()
+        for plot in self.plot_widgets:
+            plot.setParent(None)
+            plot.deleteLater()
+        self.plot_widgets.clear()
+        self.master_viewbox = None
+        for dialog in tuple(self.progress_dialogs.values()):
+            dialog.close()
+            dialog.deleteLater()
+        self.progress_dialogs.clear()
+        self.refresh_signal_list_ui()
+        self._set_plot_empty_state("正在按所选 DBC 重新解析当前 BLF")
+
     def _finish_data_load(self, result):
         old = getattr(self, "mdf_file", None)
         if old is not None and hasattr(old, "close"):
             try: old.close()
             except Exception: pass
         self._formula_context_generation += 1
+        self._can_task_generation += 1
         self.mdf_path = result.path; self.mdf_file = result.data
         self.current_file_label.setText(f"当前文件: {Path(result.path).name}")
         self.signals.clear(); self.signals.update(result.signals)
@@ -680,6 +1134,44 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.bus_loaded = True
         self._print_bus_info()
         self.create_bus_config_ui()
+        if self._pending_can_config is not None:
+            self._restore_pending_can_config()
+        elif self._reusable_can_config is not None:
+            unavailable = self._apply_saved_bus_config(self._reusable_can_config or {})
+            if unavailable:
+                details = "\n".join(f"Bus {bus}: {path}" for bus, path in unavailable)
+                QMessageBox.warning(
+                    self, "DBC 不可用",
+                    f"以下 DBC 文件不存在或不可读，请在 CAN 通道配置中重新选择：\n{details}",
+                )
+            self.auto_parse_enabled = True
+            readable_protocols = []
+            self._pending_signal_restore = {
+                "selected": list(self._reusable_can_selection or {}),
+                "identities": {
+                    key: identity
+                    for key, identity in (self._reusable_can_selection or {}).items()
+                    if identity
+                },
+                "expected_buses": self._saved_configured_bus_ids(self._reusable_can_config or {}),
+            }
+            self._add_pending_selection_rows()
+            for bus_id in self.can_bus_data:
+                protocol = self.bus_protocols.get(bus_id)
+                if protocol and os.path.isfile(protocol) and os.access(protocol, os.R_OK):
+                    readable_protocols.append(bus_id)
+                    QTimer.singleShot(0, lambda b=bus_id: self.start_parse_with_progress(b))
+                elif protocol:
+                    QMessageBox.warning(self, "DBC 不可用", f"无法读取 DBC：{protocol}\n请重新选择 DBC。")
+            if not readable_protocols and not unavailable:
+                QMessageBox.warning(
+                    self, "需要选择 DBC",
+                    "当前会话没有可复用的 DBC。请在 CAN 通道配置中选择 DBC 并解析。",
+                )
+            for bus_id in self._pending_signal_restore["expected_buses"] - set(readable_protocols):
+                self.can_bus_data.setdefault(bus_id, {})["parse_state"] = "failed"
+                self.can_bus_data[bus_id]["parse_error"] = "DBC 不存在或不可读"
+                self._complete_pending_signal_restore(bus_id)
         if Path(self.mdf_path).suffix.casefold() == ".blf":
             can_group = self.collapsible_groups.get("CAN通道配置")
             if can_group is not None:

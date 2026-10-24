@@ -3,9 +3,13 @@ import unittest
 
 import canmatrix
 import cantools
+from lxml import etree
 from canmatrix.formats import dbc
 
-from vet_data_modular.baseline import _prepare_dbc_signal_names
+from vet_data_modular.baseline import (
+    _guard_canmatrix_arxml_parent_traversal,
+    _prepare_dbc_signal_names,
+)
 
 
 def _dbc_text(database):
@@ -15,6 +19,19 @@ def _dbc_text(database):
 
 
 class ArxmlDbcSignalNameExportTests(unittest.TestCase):
+    def test_detached_xml_elements_do_not_crash_canmatrix_reference_lookup(self):
+        _guard_canmatrix_arxml_parent_traversal(canmatrix)
+        parser = canmatrix.formats.arxml.Earxml()
+        parser.root = etree.fromstring(b"<AUTOSAR><SHORT-NAME>Root</SHORT-NAME></AUTOSAR>")
+        parser.ns = ""
+        parser.sn_cache = {}
+        parser.path_cache = {}
+
+        detached = etree.Element("I-SIGNAL")
+        self.assertEqual(parser.get_short_name_path_of_element(detached), "")
+        self.assertIsNone(parser.get_referencable_parent(detached))
+        self.assertEqual(parser.find_references_of_type(detached, "I-SIGNAL"), [])
+
     def _database(self):
         database = canmatrix.CanMatrix()
         classic = canmatrix.Frame(name="ClassicFrame", arbitration_id=0x123, size=8)

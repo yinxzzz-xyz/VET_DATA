@@ -60,6 +60,15 @@ class XlsxConditionTableTests(unittest.TestCase):
         self.assertEqual((result.conditions[0].before_seconds, result.conditions[0].after_seconds), (0, 125))
         self.assertEqual((result.conditions[1].before_seconds, result.conditions[1].after_seconds), (60, 60))
 
+    def test_optional_time_offset_column_values_and_legacy_compatibility(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._save(folder, [["时间偏移", "记录内容", "记录时间"], [180, "正偏移", "2026/6/29 9:05"], [-30, "负偏移", "2026/6/29 9:06"], [None, "空值", "2026/6/29 9:07"]])
+            result = parse_condition_table(path)
+            legacy = self._save(folder, [["记录时间", "记录内容"], ["2026/6/29 9:05", "旧表"]])
+            legacy_result = parse_condition_table(legacy)
+        self.assertEqual([item.time_offset_seconds for item in result.conditions], [180, -30, 0])
+        self.assertEqual(legacy_result.conditions[0].time_offset_seconds, 0)
+
     def test_missing_required_header_is_file_error(self):
         with tempfile.TemporaryDirectory() as folder:
             path = self._save(folder, [["记录时间", "其他"], ["2026/6/29 9:05", "值"]])

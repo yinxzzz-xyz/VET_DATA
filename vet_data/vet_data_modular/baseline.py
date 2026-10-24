@@ -162,6 +162,16 @@ class SignalFilterDialog(QDialog):
         self.signal_items = []
         self.item_keys = []
         self.frame_signal_count = {}
+        self._frame_signal_keys = {}
+        self._signal_item_by_key = {}
+        self._frame_id_by_item = {}
+        self._signal_key_by_item = {}
+        self._search_index = {}
+        self._search_pending_text = ""
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(100)
+        self._search_timer.timeout.connect(self._apply_signal_filter)
         self._updating = False
         self.search_box = QLineEdit()
         self.select_all_btn = QPushButton()
@@ -270,11 +280,19 @@ class SignalFilterDialog(QDialog):
         return count
 
     def _populate_tree(self, filter_text=""):
-        """填充树形列表"""
+        """Build the tree once; later calls only apply the cached filter."""
+        if self.frame_items:
+            self._apply_filter_text(filter_text)
+            return
         self.tree.clear()
         self.signal_items = []
         self.item_keys = []
         self.frame_signal_count = {}
+        self._frame_signal_keys = {}
+        self._signal_item_by_key = {}
+        self._frame_id_by_item = {}
+        self._signal_key_by_item = {}
+        self._search_index = {}
         filter_text = filter_text.strip().lower()
 
         # 将 existing_ids 统一转换为整数集合
@@ -300,26 +318,11 @@ class SignalFilterDialog(QDialog):
             if frame_exists:
                 print(f"✅ 匹配到帧: 0x{frame_id:X} - {frame_name}")
 
-            has_matching = False
-            matching_signals = []
-
             for sig in msg.signals:
                 sig_name = sig.name
                 sig_comment = getattr(sig, 'comment', '') or ''
                 search_text = f"{sig_name} {frame_id_hex} {frame_name} {sig_comment}".lower()
-
-                should_show = True
-                if filter_text:
-                    should_show = filter_text in search_text
-
-                if should_show:
-                    has_matching = True
-                    matching_signals.append((sig, should_show))
-                else:
-                    matching_signals.append((sig, False))
-
-            if not has_matching and filter_text:
-                continue
+                self._search_index[f"{frame_id}_{sig_name}"] = search_text
 
             # 记录该帧的信号总数
             self.frame_signal_count[frame_id] = len(msg.signals)
@@ -340,8 +343,10 @@ class SignalFilterDialog(QDialog):
 
             # 检查该帧下所有信号的选中状态
             frame_checked_count = 0
-            for sig, _ in matching_signals:
+            frame_keys = []
+            for sig in msg.signals:
                 key = f"{frame_id}_{sig.name}"
+                frame_keys.append(key)
                 if self._selected_state.get(key, False):
                     frame_checked_count += 1
 
@@ -365,11 +370,10 @@ class SignalFilterDialog(QDialog):
                 frame_item.setCheckState(0, Qt.CheckState.Unchecked)
 
             self.frame_items[frame_id] = frame_item
+            self._frame_id_by_item[id(frame_item)] = frame_id
+            self._frame_signal_keys[frame_id] = frame_keys
 
-            for sig, show in matching_signals:
-                if not show and filter_text:
-                    continue
-
+            for sig in msg.signals:
                 sig_name = sig.name
                 sig_comment = getattr(sig, 'comment', '') or ''
                 is_little = getattr(sig, 'is_little_endian', False)
@@ -390,6 +394,8 @@ class SignalFilterDialog(QDialog):
 
                 self.signal_items.append(sig_item)
                 self.item_keys.append(key)
+                self._signal_item_by_key[key] = sig_item
+                self._signal_key_by_item[id(sig_item)] = key
 
                 if self._selected_state.get(key, False):
                     sig_item.setCheckState(0, Qt.CheckState.Checked)
@@ -397,6 +403,26 @@ class SignalFilterDialog(QDialog):
                     sig_item.setCheckState(0, Qt.CheckState.Unchecked)
 
         self.update_selection_count()
+        self._apply_filter_text(filter_text)
+
+    def _apply_filter_text(self, text):
+        """Filter cached rows without rebuilding the QTreeWidget hierarchy."""
+        query = text.strip().lower()
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for frame_id, frame_item in self.frame_items.items():
+                visible_count = 0
+                for key in self._frame_signal_keys.get(frame_id, ()):
+                    item = self._signal_item_by_key[key]
+                    visible = not query or query in self._search_index[key]
+                    item.setHidden(not visible)
+                    visible_count += visible
+                frame_item.setHidden(visible_count == 0)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
+    def _apply_signal_filter(self):
+        self._apply_filter_text(self._search_pending_text)
 
     def on_item_clicked(self, item, column):
         """点击行：信号项切换状态，帧项切换展开/折叠"""
@@ -413,8 +439,9 @@ class SignalFilterDialog(QDialog):
         # 信号项：点击非复选框列时切换状态
         if column != 0:
             try:
-                idx = self.signal_items.index(item)
-                key = self.item_keys[idx]
+                key = self._signal_key_by_item.get(id(item))
+                if key is None:
+                    return
                 current = self._selected_state.get(key, False)
                 new_state = not current
                 self._selected_state[key] = new_state
@@ -442,22 +469,20 @@ class SignalFilterDialog(QDialog):
             # 帧级别的勾选变化
             if item.parent() is None:
                 check_state = item.checkState(0)
-                frame_id = None
-                for fid, fitem in self.frame_items.items():
-                    if fitem is item:
-                        frame_id = fid
-                        break
+                frame_id = self._frame_id_by_item.get(id(item))
 
                 if frame_id is not None:
                     # 更新该帧下所有信号的选中状态
-                    for sig_item, key in zip(self.signal_items, self.item_keys):
-                        if key.startswith(f"{frame_id}_"):
-                            if check_state == Qt.CheckState.Checked:
-                                self._selected_state[key] = True
-                                sig_item.setCheckState(0, Qt.CheckState.Checked)
-                            else:
-                                self._selected_state[key] = False
-                                sig_item.setCheckState(0, Qt.CheckState.Unchecked)
+                    for key in self._frame_signal_keys.get(frame_id, ()):
+                        sig_item = self._signal_item_by_key[key]
+                        if sig_item.isHidden():
+                            continue
+                        if check_state == Qt.CheckState.Checked:
+                            self._selected_state[key] = True
+                            sig_item.setCheckState(0, Qt.CheckState.Checked)
+                        else:
+                            self._selected_state[key] = False
+                            sig_item.setCheckState(0, Qt.CheckState.Unchecked)
 
                     # 更新帧显示（不更新复选框，避免递归）
                     self.update_frame_display(item, update_checkbox=False)
@@ -466,8 +491,9 @@ class SignalFilterDialog(QDialog):
 
             # 信号级别的变化
             try:
-                idx = self.signal_items.index(item)
-                key = self.item_keys[idx]
+                key = self._signal_key_by_item.get(id(item))
+                if key is None:
+                    return
                 check_state = item.checkState(0)
                 self._selected_state[key] = (check_state == Qt.CheckState.Checked)
 
@@ -486,11 +512,7 @@ class SignalFilterDialog(QDialog):
         if frame_item is None:
             return
 
-        frame_id = None
-        for fid, fitem in self.frame_items.items():
-            if fitem is frame_item:
-                frame_id = fid
-                break
+        frame_id = self._frame_id_by_item.get(id(frame_item))
 
         if frame_id is None:
             return
@@ -517,19 +539,29 @@ class SignalFilterDialog(QDialog):
                 frame_item.setCheckState(0, Qt.CheckState.Unchecked)
 
     def filter_signals(self, text):
-        self._populate_tree(text)
+        self._search_pending_text = text
+        self._search_timer.start()
 
     def select_all(self):
         """全选当前筛选显示的所有信号"""
         for key in self._selected_state:
             self._selected_state[key] = True
-        self._populate_tree(self.search_box.text())
+        self._refresh_frame_selection_states()
 
     def deselect_all(self):
         """取消全选所有信号"""
         for key in self._selected_state:
             self._selected_state[key] = False
-        self._populate_tree(self.search_box.text())
+        self._refresh_frame_selection_states()
+
+    def _refresh_frame_selection_states(self):
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for frame_item in self.frame_items.values():
+                self.update_frame_display(frame_item)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+        self.update_selection_count()
 
     def update_selection_count(self):
         total = len(self._selected_state)
@@ -668,8 +700,50 @@ def _prepare_dbc_signal_names(databases):
                     signal.name = alias
 
 
+def _guard_canmatrix_arxml_parent_traversal(canmatrix):
+    """Keep canmatrix ARXML lookups safe for detached or unresolved elements."""
+    arxml = canmatrix.formats.arxml
+    earxml = arxml.Earxml
+    if getattr(earxml, "_vet_data_parent_guard", False):
+        return
+
+    def get_short_name_path_of_element(self, xml_element):
+        path = []
+        while xml_element is not None and xml_element is not self.root:
+            short_name = self.get_short_name(xml_element)
+            if short_name:
+                path.append(short_name)
+            xml_element = xml_element.getparent()
+        return "/".join(reversed(path))
+
+    def get_referencable_parent(self, xml_element):
+        while xml_element is not None and xml_element is not self.root:
+            if self.get_short_name(xml_element):
+                return xml_element
+            xml_element = xml_element.getparent()
+        return xml_element
+
+    def find_references_of_type(self, element, xml_tag, referencable_parent=False):
+        current_ar_path = self.get_short_name_path_of_element(element)
+        references = []
+        for reference in self.path_cache.get(current_ar_path, ()):
+            parent = self.get_referencable_parent(reference)
+            if parent is not None and parent.tag == self.ns + xml_tag:
+                references.append(reference)
+        if referencable_parent:
+            references = [self.get_referencable_parent(item) for item in references]
+            references = [item for item in references if item is not None]
+        return references
+
+    earxml.get_short_name_path_of_element = get_short_name_path_of_element
+    earxml.get_referencable_parent = get_referencable_parent
+    earxml.find_references_of_type = find_references_of_type
+    earxml._vet_data_parent_guard = True
+
+
 def _convert_arxml_models_to_dbc(canmatrix, arxml_file, dbc_file):
     """Load, prepare and split-export ARXML databases like canmatrix.convert."""
+    _guard_canmatrix_arxml_parent_traversal(canmatrix)
     databases = canmatrix.formats.loadp(arxml_file)
     if not databases:
         raise RuntimeError("加载 ARXML 返回空数据库")
@@ -1147,7 +1221,7 @@ class ARXMLConverterDialog(QDialog):
         event.accept()
 
 
-CAN_COLUMN_WIDTHS = (52, 40, 42, 36, 68, 34)
+CAN_COLUMN_WIDTHS = (52, 40, 42, 36, 146, 34)
 
 
 def _refresh_dynamic_style(widget):
@@ -1271,12 +1345,14 @@ class BusConfigWidget(QWidget):
         self.select_protocol_btn.setFixedWidth(46)
         self.select_protocol_btn.clicked.connect(self.select_protocol)
 
-        self.protocol_clear_btn.setText("✕")
-        self.protocol_clear_btn.setToolTip("清除协议")
+        self.protocol_clear_btn.setText("清除")
+        self.protocol_clear_btn.setToolTip("清除当前 Bus 的 DBC 选择")
         self.protocol_clear_btn.setProperty("uiRole", "secondary")
-        self.protocol_clear_btn.setFixedWidth(20)
+        self.protocol_clear_btn.setFixedWidth(40)
+        self.protocol_clear_btn.setMinimumWidth(0)
+        self.protocol_clear_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.protocol_clear_btn.clicked.connect(self.clear_protocol)
-        self.protocol_clear_btn.setVisible(False)
+        self.protocol_clear_btn.setEnabled(False)
 
         self.parse_btn.setText("解析")
         self.parse_btn.setProperty("uiRole", "primary")
@@ -1286,8 +1362,8 @@ class BusConfigWidget(QWidget):
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(1)
         action_layout.addWidget(self.select_protocol_btn)
-        action_layout.addWidget(self.protocol_clear_btn)
         action_layout.addWidget(self.parse_btn)
+        action_layout.addWidget(self.protocol_clear_btn)
         layout.addWidget(action_widget, 0, 4, 2, 1)
 
         self.status_indicator.setProperty("uiCanCell", "status")
@@ -1306,6 +1382,9 @@ class BusConfigWidget(QWidget):
 
     def set_protocol_display(self, text):
         self.protocol_label.setText(text)
+        self.protocol_clear_btn.setEnabled(
+            text != "未配置" or bool(self.protocol_path)
+        )
         self.protocol_label.setProperty(
             "statusKind", "missing" if text == "未配置" else "configured"
         )
@@ -1360,12 +1439,12 @@ class BusConfigWidget(QWidget):
             if filtered_db is not db:
                 self._cached_filtered_db = filtered_db
                 if self.protocol_clear_btn:
-                    self.protocol_clear_btn.setVisible(True)
+                    self.protocol_clear_btn.setEnabled(True)
                 self.protocol_changed.emit(self.bus_id, self.protocol_path)
             else:
                 self.set_protocol_display(os.path.basename(file_path))
                 if self.protocol_clear_btn:
-                    self.protocol_clear_btn.setVisible(True)
+                    self.protocol_clear_btn.setEnabled(True)
                 self.protocol_changed.emit(self.bus_id, file_path)
 
         except ImportError as e:
@@ -1382,7 +1461,7 @@ class BusConfigWidget(QWidget):
         self.arxml_sub_bus = ""
         self.set_protocol_display("未配置")
         if self.protocol_clear_btn:
-            self.protocol_clear_btn.setVisible(False)
+            self.protocol_clear_btn.setEnabled(False)
         self.protocol_removed.emit(self.bus_id)
         self.set_status('idle')
 
@@ -1413,6 +1492,9 @@ class BusConfigWidget(QWidget):
         elif status == 'error':
             self.status_indicator.setText("失败")
             self.status_indicator.setToolTip("解析失败")
+        elif status == 'stopped':
+            self.status_indicator.setText("解析停止")
+            self.status_indicator.setToolTip("解析已停止，本次未生成解析结果")
         self.status_indicator.setProperty("statusKind", status)
         _refresh_dynamic_style(self.status_indicator)
 
@@ -1779,12 +1861,14 @@ class BusConfigWidget(QWidget):
 
 class ParseProgressDialog(QDialog):
     """解析进度对话框"""
+    cancel_requested = pyqtSignal(int)
 
     def __init__(self, bus_id, parent=None):
         super().__init__(parent)
         self.bus_id = bus_id
         self._instance_id = id(self)
         self._cancelled = False
+        self._finished = False
         self.status_label = QLabel()
         self.progress_bar = QProgressBar()
         self.detail_label = QLabel()
@@ -1869,6 +1953,7 @@ class ParseProgressDialog(QDialog):
         self.detail_label.setText(detail_text)
 
     def set_finished(self, success=True, stats=None):
+        self._finished = True
         if success and stats:
             self.status_label.setText("✅ 解析完成!")
             self.progress_bar.setValue(100)
@@ -1888,16 +1973,30 @@ class ParseProgressDialog(QDialog):
 
     def set_empty_result(self, reason):
         """Show an expected no-result outcome without claiming a worker crash."""
+        self._finished = True
         self.status_label.setText("❌ 未生成可用信号")
         self.detail_label.setText(reason)
         self.cancel_btn.setText("关闭")
         self.cancel_btn.clicked.disconnect()
         self.cancel_btn.clicked.connect(self.close)
 
+    def set_cancelled(self):
+        self._finished = True
+        self._cancelled = True
+        self.status_label.setText("⏹ 解析停止")
+        self.detail_label.setText("当前通道已停止解析，本次未生成解析结果。")
+        self.cancel_btn.setText("关闭")
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.clicked.disconnect()
+        self.cancel_btn.clicked.connect(self.close)
+
     def on_cancel(self):
+        if self._cancelled or self._finished:
+            return
         self._cancelled = True
         self.status_label.setText("⏹ 正在取消...")
         self.cancel_btn.setEnabled(False)
+        self.cancel_requested.emit(self.bus_id)
 
     def is_cancelled(self):
         return self._cancelled
@@ -1909,7 +2008,10 @@ class ParseProgressDialog(QDialog):
         super().hideEvent(event)
 
     def closeEvent(self, event):
-        self._cancelled = True
+        if not self._finished:
+            self.on_cancel()
+            event.ignore()
+            return
         event.accept()
 
 
@@ -1918,6 +2020,7 @@ class ParseWorker(QThread):
     progress_updated = pyqtSignal(int, int, str)
     parse_finished = pyqtSignal(int, dict)
     parse_error = pyqtSignal(int, str)
+    parse_cancelled = pyqtSignal(int)
 
     def __init__(self, bus_id, target_raw_channel, msg_count, log_path, file_identity, db, arxml_sub_bus="", parent=None):
         super().__init__(parent)
@@ -2224,10 +2327,19 @@ class ParseWorker(QThread):
 
             # ===== 构建消息映射 =====
             msg_shard = {}
+            signal_identity = {}
             for msg_def in self.db.messages:
                 frame_id = msg_def.frame_id
                 message_key = (frame_id, bool(getattr(msg_def, 'is_extended_frame', False)))
                 msg_shard[message_key] = msg_def
+                for signal in msg_def.signals:
+                    signal_identity.setdefault(signal.name, []).append({
+                        'raw_channel': int(self.target_raw_channel),
+                        'frame_id': int(frame_id),
+                        'is_extended': bool(getattr(msg_def, 'is_extended_frame', False)),
+                        'message_name': str(msg_def.name),
+                        'signal_name': str(signal.name),
+                    })
                 print(f"  📨 注册消息: ID=0x{frame_id:X} ({frame_id}), 信号数={len(msg_def.signals)}")
 
             print(f"\n总线 {self.bus_id}: 数据库中有 {len(msg_shard)} 个消息定义")
@@ -2257,6 +2369,7 @@ class ParseWorker(QThread):
             total_signals_decoded = 0
             msg_ids_with_signals = set()
             matched_msg_ids = set()
+            matched_frames = set()
             unmatched_msg_ids = set()
             container_frame_counts = defaultdict(int)  # 每个容器帧的计数
 
@@ -2321,6 +2434,7 @@ class ParseWorker(QThread):
                     continue
 
                 matched_msg_ids.add(msg_id)
+                matched_frames.add(message_key)
                 total_messages_processed += 1
                 frame_signals_before = total_signals_decoded
                 frame_decode_failed = False
@@ -2359,6 +2473,8 @@ class ParseWorker(QThread):
 
                     sub_pdu_count = 0
                     while i + header_bytes <= data_len:
+                        if not self._is_running:
+                            break
                         try:
                             # 读取 Header_ID (24位，大端)
                             header_id = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]
@@ -2452,6 +2568,8 @@ class ParseWorker(QThread):
 
                     sub_pdu_count = 0
                     while i + header_bytes <= data_len:
+                        if not self._is_running:
+                            break
                         try:
                             # 读取 Header_ID (24位，大端)
                             header_id = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]
@@ -2575,6 +2693,9 @@ class ParseWorker(QThread):
                 reader.stop()
             except Exception:
                 pass
+            if not self._is_running:
+                self.parse_cancelled.emit(self.bus_id)
+                return
             if capture_can_file_identity(self.log_path) != self.file_identity:
                 raise ValueError("CAN日志在解析期间发生变化，请重新探测")
 
@@ -2641,12 +2762,14 @@ class ParseWorker(QThread):
                 'dbc_signal_count': sum(len(message.signals) for message in self.db.messages),
                 'msg_ids_with_signals': len(msg_ids_with_signals),
                 'matched_msg_ids': len(matched_msg_ids),
+                'matched_frames': sorted((int(frame_id), bool(is_extended)) for frame_id, is_extended in matched_frames),
                 'unmatched_msg_ids': len(unmatched_msg_ids),
                 'container_frame_counts': {
                     frame_id | (0x80000000 if is_extended else 0): count
                     for (frame_id, is_extended), count in container_frame_counts.items()
                 },
-                'pool': pool
+                'pool': pool,
+                'signal_identity': signal_identity,
             }
 
             self.parse_finished.emit(self.bus_id, stats)
@@ -2690,12 +2813,16 @@ class MDFPlotter(QWidget):
         self.init_ui()
 
         self.parse_workers = {}
+        self._cancelled_parse_buses = set()
         self.auto_parse_enabled = False
 
         self.search_index = {}
         self.search_timer = None
         self._search_pending_text = ""
         self._parsing_bus_ids = set()
+        self._parse_generation = 0
+        self._pending_signal_config = None
+        self._reusable_can_selection = {}
 
         self.progress_dialogs = {}
 
@@ -3220,6 +3347,10 @@ class MDFPlotter(QWidget):
             "All Supported Files (*.mdf *.mf4 *.csv *.vbo *.blf *.asc *.trc);;MDF/MF4 Files (*.mdf *.mf4);;CSV Files (*.csv);;VBO Files (*.vbo);;CAN Log Files (*.blf *.asc *.trc);;All Files (*)"
         )
         if file_name:
+            if self.can_parsed_data:
+                self._reusable_can_selection = self._capture_can_selection()
+            self._parse_generation += 1
+            self._clear_current_can_results()
             # 清理绘图
             if hasattr(self, 'plot_layout') and self.plot_layout is not None:
                 while self.plot_layout.count():
@@ -3272,6 +3403,58 @@ class MDFPlotter(QWidget):
                 self.create_bus_config_ui()
             else:
                 self.load_signals()
+
+    def _capture_can_selection(self):
+        selected = set(self.get_selected_signals())
+        saved = {}
+        if hasattr(self, '_selected_can_config'):
+            self._sync_selected_can_config()
+            saved.update({
+                record['key']: record.get('identity')
+                for record in self._selected_can_config.values()
+            })
+        for key in selected:
+            info = self.signals.get(key, {})
+            data = self.can_parsed_data.get(key, {})
+            bus_id = info.get('bus_id', data.get('bus_id'))
+            if bus_id is None:
+                continue
+            identity = info.get('signal_identity') or data.get('signal_identity')
+            saved.setdefault(key, identity)
+        return saved
+
+    def _clear_current_can_results(self):
+        """Invalidate file-bound CAN samples and visible curves immediately."""
+        for bus_id, worker in tuple(getattr(self, 'parse_workers', {}).items()):
+            try:
+                if worker.isRunning():
+                    worker.stop()
+                    worker.wait()
+            except RuntimeError:
+                pass
+        getattr(self, 'parse_workers', {}).clear()
+        getattr(self, '_parsing_bus_ids', set()).clear()
+        self.can_parsed_data.clear()
+        self.bus_signal_map.clear()
+        self.custom_math_data.clear()
+        self.signals.clear()
+        self._sig_value_cache.clear()
+        self.clear_bus_config()
+        for dialog in tuple(getattr(self, 'progress_dialogs', {}).values()):
+            try:
+                dialog.close()
+                dialog.deleteLater()
+            except RuntimeError:
+                pass
+        getattr(self, 'progress_dialogs', {}).clear()
+        for plot in self.plot_widgets:
+            plot.setParent(None)
+            plot.deleteLater()
+        self.plot_widgets.clear()
+        self.master_viewbox = None
+        if hasattr(self, 'plot_layout') and self.plot_layout is not None:
+            self._set_plot_empty_state("新文件尚未解析，请配置 DBC 并等待解析完成")
+        self.refresh_signal_list_ui()
 
     def load_can_bus_info(self, log_path):
         try:
@@ -3334,11 +3517,19 @@ class MDFPlotter(QWidget):
         QTimer.singleShot(1000, self.auto_parse_all_buses)
 
     def on_bus_protocol_removed(self, bus_id):
+        worker = self.parse_workers.get(bus_id)
+        if worker is not None:
+            self.cancel_parse_bus(bus_id)
+
         if bus_id in self.bus_protocols:
             del self.bus_protocols[bus_id]
 
         if bus_id in self.db_per_bus:
             self.db_per_bus[bus_id] = {}
+        if bus_id in self.can_bus_data:
+            self.can_bus_data[bus_id].pop('parse_stats', None)
+            self.can_bus_data[bus_id].pop('parse_error', None)
+            self.can_bus_data[bus_id]['parse_state'] = 'idle'
 
         keys_to_remove = []
         for key, info in self.signals.items():
@@ -3447,12 +3638,20 @@ class MDFPlotter(QWidget):
         return bus_snapshot
 
     def parse_bus(self, bus_id, auto_parse=False):
+        pending_restore = getattr(self, '_pending_signal_restore', None)
+        if pending_restore is not None:
+            pending_restore.setdefault('expected_buses', set()).add(bus_id)
         if bus_id in self._parsing_bus_ids:
             return
         self._parsing_bus_ids.add(bus_id)
 
         if bus_id not in self.bus_protocols:
             self._parsing_bus_ids.discard(bus_id)
+            if bus_id in getattr(self, 'can_bus_data', {}):
+                self.can_bus_data[bus_id]['parse_state'] = 'failed'
+                self.can_bus_data[bus_id]['parse_error'] = '未配置协议文件'
+            if hasattr(self, '_complete_pending_signal_restore'):
+                self._complete_pending_signal_restore(bus_id)
             if not auto_parse:
                 QMessageBox.warning(self, "解析失败", f"Bus {bus_id} 未配置协议文件")
             return
@@ -3461,6 +3660,11 @@ class MDFPlotter(QWidget):
             bus_snapshot = self._validated_can_detection_bus(bus_id)
         except (KeyError, TypeError, ValueError) as exc:
             self._parsing_bus_ids.discard(bus_id)
+            if bus_id in getattr(self, 'can_bus_data', {}):
+                self.can_bus_data[bus_id]['parse_state'] = 'failed'
+                self.can_bus_data[bus_id]['parse_error'] = str(exc)
+            if hasattr(self, '_complete_pending_signal_restore'):
+                self._complete_pending_signal_restore(bus_id)
             message = f"无法开始解析：{exc}。请重新探测当前CAN日志。"
             if bus_id in self.bus_config_widgets:
                 self.bus_config_widgets[bus_id].set_status('error')
@@ -3469,14 +3673,19 @@ class MDFPlotter(QWidget):
             print(f"⚠️ {message}")
             return
 
-        if bus_id in self.parse_workers and self.parse_workers[bus_id].isRunning():
+        if bus_id in self.parse_workers:
             self._parsing_bus_ids.discard(bus_id)
             return
 
+        self._cancelled_parse_buses.discard(bus_id)
+
         if bus_id in self.bus_config_widgets:
             self.bus_config_widgets[bus_id].set_status('loading')
+        if bus_id in self.can_bus_data:
+            self.can_bus_data[bus_id]['parse_state'] = 'parsing'
 
         progress_dialog = ParseProgressDialog(bus_id, self)
+        progress_dialog.cancel_requested.connect(self.cancel_parse_bus)
         progress_dialog.show()
         self.progress_dialogs[bus_id] = progress_dialog
 
@@ -3525,9 +3734,13 @@ class MDFPlotter(QWidget):
                 db,
                 "",
             )
+            worker._task_generation = getattr(self, '_can_task_generation', 0)
+            worker._file_identity = self.can_detection_snapshot.file_identity
             worker.progress_updated.connect(self.on_parse_progress)
             worker.parse_finished.connect(self.on_parse_finished)
             worker.parse_error.connect(self.on_parse_error)
+            worker.parse_cancelled.connect(self.on_parse_cancelled)
+            worker.finished.connect(self._on_parse_worker_thread_finished)
             self.parse_workers[bus_id] = worker
             worker.start()
             print(f"🚀 总线 {bus_id} 解析任务已启动")
@@ -3539,6 +3752,11 @@ class MDFPlotter(QWidget):
             if bus_id in self.progress_dialogs:
                 self.progress_dialogs[bus_id].set_finished(False)
                 self.progress_dialogs[bus_id].set_detail(f"错误: {e}")
+            if bus_id in self.can_bus_data:
+                self.can_bus_data[bus_id]['parse_state'] = 'failed'
+                self.can_bus_data[bus_id]['parse_error'] = str(e)
+            if hasattr(self, '_complete_pending_signal_restore'):
+                self._complete_pending_signal_restore(bus_id)
             if not auto_parse:
                 QMessageBox.warning(self, "解析失败", f"解析 Bus {bus_id} 时出错: {e}")
             import traceback
@@ -3546,6 +3764,51 @@ class MDFPlotter(QWidget):
 
     def start_parse_with_progress(self, bus_id):
         self.parse_bus(bus_id, auto_parse=True)
+
+    def cancel_parse_bus(self, bus_id):
+        """Request cooperative stop and immediately reflect the stopped state."""
+        self._cancelled_parse_buses.add(bus_id)
+        worker = self.parse_workers.get(bus_id)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+
+        if bus_id in self.can_bus_data:
+            self.can_bus_data[bus_id]['parse_state'] = 'stopped'
+        if bus_id in self.bus_config_widgets and bus_id in self.bus_protocols:
+            self.bus_config_widgets[bus_id].set_status('stopped')
+        dialog = self.progress_dialogs.get(bus_id)
+        if dialog is not None:
+            dialog.status_label.setText("⏹ 正在停止解析...")
+            dialog.cancel_btn.setEnabled(False)
+
+        if worker is None or not worker.isRunning():
+            self.on_parse_cancelled(bus_id)
+
+    def on_parse_cancelled(self, bus_id):
+        self._parsing_bus_ids.discard(bus_id)
+        worker = self.parse_workers.get(bus_id)
+        if worker is not None and not worker.isRunning():
+            self.parse_workers.pop(bus_id, None)
+        if bus_id in self.can_bus_data and bus_id in self.bus_protocols:
+            self.can_bus_data[bus_id]['parse_state'] = 'stopped'
+        if bus_id in self.bus_config_widgets:
+            self.bus_config_widgets[bus_id].set_status(
+                'stopped' if bus_id in self.bus_protocols else 'idle'
+            )
+        dialog = self.progress_dialogs.get(bus_id)
+        if dialog is not None:
+            dialog.set_cancelled()
+        if hasattr(self, '_complete_pending_signal_restore'):
+            self._complete_pending_signal_restore(bus_id)
+
+    def _on_parse_worker_thread_finished(self):
+        worker = self.sender()
+        if worker is None:
+            return
+        bus_id = getattr(worker, 'bus_id', None)
+        if bus_id is not None and self.parse_workers.get(bus_id) is worker:
+            self.parse_workers.pop(bus_id, None)
+        worker.deleteLater()
 
     def on_parse_progress(self, bus_id, progress, status_text):
         if bus_id in self.progress_dialogs:
@@ -3556,7 +3819,20 @@ class MDFPlotter(QWidget):
                     dialog.set_detail(f"Bus {bus_id}: 正在解析...")
 
     def on_parse_finished(self, bus_id, stats):
+        if bus_id in getattr(self, '_cancelled_parse_buses', ()):
+            self.on_parse_cancelled(bus_id)
+            return
+        worker = self.parse_workers.get(bus_id)
+        if worker is not None and (
+            getattr(worker, '_task_generation', getattr(self, '_can_task_generation', 0)) != getattr(self, '_can_task_generation', 0)
+            or getattr(worker, '_file_identity', None) != getattr(getattr(self, 'can_detection_snapshot', None), 'file_identity', None)
+        ):
+            return
         self._parsing_bus_ids.discard(bus_id)
+
+        for key, info in tuple(getattr(self, 'signals', {}).items()):
+            if info.get('pending_selection_placeholder'):
+                self.signals.pop(key, None)
 
         pool = stats.pop('pool', {})
 
@@ -3585,20 +3861,43 @@ class MDFPlotter(QWidget):
                 self.progress_dialogs[bus_id].set_empty_result(reason)
             if bus_id in self.can_bus_data:
                 self.can_bus_data[bus_id]['parse_stats'] = stats
+                self.can_bus_data[bus_id]['parse_state'] = 'complete'
             if bus_id in self.db_per_bus:
                 self.db_per_bus[bus_id]['parsed'] = False
-            if bus_id in self.parse_workers:
-                del self.parse_workers[bus_id]
+            bus_name = self.can_bus_data.get(bus_id, {}).get('name', f"Bus {bus_id}")
+            if hasattr(self, 'register_can_signal_catalog'):
+                self.register_can_signal_catalog(bus_id, bus_name, stats)
+            if hasattr(self, 'refresh_signal_list_ui'):
+                self.refresh_signal_list_ui()
+            if hasattr(self, '_complete_pending_signal_restore'):
+                self._complete_pending_signal_restore(bus_id)
             return
 
         stats['result_state'] = 'success'
         stats['result_message'] = ''
+        stats.setdefault('signal_identity', stats.pop('signal_identity', {}))
 
         bus_name = self.can_bus_data.get(bus_id, {}).get('name', f"Bus {bus_id}")
         self.register_can_signals(pool, bus_name, bus_id)
+        identities = stats.get('signal_identity', {})
+        for key, info in getattr(self, 'signals', {}).items():
+            if info.get('bus_id') != bus_id or not key.startswith(f'CAN_{bus_name}_'):
+                continue
+            name = key[len(f'CAN_{bus_name}_'):]
+            candidates = identities.get(name, ())
+            if candidates:
+                identities_for_signal = [dict(item, bus_id=bus_id) for item in candidates]
+                identity = identities_for_signal[0] if len(identities_for_signal) == 1 else identities_for_signal
+                info['signal_identity'] = identity
+                if key in self.can_parsed_data:
+                    self.can_parsed_data[key]['signal_identity'] = identity
 
         if bus_id in self.can_bus_data:
             self.can_bus_data[bus_id]['parse_stats'] = stats
+            self.can_bus_data[bus_id]['parse_state'] = 'complete'
+
+        if hasattr(self, 'register_can_signal_catalog'):
+            self.register_can_signal_catalog(bus_id, bus_name, stats)
 
         if bus_id in self.db_per_bus:
             self.db_per_bus[bus_id]['parsed'] = True
@@ -3616,25 +3915,72 @@ class MDFPlotter(QWidget):
 
         self.refresh_signal_list_ui()
 
-        if bus_id in self.parse_workers:
-            del self.parse_workers[bus_id]
+        if not getattr(self, '_pending_signal_restore', None) and getattr(self, '_reusable_can_selection', None) and hasattr(self, '_apply_can_selection'):
+            saved = self._reusable_can_selection
+            self._apply_can_selection(
+                list(saved),
+                {key: {**identity, 'bus_id': self.signals.get(key, {}).get('bus_id')}
+                 for key, identity in saved.items() if isinstance(identity, dict)},
+            )
+
+        if hasattr(self, '_complete_pending_signal_restore'):
+            self._complete_pending_signal_restore(bus_id)
 
         print(f"✅ Bus {bus_id} 解析完成: {stats}")
 
     def on_parse_error(self, bus_id, error_msg):
+        if bus_id in getattr(self, '_cancelled_parse_buses', ()):
+            self.on_parse_cancelled(bus_id)
+            return
+        worker = self.parse_workers.get(bus_id)
+        if worker is not None and (
+            getattr(worker, '_task_generation', getattr(self, '_can_task_generation', 0)) != getattr(self, '_can_task_generation', 0)
+            or getattr(worker, '_file_identity', None) != getattr(getattr(self, 'can_detection_snapshot', None), 'file_identity', None)
+        ):
+            return
         self._parsing_bus_ids.discard(bus_id)
 
         if bus_id in self.bus_config_widgets:
             self.bus_config_widgets[bus_id].set_status('error')
+        if bus_id in self.can_bus_data:
+            self.can_bus_data[bus_id]['parse_state'] = 'failed'
+            self.can_bus_data[bus_id]['parse_error'] = str(error_msg)
 
         if bus_id in self.progress_dialogs:
             self.progress_dialogs[bus_id].set_finished(False)
             self.progress_dialogs[bus_id].set_detail(f"错误: {error_msg}")
 
-        if bus_id in self.parse_workers:
-            del self.parse_workers[bus_id]
+        if hasattr(self, '_complete_pending_signal_restore'):
+            self._complete_pending_signal_restore(bus_id)
 
         print(f"❌ Bus {bus_id} 解析失败: {error_msg}")
+
+    def _complete_pending_signal_restore(self, bus_id):
+        pending = getattr(self, '_pending_signal_restore', None)
+        if not pending:
+            return
+        pending.setdefault('completed_buses', set()).add(bus_id)
+        expected = set(pending.get('expected_buses', ()))
+        if not expected or not pending['completed_buses'] >= expected:
+            return
+        config = pending.get('config', {})
+        if config:
+            report = self._restore_calculated_channels(config)
+        else:
+            report = None
+        for combo, field in ((self.lat_combo, 'gps_lat_key'), (self.lon_combo, 'gps_lon_key')):
+            key = config.get(field)
+            index = combo.findData(key) if key else -1
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        self._apply_can_selection(
+            pending.get('selected', ()), pending.get('identities', {})
+        )
+        self._pending_signal_restore = None
+        if report is not None and report.failures:
+            QMessageBox.warning(
+                self, '公式通道恢复报告', self._restore_summary(report)
+            )
 
     def close_progress_dialog(self, bus_id):
         if bus_id in self.progress_dialogs:
@@ -3686,12 +4032,54 @@ class MDFPlotter(QWidget):
                 'channel': -88,
                 'comment': f"{pack.get('comment', '')} ({pack.get('unit', '')})",
                 'bus_id': bus_id,
-                'signal_type': 'can'
+                'signal_type': 'can',
+                'available': True,
             }
             self.bus_signal_map[unique_key] = bus_id
             registered_count += 1
 
         print(f"✅ 总线 {bus_name} (ID: {bus_id}) 注册了 {registered_count} 个CAN信号")
+
+    def register_can_signal_catalog(self, bus_id, bus_name, stats):
+        """Keep every DBC signal visible while marking file-specific data availability."""
+        identities = stats.get('signal_identity', {})
+        matched_frames = {
+            (int(frame_id), bool(is_extended))
+            for frame_id, is_extended in stats.get('matched_frames', ())
+        }
+        for signal_name, candidates in identities.items():
+            if not candidates:
+                continue
+            normalized = [dict(item, bus_id=bus_id) for item in candidates]
+            identity = normalized[0] if len(normalized) == 1 else normalized
+            key = f"CAN_{bus_name}_{signal_name}"
+            available = key in self.can_parsed_data and len(self.can_parsed_data[key].get('samples', ())) > 0
+            if available:
+                reason = ""
+            elif any((item['frame_id'], item['is_extended']) in matched_frames for item in normalized):
+                if stats.get('decode_failed_frames', 0):
+                    reason = "当前 BLF 有对应报文，但解码未生成此信号数据"
+                else:
+                    reason = "当前 BLF 有对应报文，但未生成此信号数据"
+            else:
+                reason = "当前 BLF 不包含此信号对应的报文"
+            info = self.signals.get(key, {
+                'name': key,
+                'display_name': f"🚌 {bus_name} - {signal_name}",
+                'group': -88,
+                'channel': -88,
+                'comment': '',
+                'bus_id': bus_id,
+                'signal_type': 'can',
+            })
+            info.update({
+                'signal_identity': identity,
+                'available': available,
+                'unavailable_reason': reason,
+            })
+            if reason:
+                info['comment'] = f"{info.get('comment', '')}；{reason}".strip('；')
+            self.signals[key] = info
 
     def create_basic_signals_for_bus(self, bus_id):
         bus_name = self.can_bus_data.get(bus_id, {}).get('name', f"Bus {bus_id}")
@@ -4135,6 +4523,16 @@ class MDFPlotter(QWidget):
                 print(f"MDF/MF4 获取信号失败: {exc}")
             return None
 
+    @staticmethod
+    def _configure_plot_y_axis(axis, numeric_extent=None):
+        """Let Y tick labels determine axis width, reducing font for large values."""
+        axis.setStyle(autoExpandTextSpace=True, autoReduceTextSpace=True)
+        if numeric_extent is not None and numeric_extent >= 1000:
+            tick_font = pg.QtGui.QFont()
+            tick_font.setPointSizeF(8.0)
+            axis.setStyle(tickFont=tick_font)
+        axis.setWidth(None)
+
     def plot_selected_signals(self):
         for widget in self.plot_widgets:
             widget.setParent(None)
@@ -4189,7 +4587,7 @@ class MDFPlotter(QWidget):
                 vb.setLimits(xMin=t_min, xMax=t_max)
 
                 left_axis = plot_widget.getPlotItem().getAxis('left')
-                left_axis.setWidth(30)
+                self._configure_plot_y_axis(left_axis)
 
                 # ===== 判断是否为文字信号 =====
                 is_text_signal = hasattr(signal, 'is_text_signal') and signal.is_text_signal
@@ -4214,6 +4612,11 @@ class MDFPlotter(QWidget):
                         y_max_data = np.max(samples[valid_mask])
                     else:
                         y_min_data, y_max_data = 0.0, 1.0
+
+                    self._configure_plot_y_axis(
+                        left_axis,
+                        max(abs(float(y_min_data)), abs(float(y_max_data))),
+                    )
 
                     y_range = y_max_data - y_min_data
                     if y_range == 0:

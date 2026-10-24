@@ -332,6 +332,29 @@ class GuiBusBindingTests(unittest.TestCase):
             target.deleteLater()
             APP.processEvents()
 
+    def test_exact_signal_identity_includes_bus_frame_kind_and_names(self):
+        identity = {
+            "bus_id": 2, "frame_id": 0x123, "is_extended": True,
+            "message_name": "Powertrain", "signal_name": "Speed",
+        }
+        self.assertEqual(
+            MDFPlotter._identity_token(identity),
+            (("bus", 2), 0x123, True, "Powertrain", "Speed"),
+        )
+        raw_identity = dict(identity, raw_channel=1)
+        self.assertEqual(
+            MDFPlotter._identity_token(raw_identity),
+            (("raw", 1), 0x123, True, "Powertrain", "Speed"),
+        )
+        self.assertEqual(
+            MDFPlotter._identity_token([identity]),
+            MDFPlotter._identity_token(identity),
+        )
+        other = dict(identity, is_extended=False)
+        self.assertNotEqual(
+            MDFPlotter._identity_token(identity), MDFPlotter._identity_token(other)
+        )
+
 
 class AuxiliaryMappingTests(unittest.TestCase):
     def test_timestamp_signals_use_gui_bus_mapping(self):

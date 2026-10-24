@@ -97,6 +97,22 @@ class CsvConditionTableTests(unittest.TestCase):
             result = parse_condition_table(path)
         self.assertEqual((result.conditions[0].before_seconds, result.conditions[0].after_seconds), (60, 60))
 
+    def test_optional_time_offset_parses_positive_negative_zero_and_blank(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, "记录内容,时间偏移 ,记录时间\n加速,180,2026/6/29 9:05\n制动,-30,2026/6/29 9:06\n稳态,0,2026/6/29 9:07\n默认,,2026/6/29 9:08\n")
+            result = parse_condition_table(path)
+        self.assertEqual([c.time_offset_seconds for c in result.conditions], [180, -30, 0, 0])
+
+    def test_missing_time_offset_column_is_compatible_and_invalid_values_are_discarded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, "记录时间,记录内容\n2026/6/29 9:05,旧版\n2026/6/29 9:06,错误\n")
+            result = parse_condition_table(path)
+            path2 = Path(folder) / "bad.csv"
+            path2.write_text("记录时间,记录内容,时间偏移\n2026/6/29 9:05,坏,NaN\n", encoding="utf-8")
+            invalid = parse_condition_table(path2)
+        self.assertEqual(result.conditions[0].time_offset_seconds, 0)
+        self.assertIn("时间偏移必须为有限数值", invalid.discarded_rows[0].reason)
+
     def test_required_header_duplicates_are_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
             path = self._write(

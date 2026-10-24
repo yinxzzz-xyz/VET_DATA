@@ -111,6 +111,21 @@ class FormulaConfigLifecycleTests(unittest.TestCase):
         self.assertEqual((resolved.key, resolved.unit), ("Calc1", "kW"))
         self.assertEqual(self.window._formula_resolver().resolve("A").unit, "Math")
 
+    def test_can_config_can_be_saved_without_selected_signals(self):
+        self.window.mdf_path = "capture.blf"
+        self.window.signals.clear()
+        self.window.custom_math_data.clear()
+        self.window.can_bus_data[1] = {"name": "Bus 1"}
+        self.window.bus_protocols[1] = "network.dbc"
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, "config.json")
+            with patch.object(window_module.QFileDialog, "getSaveFileName", return_value=(str(path), "")):
+                self.window.save_signal_config()
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["selected_signals"], [])
+        self.assertEqual(saved["bus_config"]["1"]["protocol"], "network.dbc")
+
     def test_out_of_order_four_level_chain_is_registered_topologically(self):
         calc1 = _definition("Calc1", "S001+S002", {"S001": "A", "S002": "B"})
         calc2 = _definition("Calc2", "derivative(S001)", {"S001": "Calc1"})

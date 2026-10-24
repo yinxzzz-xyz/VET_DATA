@@ -84,6 +84,7 @@ class ConditionCandidateMatch:
     window: ConditionTimeWindow
     candidate_paths: tuple[Path, ...] = field(default_factory=tuple)
     unresolved_paths: tuple[Path, ...] = field(default_factory=tuple)
+    effective_offsets: tuple[tuple[str, float], ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -673,6 +674,9 @@ def select_blf_candidates(
     progress_callback: Callable[[RangeScanProgress], None] | None = None,
     valid_frame_callback: Callable[[Path, Any, float], None] | None = None,
     progress_interval: int = 100000,
+    global_time_offset_seconds: float = 0.0,
+    file_time_offsets: dict[str, float] | None = None,
+    condition_time_offsets: tuple[float, ...] | list[float] | None = None,
 ) -> CandidateSelectionResult:
     """Conservatively prefilter, confirm once, then match exact closed ranges."""
     source_entries = tuple(entries)
@@ -681,7 +685,15 @@ def select_blf_candidates(
         raise TypeError("entries must contain only BlfIndexEntry values")
     if not all(isinstance(window, ConditionTimeWindow) for window in condition_windows):
         raise TypeError("windows must contain only ConditionTimeWindow values")
-
+    file_time_offsets = file_time_offsets or {}
+    row_offsets = tuple(condition_time_offsets or (0.0,) * len(condition_windows))
+    if len(row_offsets) != len(condition_windows):
+        raise ValueError("condition_time_offsets must correspond to windows")
+    per_entry_offsets = {
+        _stable_path_key(entry.path): float(global_time_offset_seconds)
+        + float(file_time_offsets.get(str(entry.path), file_time_offsets.get(_stable_path_key(entry.path), 0.0)))
+        for entry in source_entries
+    }
     seen_paths: set[str] = set()
     for entry in source_entries:
         key = _stable_path_key(entry.path)
@@ -698,10 +710,9 @@ def select_blf_candidates(
             continue
         if entry.time_range_status is not BlfTimeRangeStatus.UNCONFIRMED:
             continue
-        if any(
-            not _header_safely_excludes_window(entry, window)
-            for window in condition_windows
-        ):
+        if any(not _header_safely_excludes_window(
+            entry, _shift_window(window, -(per_entry_offsets[_stable_path_key(entry.path)] + row_offsets[wi]))
+        ) for wi, window in enumerate(condition_windows)):
             pending_indices.append(index)
 
     updated_entries = list(source_entries)
@@ -720,24 +731,29 @@ def select_blf_candidates(
             updated_entries[index] = confirmed_entry
 
     matches: list[ConditionCandidateMatch] = []
-    for window in condition_windows:
+    for wi, window in enumerate(condition_windows):
         candidates: list[Path] = []
         unresolved: list[Path] = []
+        effective_offsets = []
         for entry in updated_entries:
+            key = _stable_path_key(entry.path)
+            total_offset = per_entry_offsets[key] + row_offsets[wi]
+            raw_axis_window = _shift_window(window, -total_offset)
             if _has_usable_effective_range(entry):
                 if _closed_ranges_overlap(
                     entry.effective_start_timestamp,
                     entry.effective_stop_timestamp,
-                    window.start,
-                    window.end,
+                    raw_axis_window.start,
+                    raw_axis_window.end,
                 ):
                     candidates.append(entry.path)
+                    effective_offsets.append((str(entry.path), total_offset))
                 continue
             if entry.time_range_status is BlfTimeRangeStatus.EMPTY:
                 continue
             if (
                 entry.time_range_status is BlfTimeRangeStatus.UNCONFIRMED
-                and _header_safely_excludes_window(entry, window)
+                and _header_safely_excludes_window(entry, raw_axis_window)
             ):
                 continue
             unresolved.append(entry.path)
@@ -746,6 +762,7 @@ def select_blf_candidates(
                 window=window,
                 candidate_paths=tuple(candidates),
                 unresolved_paths=tuple(unresolved),
+                effective_offsets=tuple(effective_offsets),
             )
         )
 
@@ -754,6 +771,10 @@ def select_blf_candidates(
         matches=tuple(matches),
         range_confirmation_paths=confirmation_paths,
     )
+
+
+def _shift_window(window: ConditionTimeWindow, seconds: float) -> ConditionTimeWindow:
+    return ConditionTimeWindow(window.start + seconds, window.end + seconds)
 
 
 def _header_safely_excludes_window(
@@ -1195,6 +1216,11 @@ def validate_task(task: SliceTask) -> TaskValidationResult:
 
     _validate_offset(task.blf_utc_offset, "blf_utc_offset", "BLF 时区", issues)
     _validate_offset(task.table_utc_offset, "table_utc_offset", "表格时区", issues)
+    if isinstance(task.global_time_offset_seconds, bool) or not isinstance(task.global_time_offset_seconds, (int, float)) or not math.isfinite(float(task.global_time_offset_seconds)):
+        issues.append(_issue("invalid_global_time_offset", "全局时间偏移必须是有限数值（秒）。", "global_time_offset_seconds"))
+    for path, value in task.blf_time_offsets:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            issues.append(_issue("invalid_file_time_offset", f"BLF 单文件时间偏移无效：{path}", "blf_time_offsets"))
 
     if task.input_mode not in (InputMode.FILE, InputMode.FOLDER):
         issues.append(_issue("invalid_input_mode", "BLF 输入模式无效。", "input_mode"))
@@ -1224,6 +1250,8 @@ def validate_task(task: SliceTask) -> TaskValidationResult:
 def _validate_condition(condition: ConditionSpec) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     row = condition.original_row_number
+    if isinstance(condition.time_offset_seconds, bool) or not isinstance(condition.time_offset_seconds, (int, float)) or not math.isfinite(float(condition.time_offset_seconds)):
+        issues.append(_issue("invalid_time_offset", "时间偏移必须是有限数值（秒）。", "time_offset_seconds", row))
     if not isinstance(condition.name, str) or not condition.name.strip():
         issues.append(_issue("invalid_condition_name", "工况名称不能为空。", "name", row))
 

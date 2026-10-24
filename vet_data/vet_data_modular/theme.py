@@ -244,6 +244,7 @@ QLabel[uiCanCell="protocol"][statusKind="configured"] {{
 }}
 QLabel[uiCanCell="status"][statusKind="idle"] {{ color: {c.text_secondary}; }}
 QLabel[uiCanCell="status"][statusKind="loading"] {{ color: {c.warning}; }}
+QLabel[uiCanCell="status"][statusKind="stopped"] {{ color: {c.text_secondary}; }}
 QLabel[uiCanCell="status"][statusKind="success"] {{ color: {c.success}; }}
 QLabel[uiCanCell="status"][statusKind="error"] {{ color: {c.danger}; }}
 QLineEdit[uiCanCell="bus"] {{

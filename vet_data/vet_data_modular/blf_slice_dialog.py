@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+import os
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QAbstractItemView, QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGroupBox, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem, QToolButton,
+    QPushButton, QRadioButton, QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget, QScrollArea,
 )
 
@@ -19,6 +20,7 @@ from .blf_slice_service import resolve_output_directory, validate_task
 from .blf_slice_table import (
     DEFAULT_AFTER_SECONDS, DEFAULT_BEFORE_SECONDS, OPTIONAL_AFTER_HEADER,
     OPTIONAL_BEFORE_HEADER, REQUIRED_HEADERS, TableParseError, TableParseResult,
+    OPTIONAL_TIME_OFFSET_HEADER,
     parse_condition_table,
 )
 from .theme import DEFAULT_THEME, build_blf_slice_stylesheet
@@ -44,10 +46,14 @@ def condition_table_help_text() -> str:
 可选表头：
 • {OPTIONAL_BEFORE_HEADER}：从工况时间向前扩展的切片秒数
 • {OPTIONAL_AFTER_HEADER}：从工况时间向后扩展的切片秒数
+• {OPTIONAL_TIME_OFFSET_HEADER}：工况行额外时间校正，单位秒；可不添加
 
 默认规则：
 • 没有“{OPTIONAL_BEFORE_HEADER}”列或对应单元格为空时，使用当前默认值：{DEFAULT_BEFORE_SECONDS} 秒。
 • 没有“{OPTIONAL_AFTER_HEADER}”列或对应单元格为空时，使用当前默认值：{DEFAULT_AFTER_SECONDS} 秒。
+• “{OPTIONAL_TIME_OFFSET_HEADER}”列缺少、单元格为空或为 0 时均按 0 秒；支持正负有限数值。
+• “{OPTIONAL_TIME_OFFSET_HEADER}”不会覆盖其他校准，最终为全局偏移 + 当前 BLF 单文件偏移 + 当前工况行偏移。
+• 正值使 BLF 时间向后校正；例如 +180 表示增加 180 秒，-30 表示减少 30 秒。校正后 BLF 时间与表格真实时间匹配。
 
 兼容规则：
 • 允许存在“序号、时间来源、纬度、经度”等其他附加列，附加列会被忽略，不会导致解析失败。
@@ -59,11 +65,12 @@ def condition_table_help_text() -> str:
 • 同时兼容现有格式：YYYY/M/D H:MM（分钟精度会将秒补为 00）。
 
 示例：
-{recorded_at_header} | {content_header} | {OPTIONAL_BEFORE_HEADER} | {OPTIONAL_AFTER_HEADER}
-2026-09-11 22:27:00 | 加速测试 | 30 | 30
-2026-09-11 22:30:00 | 制动测试 |   |
+工况名称 | 工况时间 | 时间偏移
+急加速 | 2026-10-21 14:30:00 | 180
+制动测试 | 2026-10-21 14:35:00 | -30
+稳态行驶 | 2026-10-21 14:40:00 | 0
 
-示例第二行的可选秒数为空，因此使用上述当前默认值。"""
+示例中的名称和时间仅用于演示。实际导入时前两列表头仍需使用必需字段“记录内容”和“记录时间”；时间偏移示例分别为 +180 秒、-30 秒和 0 秒。"""
 
 
 class _HelpToolButton(QToolButton):
@@ -117,6 +124,33 @@ def selected_offset(combo: QComboBox, special_combo: QComboBox) -> timedelta:
     if minutes == OTHER_OFFSET:
         minutes = special_combo.currentData()
     return timedelta(minutes=int(minutes))
+
+
+def _time_offset_dialog(parent, title, current_seconds):
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(QLabel("正值使 BLF 时间向后校正；负值使其向前校正。校正后与 Excel 工况真实时间匹配。"))
+    row = QHBoxLayout()
+    spin = QDoubleSpinBox(); spin.setRange(-1_000_000, 1_000_000); spin.setDecimals(3)
+    unit = QComboBox(); unit.addItem("秒", 1.0); unit.addItem("分钟", 60.0)
+    spin.setValue(float(current_seconds)); row.addWidget(spin); row.addWidget(unit); layout.addLayout(row)
+    effective = QLabel(f"当前生效：{float(current_seconds):+g} 秒")
+    spin.valueChanged.connect(lambda value: effective.setText(f"当前输入：{value * unit.currentData():+g} 秒"))
+    last_factor = [1.0]
+    def change_unit():
+        factor = float(unit.currentData())
+        if factor != last_factor[0]:
+            spin.setValue(spin.value() * last_factor[0] / factor)
+            last_factor[0] = factor
+        effective.setText(f"当前输入：{spin.value() * factor:+g} 秒")
+    unit.currentIndexChanged.connect(change_unit)
+    layout.addWidget(effective)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return float(current_seconds), False
+    return spin.value() * unit.currentData(), True
 
 
 def retain_duplicate_choices(files, groups, choices: dict[int, Path]) -> tuple[Path, ...]:
@@ -200,7 +234,7 @@ class DuplicateSelectionDialog(QDialog):
 
 class BlfSliceDialog(QDialog):
     task_confirmed = pyqtSignal(object, object)
-    COLUMNS = ("选择", "原始行", "工况名称", "工况时间", "向前秒数", "向后秒数", "校验状态")
+    COLUMNS = ("选择", "原始行", "工况名称", "工况时间", "向前秒数", "向后秒数", "时间偏移（秒）", "校验状态")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -265,6 +299,14 @@ class BlfSliceDialog(QDialog):
         settings_layout.setHorizontalSpacing(DEFAULT_THEME.spacing.small)
         settings_layout.setVerticalSpacing(DEFAULT_THEME.spacing.xsmall)
         self.blf_offset_combo, self.table_offset_combo = QComboBox(), QComboBox()
+        self.global_time_offset_seconds = 0.0
+        self.blf_time_offsets: dict[str, float] = {}
+        self.time_calibration_button = QPushButton("时间校准：全局 0 秒")
+        self.time_calibration_button.clicked.connect(self._edit_global_time_offset)
+        settings_layout.addWidget(self.time_calibration_button, 2, 0, 1, 2)
+        self.file_time_offset_button = QPushButton("设置各 BLF 单文件偏移…")
+        self.file_time_offset_button.clicked.connect(self._edit_file_time_offsets)
+        settings_layout.addWidget(self.file_time_offset_button, 2, 2, 1, 3)
         self.blf_special_offset_combo, self.table_special_offset_combo = QComboBox(), QComboBox()
         populate_special_offset_combo(self.blf_special_offset_combo)
         populate_special_offset_combo(self.table_special_offset_combo)
@@ -311,10 +353,10 @@ class BlfSliceDialog(QDialog):
         self.condition_table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.condition_table.verticalHeader().setDefaultSectionSize(30)
         header = self.condition_table.horizontalHeader()
-        for column in (0, 1, 3, 4, 5):
+        for column in (0, 1, 3, 4, 5, 6):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.condition_table.itemChanged.connect(self._sync_table_item_tooltip)
         condition_layout.addWidget(self.condition_table)
         root.addWidget(self.condition_box, 1)
@@ -417,9 +459,12 @@ class BlfSliceDialog(QDialog):
                 spin.setRange(0, 300)
                 spin.setValue(value)
                 self.condition_table.setCellWidget(row, column, spin)
+            offset_item = QTableWidgetItem(f"{condition.time_offset_seconds:g}")
+            offset_item.setFlags(offset_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.condition_table.setItem(row, 6, offset_item)
             status = QTableWidgetItem("待校验")
             status.setFlags(status.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.condition_table.setItem(row, 6, status)
+            self.condition_table.setItem(row, 7, status)
 
     def _set_all_selected(self, selected):
         state = Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked
@@ -465,10 +510,53 @@ class BlfSliceDialog(QDialog):
             tuple(conditions), now or datetime.now(),
             selected_offset(self.blf_offset_combo, self.blf_special_offset_combo),
             selected_offset(self.table_offset_combo, self.table_special_offset_combo),
+            self.global_time_offset_seconds,
+            tuple(self.blf_time_offsets.items()),
         )
 
+    def _edit_global_time_offset(self):
+        seconds, ok = _time_offset_dialog(self, "全局时间偏移", self.global_time_offset_seconds)
+        if ok:
+            self.global_time_offset_seconds = seconds
+            self.time_calibration_button.setText(f"时间校准：全局 {seconds:+g} 秒")
+
+    def _edit_file_time_offsets(self):
+        path = Path(self.input_edit.text().strip())
+        if self.mode_combo.currentData() is InputMode.FILE:
+            files = (path,) if path.suffix.lower() == ".blf" else ()
+        else:
+            try:
+                files = tuple(sorted((p for p in path.iterdir() if p.is_file() and p.suffix.lower() == ".blf"), key=lambda p: str(p).casefold()))
+            except OSError:
+                files = ()
+        if not files:
+            QMessageBox.information(self, "单文件偏移", "请先选择 BLF 文件或直接包含 BLF 的文件夹。")
+            return
+        values = {self._path_key(p): self.blf_time_offsets.get(self._path_key(p), 0.0) for p in files}
+        dialog = QDialog(self)
+        dialog.setWindowTitle("BLF 单文件时间偏移")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("单文件偏移与全局偏移、工况行偏移叠加；正值使 BLF 时间向后校正。单位：秒。"))
+        table = QTableWidget(len(files), 2)
+        table.setHorizontalHeaderLabels(("BLF 文件", "单文件偏移（秒）"))
+        edits = {}
+        for row, file_path in enumerate(files):
+            table.setItem(row, 0, QTableWidgetItem(file_path.name))
+            table.item(row, 0).setToolTip(str(file_path))
+            spin = QDoubleSpinBox(); spin.setRange(-1_000_000, 1_000_000); spin.setDecimals(3); spin.setValue(values[self._path_key(file_path)])
+            table.setCellWidget(row, 1, spin); edits[self._path_key(file_path)] = spin
+        layout.addWidget(table)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            for key, spin in edits.items(): self.blf_time_offsets[key] = spin.value()
+
+    @staticmethod
+    def _path_key(path):
+        return os.path.normcase(str(Path(path).resolve(strict=False)))
+
     def _mark_invalid(self, row, column, message):
-        self.condition_table.item(row, 6).setText(message)
+        self.condition_table.item(row, 7).setText(message)
         self.condition_table.setCurrentCell(row, column)
 
     def _confirm_task(self):
@@ -482,7 +570,7 @@ class BlfSliceDialog(QDialog):
             first = validation.issues[0]
             if first.condition_row_number is not None:
                 row = next((i for i, item in enumerate(task.conditions) if item.original_row_number == first.condition_row_number), 0)
-                self._mark_invalid(row, {"name": 2, "recorded_at": 3, "before_seconds": 4, "after_seconds": 5}.get(first.field, 6), first.message)
+                self._mark_invalid(row, {"name": 2, "recorded_at": 3, "before_seconds": 4, "after_seconds": 5}.get(first.field, 7), first.message)
             QMessageBox.warning(self, "参数校验失败", "\n".join(issue.message for issue in validation.issues))
             return
         self.task_confirmed.emit(task, self._table_result)

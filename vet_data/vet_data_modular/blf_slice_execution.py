@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import copy
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -53,6 +54,7 @@ class SlicePlanTarget:
     source_paths: tuple[Path, ...]
     unresolved_paths: tuple[Path, ...] = field(default_factory=tuple)
     coverage_gaps: tuple[str, ...] = field(default_factory=tuple)
+    file_time_offsets: tuple[tuple[str, float], ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_paths", tuple(Path(p) for p in self.source_paths))
@@ -88,25 +90,27 @@ class SliceScanProgress:
 
 def build_slice_execution_plan(
     matches: tuple[ConditionCandidateMatch, ...] | list[ConditionCandidateMatch],
-    source_chains: SourceChainBuildResult,
+    source_chains: SourceChainBuildResult | tuple[SourceChainBuildResult, ...],
     conditions: tuple[ConditionSpec, ...] | list[ConditionSpec],
 ) -> SliceExecutionPlan:
     """Build a deterministic source-first plan without re-deriving provenance."""
     condition_specs = tuple(conditions)
     if len(condition_specs) != len(tuple(matches)):
         raise ValueError("conditions must correspond one-to-one with candidate matches")
-    chain_by_path: dict[str, tuple[int, BlfSourceChain]] = {}
-    entry_by_path: dict[str, BlfIndexEntry] = {}
-    for chain_index, chain in enumerate(source_chains.chains):
-        for entry in chain.entries:
-            key = _path_key(entry.path)
-            chain_by_path[key] = (chain_index, chain)
-            entry_by_path[key] = entry
+    chain_results = source_chains if isinstance(source_chains, tuple) else (source_chains,) * len(tuple(matches))
 
     targets: list[SlicePlanTarget] = []
     source_targets: dict[str, list[str]] = {}
     source_paths: dict[str, Path] = {}
     for match_index, match in enumerate(matches):
+        current_chains = chain_results[match_index]
+        chain_by_path: dict[str, tuple[int, BlfSourceChain]] = {}
+        entry_by_path: dict[str, BlfIndexEntry] = {}
+        for chain_index, chain in enumerate(current_chains.chains):
+            for entry in chain.entries:
+                key = _path_key(entry.path)
+                chain_by_path[key] = (chain_index, chain)
+                entry_by_path[key] = entry
         condition = condition_specs[match_index]
         candidates = {_path_key(path) for path in match.candidate_paths}
         grouped: dict[int, tuple[Path, ...]] = {}
@@ -130,6 +134,7 @@ def build_slice_execution_plan(
                 source_paths=paths,
                 unresolved_paths=match.unresolved_paths,
                 coverage_gaps=_coverage_gaps(match.window, paths, entry_by_path),
+                file_time_offsets=match.effective_offsets,
             )
             targets.append(target)
             for path in paths:
@@ -193,6 +198,10 @@ class _TargetState:
     cancelled: bool = False
     committed_path: Path | None = None
     started: bool = False
+    file_time_offsets: dict[str, float] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.file_time_offsets = dict(self.plan.file_time_offsets)
 
 
 class _WindowMatcher:
@@ -326,6 +335,7 @@ def execute_slice(
                     writer_factory,
                     owned,
                     allocator,
+                    scan.path,
                 )
         except Exception as exc:
             detail = f"source_read_or_process_error:{scan.path}:{type(exc).__name__}: {exc}"
@@ -386,6 +396,7 @@ def _dispatch_message(
     writer_factory: Callable[[Path], Any],
     owned: OwnedTemporaryFiles,
     allocator: OutputNameAllocator,
+    source_path: Path | None = None,
 ) -> None:
     raw_timestamp = getattr(message, "timestamp", None)
     if isinstance(raw_timestamp, bool) or not isinstance(raw_timestamp, (int, float)) or not math.isfinite(float(raw_timestamp)):
@@ -393,8 +404,15 @@ def _dispatch_message(
             state.ignored_other += 1
             state.warnings.append("ignored_invalid_timestamp")
         return
-    timestamp = float(blf_timestamp_to_utc_timestamp(float(raw_timestamp), task.blf_utc_offset))
-    matching = matcher.matching_states(timestamp)
+    base_timestamp = float(blf_timestamp_to_utc_timestamp(float(raw_timestamp), task.blf_utc_offset))
+    matching = []
+    timestamps: dict[str, float] = {}
+    for state in states:
+        offset = state.file_time_offsets.get(str(source_path), 0.0) if source_path is not None else 0.0
+        timestamp = base_timestamp + offset
+        timestamps[state.plan.target_id] = timestamp
+        if state.plan.window.contains(timestamp):
+            matching.append(state)
     if not matching:
         return
     if not hasattr(message, "is_remote_frame") or not hasattr(message, "is_error_frame"):
@@ -431,8 +449,12 @@ def _dispatch_message(
                     state.paths = replacement_paths
                 owned.register(state.paths.temporary_path)
                 state.writer = writer_factory(state.paths.temporary_path)
-            state.writer.on_message_received(message)
+            output_message = copy.copy(message)
+            calibration_seconds = state.file_time_offsets.get(str(source_path), 0.0) if source_path is not None else 0.0
+            output_message.timestamp = float(raw_timestamp) + calibration_seconds
+            state.writer.on_message_received(output_message)
             state.message_count += 1
+            timestamp = timestamps[state.plan.target_id]
             state.first_timestamp = timestamp if state.first_timestamp is None else state.first_timestamp
             state.last_timestamp = timestamp
         except Exception as exc:

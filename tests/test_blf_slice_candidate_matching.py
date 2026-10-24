@@ -1,4 +1,5 @@
 import unittest
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +40,20 @@ class FakeReader:
 
 
 class ConservativeCandidateSelectionTests(unittest.TestCase):
+    def test_global_file_and_row_offsets_are_added_per_candidate_file(self):
+        entries = [
+            BlfIndexEntry(path="a.blf", time_range_status=BlfTimeRangeStatus.CONFIRMED, effective_start_timestamp=BASE, effective_stop_timestamp=BASE + 10),
+            BlfIndexEntry(path="b.blf", time_range_status=BlfTimeRangeStatus.CONFIRMED, effective_start_timestamp=BASE + 100, effective_stop_timestamp=BASE + 110),
+        ]
+        result = select_blf_candidates(
+            entries, [ConditionTimeWindow(BASE + 150, BASE + 150)], timedelta(0),
+            global_time_offset_seconds=60,
+            file_time_offsets={os.path.normcase(str(Path("a.blf").resolve())): 120, os.path.normcase(str(Path("b.blf").resolve())): 180},
+            condition_time_offsets=[-30],
+        )
+        self.assertEqual(result.matches[0].candidate_paths, (Path("a.blf"),))
+        self.assertEqual(result.matches[0].effective_offsets, ((str(Path("a.blf")), 150.0),))
+
     def test_confirmed_ranges_match_closed_boundaries_without_scanning(self):
         entries = [
             BlfIndexEntry(

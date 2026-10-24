@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -115,12 +116,29 @@ class BlfSliceWorker(QThread):
             selection = select_blf_candidates(
                 entries, windows, self.task.blf_utc_offset,
                 cancel_event=self.cancel_event, progress_callback=self._progress,
+                global_time_offset_seconds=self.task.global_time_offset_seconds,
+                file_time_offsets=dict(self.task.blf_time_offsets),
+                condition_time_offsets=tuple(item.time_offset_seconds for item in selected),
             )
             if self.cancel_event.is_set():
                 self._emit_cancelled(partial, selection.entries, "range_confirmation_cancelled")
                 return
             self._phase("source_chains", "正在匹配来源链…")
-            chains = build_blf_source_chains(selection.entries)
+            file_offsets = dict(self.task.blf_time_offsets)
+            def file_offset(path):
+                key = os.path.normcase(str(Path(path).resolve(strict=False)))
+                return float(file_offsets.get(key, file_offsets.get(str(path), 0.0)))
+            chains = tuple(
+                build_blf_source_chains(tuple(
+                    replace(entry,
+                        effective_start_timestamp=(entry.effective_start_timestamp + self.task.global_time_offset_seconds + file_offset(entry.path) + selected[index].time_offset_seconds)
+                        if entry.effective_start_timestamp is not None else None,
+                        effective_stop_timestamp=(entry.effective_stop_timestamp + self.task.global_time_offset_seconds + file_offset(entry.path) + selected[index].time_offset_seconds)
+                        if entry.effective_stop_timestamp is not None else None,
+                    ) for entry in selection.entries
+                ))
+                for index in range(len(selected))
+            )
             plan = build_slice_execution_plan(selection.matches, chains, selected)
             self._phase("slice", "正在切片并安全写入…")
             result = execute_slice(

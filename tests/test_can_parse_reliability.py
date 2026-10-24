@@ -91,6 +91,31 @@ class ParseWorkerReliabilityTests(unittest.TestCase):
         self.assertEqual(len(finished), 1)
         return finished[0][1], progress, reader
 
+    def test_cancel_stops_reader_without_emitting_partial_parse_results(self):
+        database = load_dbc(
+            "BO_ 256 Cancelled: 1 Vector__XXX\n"
+            " SG_ value : 0|8@1+ (1,0) [0|255] \"\" Vector__XXX\n"
+        )
+        identity = CanFileIdentity(normalized_can_path("input.blf"), 100, 200)
+        worker = baseline.ParseWorker(
+            1, 1, 1, "input.blf", identity, database
+        )
+        finished = []
+        cancelled = []
+        worker.parse_finished.connect(lambda *_args: finished.append(True))
+        worker.parse_cancelled.connect(cancelled.append)
+        reader = FakeReader([frame(0x100, b"\x11")])
+
+        worker.stop()
+        with patch.object(baseline.can, "BLFReader", return_value=reader), patch.object(
+            baseline, "capture_can_file_identity", return_value=identity
+        ), contextlib.redirect_stdout(io.StringIO()):
+            worker.run()
+
+        self.assertTrue(reader.stopped)
+        self.assertEqual(cancelled, [1])
+        self.assertFalse(finished)
+
     def test_classic_can_and_full_can_fd_payload_decode_normally(self):
         database = load_dbc(
             "BO_ 256 Classic: 1 Vector__XXX\n"

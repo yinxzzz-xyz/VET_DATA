@@ -1,5 +1,6 @@
 # Track only the application source tree, tests, and this file.
 /*
+!/Excel工况表使用说明.md
 !/.gitignore
 !/requirements.txt
 !/VET_DATA.spec

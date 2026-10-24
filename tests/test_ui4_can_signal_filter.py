@@ -67,6 +67,8 @@ class CanConfigurationUi4Tests(unittest.TestCase):
         self.assertEqual(self.row.select_protocol_btn.property("uiRole"), "secondary")
         self.assertEqual(self.row.parse_btn.property("uiRole"), "primary")
         self.assertEqual(self.row.protocol_clear_btn.property("uiRole"), "secondary")
+        self.assertEqual(self.row.protocol_clear_btn.text(), "清除")
+        self.assertFalse(self.row.protocol_clear_btn.isEnabled())
 
         requested = []
         renamed = []
@@ -85,6 +87,10 @@ class CanConfigurationUi4Tests(unittest.TestCase):
         self.window.collapsible_groups["CAN通道配置"].setChecked(True)
         self.window.show()
         APP.processEvents()
+        self.assertGreater(
+            self.row.protocol_clear_btn.geometry().x(),
+            self.row.parse_btn.geometry().x(),
+        )
         self.assertGreaterEqual(self.window.bus_scroll.viewport().width(), 300)
         self.assertEqual(self.window.bus_scroll.horizontalScrollBar().maximum(), 0)
 
@@ -113,6 +119,7 @@ class CanConfigurationUi4Tests(unittest.TestCase):
             ("loading", "解析中"),
             ("success", "完成"),
             ("error", "失败"),
+            ("stopped", "解析停止"),
         ):
             self.row.set_status(state)
             self.assertEqual(self.row.status_indicator.text(), text)
@@ -125,6 +132,84 @@ class CanConfigurationUi4Tests(unittest.TestCase):
             "a_very_long_protocol_database_name.dbc",
         )
         self.assertEqual(self.window.arxml2dbc_btn.property("uiRole"), "secondary")
+
+    def test_cancel_stops_worker_and_updates_bus_status(self):
+        class Worker:
+            def __init__(self):
+                self.stopped = False
+
+            def isRunning(self):
+                return True
+
+            def stop(self):
+                self.stopped = True
+
+        worker = Worker()
+        dialog = baseline.ParseProgressDialog(1, self.window)
+        self.window.bus_protocols[1] = "bus1.dbc"
+        self.window.parse_workers[1] = worker
+        self.window._parsing_bus_ids.add(1)
+        self.window.progress_dialogs[1] = dialog
+        dialog.cancel_requested.connect(self.window.cancel_parse_bus)
+        dialog.on_cancel()
+
+        self.assertTrue(worker.stopped)
+        self.assertEqual(self.window.bus_config_widgets[1].status_indicator.text(), "解析停止")
+        self.assertEqual(self.window.can_bus_data[1]["parse_state"], "stopped")
+        self.assertIn(1, self.window._cancelled_parse_buses)
+        self.window.on_parse_cancelled(1)
+        self.assertEqual(dialog.status_label.text(), "⏹ 解析停止")
+        with patch.object(self.window, "register_can_signals") as register:
+            self.window.on_parse_finished(1, {"pool": {"late": {"t": [0], "v": [1]}}})
+        register.assert_not_called()
+        self.assertEqual(self.window.bus_config_widgets[1].status_indicator.text(), "解析停止")
+        dialog.deleteLater()
+
+    def test_clear_protocol_removes_only_its_bus_and_stops_active_parse(self):
+        class Worker:
+            def __init__(self):
+                self.stopped = False
+
+            def isRunning(self):
+                return True
+
+            def stop(self):
+                self.stopped = True
+
+        self.window.bus_protocols.update({1: "bus1.dbc", 2: "bus2.dbc"})
+        self.window.db_per_bus.update({1: {"parsed": True}, 2: {"parsed": True}})
+        self.window.can_bus_data[2] = {"name": "Bus 2", "parse_state": "complete"}
+        self.window.signals.update({
+            "CAN_bus1_speed": {"bus_id": 1},
+            "CAN_bus2_speed": {"bus_id": 2},
+        })
+        self.window.can_parsed_data.update({
+            "CAN_bus1_speed": {"samples": [1]},
+            "CAN_bus2_speed": {"samples": [2]},
+        })
+        self.window.bus_signal_map.update({"CAN_bus1_speed": 1, "CAN_bus2_speed": 2})
+        worker = Worker()
+        self.window.parse_workers[1] = worker
+        self.row.protocol_path = "bus1.dbc"
+        self.row.protocol_label.setText("bus1.dbc")
+        self.row.protocol_clear_btn.setEnabled(True)
+
+        self.row.protocol_clear_btn.click()
+
+        self.assertTrue(worker.stopped)
+        self.assertNotIn(1, self.window.bus_protocols)
+        self.assertEqual(self.row.protocol_label.text(), "未配置")
+        self.assertFalse(self.row.protocol_clear_btn.isEnabled())
+        self.assertNotIn("CAN_bus1_speed", self.window.signals)
+        self.assertIn("CAN_bus2_speed", self.window.signals)
+        self.assertNotIn("CAN_bus1_speed", self.window.can_parsed_data)
+        self.assertIn("CAN_bus2_speed", self.window.can_parsed_data)
+        self.assertEqual(self.window.can_bus_data[1]["parse_state"], "idle")
+        self.assertEqual(self.window.db_per_bus[1], {})
+        self.assertEqual(self.window.bus_config_widgets[1].status_indicator.text(), "就绪")
+        with patch.object(self.window, "register_can_signals") as register:
+            self.window.on_parse_finished(1, {"pool": {"late": {"t": [0], "v": [1]}}})
+        register.assert_not_called()
 
 
 class SignalFilterDialogUi4Tests(unittest.TestCase):
@@ -165,8 +250,13 @@ class SignalFilterDialogUi4Tests(unittest.TestCase):
         self.assertTrue(frame.isExpanded())
 
         self.dialog.search_box.setText("DoorOpen")
-        self.assertEqual(self.dialog.tree.topLevelItemCount(), 1)
-        self.assertIn("BodyFrame", self.dialog.tree.topLevelItem(0).text(0))
+        self.assertTrue(self.dialog._search_timer.isActive())
+        self.assertFalse(self.dialog.frame_items[0x100].isHidden())
+        self.dialog._apply_signal_filter()
+        self.assertEqual(self.dialog.tree.topLevelItemCount(), 2)
+        self.assertTrue(self.dialog.frame_items[0x100].isHidden())
+        self.assertIn("BodyFrame", self.dialog.frame_items[0x200].text(0))
+        self.assertFalse(self.dialog.frame_items[0x200].isHidden())
         self.dialog.select_all_btn.click()
         selected = self.dialog.get_selected_signals_by_frame()
         self.assertEqual(set(selected), {0x100, 0x200})
@@ -176,6 +266,7 @@ class SignalFilterDialogUi4Tests(unittest.TestCase):
         self.dialog.deselect_all_btn.click()
         self.assertEqual(self.dialog.get_selected_signals_by_frame(), {})
         self.dialog.search_box.clear()
+        self.dialog._apply_signal_filter()
         first_signal = self.dialog.tree.topLevelItem(0).child(0)
         self.dialog.on_item_clicked(first_signal, 2)
         self.assertEqual(
@@ -184,6 +275,55 @@ class SignalFilterDialogUi4Tests(unittest.TestCase):
         )
         self.dialog.select_btn.click()
         self.assertEqual(self.dialog.result(), QDialog.DialogCode.Accepted)
+
+    def test_cached_filter_handles_large_list_and_preserves_selection(self):
+        messages = [
+            _message(index, f"Frame{index}", [
+                _signal(f"Signal{index}_{signal_index}", f"comment {signal_index}")
+                for signal_index in range(20)
+            ])
+            for index in range(250)
+        ]
+        dialog = baseline.SignalFilterDialog(
+            SimpleNamespace(messages=messages), "Large bus"
+        )
+        try:
+            item = dialog._signal_item_by_key["125_Signal125_7"]
+            item.setCheckState(0, Qt.CheckState.Checked)
+            dialog.search_box.setText("Signal125_7")
+            dialog.search_box.setText("Signal125")
+            dialog.search_box.setText("Signal125_7")
+            self.assertEqual(dialog._search_pending_text, "Signal125_7")
+            dialog._apply_signal_filter()
+            self.assertIs(dialog._signal_item_by_key["125_Signal125_7"], item)
+            self.assertFalse(item.isHidden())
+            self.assertEqual(
+                sum(not dialog.frame_items[frame_id].isHidden() for frame_id in dialog.frame_items),
+                1,
+            )
+            self.assertTrue(dialog._selected_state["125_Signal125_7"])
+
+            dialog.search_box.clear()
+            self.assertEqual(dialog._search_pending_text, "")
+            dialog._apply_signal_filter()
+            self.assertFalse(item.isHidden())
+            self.assertTrue(dialog._selected_state["125_Signal125_7"])
+            self.assertEqual(len(dialog.signal_items), 5000)
+        finally:
+            dialog.deleteLater()
+            APP.processEvents()
+
+    def test_frame_checkbox_only_changes_signals_visible_in_filter(self):
+        frame = self.dialog.frame_items[0x100]
+        self.dialog.search_box.setText("EngineSpeed")
+        self.dialog._apply_signal_filter()
+        frame.setCheckState(0, Qt.CheckState.Checked)
+        self.assertTrue(self.dialog._selected_state["256_EngineSpeed"])
+        self.assertFalse(
+            self.dialog._selected_state[
+                f"256_{self.long_signal}"
+            ]
+        )
 
 
 if __name__ == "__main__":

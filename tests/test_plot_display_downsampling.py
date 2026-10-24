@@ -83,6 +83,20 @@ class PlotDisplayDownsamplingTests(unittest.TestCase):
         np.testing.assert_array_equal(signal_timestamps, timestamp_snapshot)
         np.testing.assert_array_equal(signal_samples, sample_snapshot)
 
+    def test_large_y_values_expand_axis_and_use_slightly_smaller_tick_font(self):
+        samples = np.linspace(1412.0, 2721.5, 101)
+        plot = self._populate(np.linspace(0.0, 10.0, len(samples)), samples)
+        axis = plot.getPlotItem().getAxis("left")
+        APP.processEvents()
+        plot.grab()
+        APP.processEvents()
+
+        self.assertGreater(axis.width(), 30)
+        self.assertGreaterEqual(axis.width(), axis.textWidth)
+        self.assertIsNotNone(axis.style["tickFont"])
+        self.assertAlmostEqual(axis.style["tickFont"].pointSizeF(), 8.0)
+        self.assertTrue(axis.style["autoExpandTextSpace"])
+
     def test_peak_pulse_step_oscillation_and_nan_gap_visual_semantics(self):
         count = 240_000
         timestamps = np.linspace(0.0, 240.0, count, dtype=np.float64)
