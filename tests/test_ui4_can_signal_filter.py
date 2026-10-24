@@ -49,6 +49,7 @@ class CanConfigurationUi4Tests(unittest.TestCase):
         }
         with patch.object(baseline.QTimer, "singleShot"):
             self.window.create_bus_config_ui()
+        self.window.left_tabs.setCurrentWidget(self.window.can_tab_page)
         self.row = self.window.bus_config_widgets[1]
 
     def tearDown(self):
@@ -56,11 +57,9 @@ class CanConfigurationUi4Tests(unittest.TestCase):
         APP.processEvents()
         self.temporary.cleanup()
 
-    def test_column_structure_and_actions_remain_locatable(self):
-        headers = [
-            item.text() for item in self.window.bus_header.findChildren(QLabel)
-        ]
-        self.assertEqual(headers, ["Bus", "CAN类型", "ID数量", "协议状态", "操作", "状态"])
+    def test_channel_card_fields_and_actions_remain_locatable(self):
+        self.assertIsNone(self.window.bus_header)
+        self.assertEqual(self.row.card_group.objectName(), "busConfigCard1")
         self.assertEqual(self.row.id_label.text(), "Bus 1")
         self.assertEqual(self.row.type_label.text(), "CANFD")
         self.assertEqual(self.row.id_count_label.text(), "2 IDs")
@@ -69,13 +68,14 @@ class CanConfigurationUi4Tests(unittest.TestCase):
         self.assertEqual(self.row.protocol_clear_btn.property("uiRole"), "secondary")
         self.assertEqual(self.row.protocol_clear_btn.text(), "清除")
         self.assertFalse(self.row.protocol_clear_btn.isEnabled())
+        self.assertGreaterEqual(self.row.layout().count(), 1)
+        self.assertEqual(self.row.protocol_label.alignment(), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         requested = []
         renamed = []
         self.row.parse_requested.disconnect()
         self.row.parse_requested.connect(requested.append)
         self.row.bus_id_changed.connect(lambda bus, name: renamed.append((bus, name)))
-        self.window.collapsible_groups["CAN通道配置"].setChecked(True)
         self.row.parse_btn.click()
         self.row.name_edit.setText("PT CAN")
         self.assertEqual(requested, [1])
@@ -83,9 +83,8 @@ class CanConfigurationUi4Tests(unittest.TestCase):
 
     def test_reasonable_width_needs_no_horizontal_scroll(self):
         self.window.resize(1280, 820)
-        self.window.main_splitter.setSizes([440, 840])
-        self.window.collapsible_groups["CAN通道配置"].setChecked(True)
         self.window.show()
+        self.window.main_splitter.setSizes([440, 840])
         APP.processEvents()
         self.assertGreater(
             self.row.protocol_clear_btn.geometry().x(),
@@ -96,9 +95,8 @@ class CanConfigurationUi4Tests(unittest.TestCase):
 
     def test_extreme_width_degrades_to_scroll_without_overlapping_actions(self):
         self.window.resize(850, 700)
-        self.window.main_splitter.setSizes([320, 530])
-        self.window.collapsible_groups["CAN通道配置"].setChecked(True)
         self.window.show()
+        self.window.main_splitter.setSizes([320, 530])
         APP.processEvents()
         buttons = (
             self.row.select_protocol_btn,

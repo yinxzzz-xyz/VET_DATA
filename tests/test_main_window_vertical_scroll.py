@@ -5,6 +5,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QPoint, QRect
 from PyQt6.QtWidgets import QApplication
 
 from vet_data_modular.window import MDFPlotter
@@ -32,68 +33,76 @@ class MainWindowVerticalScrollTests(unittest.TestCase):
         self.window.show()
         APP.processEvents()
 
-    def test_top_actions_use_four_plus_one_two_row_layout(self):
+    def test_fixed_shortcuts_stay_visible_above_the_main_splitter(self):
         self._show_at(1200, 800)
-        top_buttons = (
-            self.window.select_all_button,
-            self.window.deselect_all_button,
-            self.window.save_config_button,
-            self.window.load_config_button,
+        shortcuts = (
+            self.window.load_file_button,
+            self.window.plot_button,
+            self.window.math_channel_button,
+            self.window.single_cursor_button,
+            self.window.dual_cursor_button,
+            self.window.plot_mode_combo,
         )
-
-        self.assertEqual({button.y() for button in top_buttons}, {top_buttons[0].y()})
-        self.assertEqual(self.window.top_action_layout.count(), 4)
-        self.assertTrue(all(button.width() > 0 for button in top_buttons))
-        self.assertLessEqual(max(button.width() for button in top_buttons) - min(
-            button.width() for button in top_buttons
-        ), 1)
-
-        old_three_row_height = sum(
-            (top_buttons[0].sizeHint().height(),
-             self.window.save_config_button.sizeHint().height(),
-             self.window.plot_button.sizeHint().height())
-        ) + self.window.left_panel_content.layout().spacing() * 2
-        new_two_row_height = (
-            max(button.height() for button in top_buttons)
-            + self.window.plot_button.height()
-            + self.window.left_panel_content.layout().spacing()
+        self.assertEqual(self.window.quick_actions_layout.count(), 6)
+        self.assertTrue(all(button.isVisible() and button.width() > 0 for button in shortcuts))
+        self.assertTrue(all(button.height() == 36 for button in shortcuts))
+        self.assertEqual(
+            [self.window.ribbon_tabs.tabText(index) for index in range(self.window.ribbon_tabs.count())],
+            ["文件", "信号管理", "曲线显示", "分析工具", "数据处理", "导出", "视图"],
         )
-        self.assertLess(new_two_row_height, old_three_row_height)
+        for index in range(self.window.ribbon_tabs.count()):
+            self.window.ribbon_tabs.setCurrentIndex(index)
+            APP.processEvents()
+            self.assertTrue(all(button.isVisible() for button in shortcuts))
+        self.assertLess(self.window.ribbon_widget.geometry().bottom(), self.window.main_splitter.geometry().top())
+        self.assertFalse(self.window.ribbon_widget._wrapped)
+        self.assertEqual(
+            self.window.ribbon_tabs.geometry().top(),
+            self.window.quick_actions_widget.geometry().top(),
+        )
+        for button in shortcuts:
+            top_left = button.mapTo(self.window.quick_actions_widget, QPoint(0, 0))
+            self.assertTrue(
+                self.window.quick_actions_widget.rect().contains(
+                    QRect(top_left, button.size())
+                )
+            )
 
     def test_narrow_top_actions_do_not_overlap_and_remain_operable(self):
         self._show_at(850, 620)
         self.window.main_splitter.setSizes([320, 530])
         APP.processEvents()
         buttons = (
-            self.window.select_all_button,
-            self.window.deselect_all_button,
-            self.window.save_config_button,
-            self.window.load_config_button,
+            self.window.load_file_button,
+            self.window.plot_button,
+            self.window.math_channel_button,
+            self.window.single_cursor_button,
+            self.window.dual_cursor_button,
+            self.window.plot_mode_combo,
         )
-        self.assertTrue(all(button.isVisible() and button.width() >= 55 for button in buttons))
+        self.assertTrue(self.window.ribbon_widget._wrapped)
+        self.assertTrue(all(button.isVisible() and button.width() >= 32 for button in buttons))
+        self.assertTrue(all(button.height() == 36 for button in buttons))
         for left, right in zip(buttons, buttons[1:]):
             self.assertFalse(left.geometry().intersects(right.geometry()))
-        self.assertLessEqual(buttons[-1].geometry().right(), self.window.left_panel_content.width())
+        self.assertLessEqual(
+            buttons[-1].mapTo(self.window, buttons[-1].rect().bottomRight()).x(),
+            self.window.width(),
+        )
 
-    def test_expanded_sections_scroll_to_access_bottom_actions(self):
-        for title in ("CAN通道配置", "GPS轨迹图"):
-            self.window.collapsible_groups[title].setChecked(True)
+    def test_gps_controls_live_in_view_ribbon_without_using_left_panel_space(self):
         self._show_at(900, 430)
-
-        bar = self.window.left_panel_scroll.verticalScrollBar()
-        self.assertGreater(bar.maximum(), 0)
-        bar.setValue(bar.maximum())
+        self.assertNotIn("GPS轨迹图", self.window.collapsible_groups)
+        self.assertFalse(self.window.show_map_button.isChecked())
+        self.window.ribbon_tabs.setCurrentWidget(self.window.view_ribbon_page)
         APP.processEvents()
-
-        viewport_rect = self.window.left_panel_scroll.viewport().rect()
-        for button in (
-            self.window.math_channel_button,
-            self.window.blf_slice_button,
-        ):
-            center = button.mapTo(self.window.left_panel_scroll.viewport(), button.rect().center())
-            self.assertTrue(button.isVisible())
-            self.assertTrue(viewport_rect.contains(center), button.text())
-            self.assertTrue(button.isEnabled() or not self.window.signals)
+        self.assertTrue(self.window.lat_combo.isVisible())
+        self.assertTrue(self.window.lon_combo.isVisible())
+        self.assertTrue(self.window.show_map_button.isVisible())
+        self.assertTrue(self.window.math_channel_button.isVisible())
+        self.window.ribbon_tabs.setCurrentWidget(self.window.processing_ribbon_page)
+        APP.processEvents()
+        self.assertTrue(self.window.blf_slice_button.isVisible())
 
 
 if __name__ == "__main__":

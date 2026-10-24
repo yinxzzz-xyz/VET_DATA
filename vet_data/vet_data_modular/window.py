@@ -10,7 +10,7 @@ from uuid import uuid4
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
     QDialog, QFileDialog, QGroupBox, QInputDialog, QLabel, QMessageBox, QPushButton,
-    QScrollArea, QSplitter,
+    QScrollArea, QSplitter, QTabWidget,
 )
 
 from .blf_slice_dialog import BlfSliceDialog
@@ -75,7 +75,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._can_task_generation = 0
         self._reusable_can_config = None
         self._selected_can_config = {}
-        self.math_channel_button.setText("➕ 创建自定义公式计算通道")
+        self.math_channel_button.setText("公式")
         self.math_channel_button.setToolTip("使用多信号公式、数学函数、导数和积分创建通道")
         self._setup_signal_panel(); self._setup_plot_panel(); self._setup_collapsible_panels()
         self._setup_blf_slice_entry()
@@ -96,15 +96,14 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             tokens.spacing.small, tokens.spacing.small,
         )
         self.left_panel_content.layout().setSpacing(tokens.spacing.small)
-        self.top_action_layout.setSpacing(tokens.spacing.xsmall)
-        self.top_primary_action_layout.setSpacing(tokens.spacing.xsmall)
-        self.bottom_action_layout.setSpacing(tokens.spacing.xsmall)
+        self.quick_actions_layout.setSpacing(tokens.spacing.xsmall)
         self.search_box.setProperty("uiControl", "main")
         self.search_box.setStyleSheet("")
+        self.plot_mode_combo.setProperty("uiControl", "main")
         self.current_file_label.setProperty("uiTextRole", "secondary")
         self.main_splitter.setProperty("uiSplitter", "main")
         for group in self.findChildren(QGroupBox):
-            if group.title() in {"可用信号", "CAN通道配置", "GPS轨迹图", "信号曲线"}:
+            if group.title() in {"可用信号", "CAN通道配置", "信号曲线"}:
                 group.setProperty("uiPanel", "main")
                 group.setStyleSheet("")
         primary_buttons = (self.load_file_button, self.plot_button)
@@ -113,7 +112,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             self.save_config_button, self.load_config_button,
             self.math_channel_button, self.export_button,
             self.save_data_button, self.blf_slice_button,
-            self.show_map_button, self.arxml2dbc_btn,
+            self.arxml2dbc_btn,
         )
         for button in primary_buttons:
             button.setProperty("uiRole", "primary")
@@ -121,6 +120,24 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         for button in secondary_buttons:
             button.setProperty("uiRole", "secondary")
             button.setStyleSheet("")
+        self.show_map_button.setProperty("uiRole", "stateToggle")
+        for shortcut in (
+            self.load_file_button, self.plot_button, self.math_channel_button,
+            self.single_cursor_button, self.dual_cursor_button,
+            self.plot_mode_combo,
+        ):
+            shortcut.setFixedHeight(36)
+        self._update_cursor_button_icons()
+
+    def _update_cursor_button_icons(self):
+        inactive = DEFAULT_THEME.colors.text_primary
+        active = DEFAULT_THEME.colors.surface
+        self.single_cursor_button.setIcon(baseline._quick_action_icon(
+            "single", active if self.single_cursor_button.isChecked() else inactive
+        ))
+        self.dual_cursor_button.setIcon(baseline._quick_action_icon(
+            "dual", active if self.dual_cursor_button.isChecked() else inactive
+        ))
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -815,10 +832,11 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.blf_slice_button = QPushButton("BLF 工况切片")
         self.blf_slice_button.setToolTip("独立选择 BLF 和工况表并执行自动切片")
         self.blf_slice_button.clicked.connect(self.open_blf_slice_dialog)
-        layout = self._find_layout_containing(self.layout(), self.math_channel_button)
-        if layout is None:
-            raise RuntimeError("无法定位主窗口底部操作区")
-        layout.addWidget(self.blf_slice_button, 1)
+        self.blf_slice_button.setProperty("uiRole", "secondary")
+        self.processing_ribbon_layout.insertWidget(
+            max(0, self.processing_ribbon_layout.count() - 1),
+            self.blf_slice_button,
+        )
 
     @classmethod
     def _find_layout_containing(cls, layout, widget):
@@ -847,6 +865,13 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                     splitter_child = child.widget(child_index)
                     found = cls._find_layout_containing(
                         splitter_child.layout(), widget
+                    )
+                    if found is not None:
+                        return found
+            if isinstance(child, QTabWidget):
+                for page_index in range(child.count()):
+                    found = cls._find_layout_containing(
+                        child.widget(page_index).layout(), widget
                     )
                     if found is not None:
                         return found
@@ -954,7 +979,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         if suffix in {".blf", ".asc", ".trc"}:
             self._add_pending_selection_rows()
             self._formula_context_generation += 1
-            self.mdf_path = path; self.current_file_label.setText(f"当前文件: {Path(path).name}")
+            self.mdf_path = path; self.set_current_file_status(path)
             self.can_bus_data.clear()
             self.can_bus_mapping = None
             self.set_buttons_enabled(False)
@@ -1029,6 +1054,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             record["ui_key"] = key
 
     def _clear_current_can_state(self):
+        self._clear_cursor_positions_for_data_change()
         for worker in tuple(getattr(self, "parse_workers", {}).values()):
             try:
                 if worker.isRunning():
@@ -1060,6 +1086,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._set_plot_empty_state("新文件尚未解析，等待 CAN 探测和信号解析")
 
     def _clear_can_parse_results_keep_detection(self):
+        self._clear_cursor_positions_for_data_change()
         for worker in tuple(self.parse_workers.values()):
             try:
                 if worker.isRunning():
@@ -1095,7 +1122,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._formula_context_generation += 1
         self._can_task_generation += 1
         self.mdf_path = result.path; self.mdf_file = result.data
-        self.current_file_label.setText(f"当前文件: {Path(result.path).name}")
+        self.set_current_file_status(result.path)
         self.signals.clear(); self.signals.update(result.signals)
         self.can_parsed_data.clear(); self.bus_signal_map.clear(); self.custom_math_data.clear()
         self.calculated_signal_definitions.clear()
@@ -1173,9 +1200,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                 self.can_bus_data[bus_id]["parse_error"] = "DBC 不存在或不可读"
                 self._complete_pending_signal_restore(bus_id)
         if Path(self.mdf_path).suffix.casefold() == ".blf":
-            can_group = self.collapsible_groups.get("CAN通道配置")
-            if can_group is not None:
-                can_group.setChecked(True)
+            self.left_tabs.setCurrentWidget(self.can_tab_page)
 
     def _fail_can_bus_detection(self, message, generation, worker):
         if not self._is_current_can_detection(generation, worker):
@@ -1187,7 +1212,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         if not self._is_current_can_detection(generation, worker):
             return
         self.can_detection_snapshot = None
-        self.current_file_label.setText("当前文件: 未选择")
+        self.set_current_file_status()
 
     def _cleanup_can_bus_detection(self, generation, worker, dialog):
         if not self._is_current_can_detection(generation, worker):

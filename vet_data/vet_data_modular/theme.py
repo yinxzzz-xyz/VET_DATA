@@ -79,7 +79,7 @@ THEME_NAME = "default-light"
 def build_application_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
     """Return conservative application defaults; local legacy QSS still wins."""
     c, f = theme.colors, theme.fonts
-    return f"""
+    stylesheet = f"""
 QWidget {{
     color: {c.text_primary};
     font-size: {f.body}px;
@@ -101,6 +101,7 @@ QToolTip {{
     border: 1px solid {c.border};
 }}
 """.strip()
+    return _append_action_button_stylesheet(stylesheet, theme)
 
 
 def semantic_button_stylesheet(
@@ -108,31 +109,81 @@ def semantic_button_stylesheet(
 ) -> str:
     """Return reusable QSS for a semantic action button."""
     colors = theme.colors
-    role_colors = {
-        "primary": colors.primary,
-        "secondary": colors.secondary,
-        "danger": colors.danger,
-        "success": colors.success,
-        "warning": colors.warning,
-    }
-    try:
-        background = role_colors[role]
-    except KeyError as exc:
-        raise ValueError(f"unknown semantic button role: {role}") from exc
+    if role not in {"primary", "secondary", "danger", "success", "warning"}:
+        raise ValueError(f"unknown semantic button role: {role}")
     controls, padding = theme.controls, theme.padding
-    return f"""
+    stylesheet = f"""
 QPushButton {{
     min-height: {controls.standard_height}px;
     padding: {padding.compact}px {padding.standard}px;
-    border: 1px solid {background};
+    border: 1px solid {colors.border};
     border-radius: {controls.corner_radius}px;
+    color: {colors.text_primary};
+    background-color: {colors.surface};
+}}
+QPushButton:hover {{ background-color: {colors.background}; }}
+QPushButton:pressed {{ background-color: {colors.disabled_background}; }}
+QPushButton[uiRole="stateToggle"] {{
+    color: {colors.text_primary};
+    background-color: {colors.disabled_background};
+    border-color: {colors.border};
+}}
+QPushButton[uiRole="stateToggle"]:checked {{
     color: {colors.surface};
-    background-color: {background};
+    background-color: {colors.primary};
+    border-color: {colors.primary};
 }}
 QPushButton:disabled {{
     color: {colors.disabled_text};
     background-color: {colors.disabled_background};
     border-color: {colors.border};
+}}
+""".strip()
+    return _append_action_button_stylesheet(stylesheet, theme)
+
+
+def _append_action_button_stylesheet(stylesheet: str, theme: ThemeTokens) -> str:
+    """Apply shared button colors while keeping stateful roles distinct."""
+    c = theme.colors
+    return f"""{stylesheet}
+QPushButton {{
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+}}
+QPushButton:hover {{ background-color: {c.background}; }}
+QPushButton:pressed {{ background-color: {c.disabled_background}; }}
+QPushButton:disabled {{
+    color: {c.disabled_text};
+    background-color: {c.disabled_background};
+    border-color: {c.border};
+}}
+QPushButton[uiRole="primary"], QPushButton[uiRole="secondary"],
+QPushButton[uiRole="formulaFunction"] {{
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border-color: {c.border};
+}}
+QPushButton[uiRole="primary"]:hover, QPushButton[uiRole="secondary"]:hover,
+QPushButton[uiRole="formulaFunction"]:hover {{ background-color: {c.background}; }}
+QPushButton[uiRole="primary"]:pressed, QPushButton[uiRole="secondary"]:pressed,
+QPushButton[uiRole="formulaFunction"]:pressed {{ background-color: {c.disabled_background}; }}
+QPushButton[uiRole="stateToggle"], QPushButton[uiRole="signalView"] {{
+    color: {c.text_primary};
+    background-color: {c.disabled_background};
+    border-color: {c.border};
+}}
+QPushButton[uiRole="stateToggle"]:checked, QPushButton[uiRole="signalView"]:checked {{
+    color: {c.surface};
+    background-color: {c.primary};
+    border-color: {c.primary};
+}}
+QPushButton[uiRole="primary"]:disabled, QPushButton[uiRole="secondary"]:disabled,
+QPushButton[uiRole="formulaFunction"]:disabled, QPushButton[uiRole="stateToggle"]:disabled,
+QPushButton[uiRole="signalView"]:disabled {{
+    color: {c.disabled_text};
+    background-color: {c.disabled_background};
+    border-color: {c.border};
 }}
 """.strip()
 
@@ -141,7 +192,7 @@ def build_main_window_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
     """Return compact, token-driven rules scoped by main-window properties."""
     c, f = theme.colors, theme.fonts
     controls, spacing, padding = theme.controls, theme.spacing, theme.padding
-    return f"""
+    stylesheet = f"""
 QWidget[uiSurface="main"] {{
     background-color: {c.background};
 }}
@@ -162,6 +213,34 @@ QLineEdit[uiControl="main"] {{
     background-color: {c.surface};
     border: 1px solid {c.border};
     border-radius: {controls.corner_radius}px;
+}}
+QComboBox[uiControl="main"] {{
+    min-height: {controls.standard_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+}}
+QTabWidget#mainFunctionalTabs::pane {{
+    border: 1px solid {c.border};
+    background-color: {c.surface};
+}}
+QTabWidget#mainFunctionalTabs QTabBar::tab {{
+    min-height: {controls.compact_height}px;
+    padding: 0 {padding.standard}px;
+    color: {c.text_secondary};
+    background-color: {c.background};
+    border: 1px solid {c.border};
+}}
+QTabWidget#mainFunctionalTabs QTabBar::tab:selected {{
+    color: {c.primary};
+    background-color: {c.surface};
+    border-bottom-color: {c.surface};
+    font-weight: 600;
+}}
+QWidget#mainQuickActions {{
+    background-color: {c.surface};
 }}
 QPushButton[uiRole="primary"] {{
     min-height: {controls.standard_height}px;
@@ -212,16 +291,30 @@ QSplitter[uiSplitter="main"]::handle {{
     background-color: {c.border};
 }}
 """.strip()
+    return _append_action_button_stylesheet(stylesheet, theme)
 
 
 def build_can_config_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
     """Return compact token-driven rules for CAN configuration rows."""
     c, f = theme.colors, theme.fonts
     controls, padding = theme.controls, theme.padding
-    return f"""
+    stylesheet = f"""
 QWidget[uiCanRow="true"] {{
+    background-color: transparent;
+}}
+QGroupBox[uiCanCard="true"] {{
+    color: {c.text_primary};
     background-color: {c.surface};
-    border-bottom: 1px solid {c.border};
+    border: 1px solid {c.border};
+    border-radius: 6px;
+    margin-top: 8px;
+    padding-top: 4px;
+}}
+QGroupBox[uiCanCard="true"]::title {{
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+    color: {c.text_secondary};
 }}
 QWidget[uiCanHeader="true"] {{
     background-color: {c.background};
@@ -280,13 +373,14 @@ QPushButton:disabled {{
     border-color: {c.border};
 }}
 """.strip()
+    return _append_action_button_stylesheet(stylesheet, theme)
 
 
 def build_signal_filter_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
     """Return dense, neutral styling for the signal filter dialog."""
     c, f = theme.colors, theme.fonts
     controls, padding = theme.controls, theme.padding
-    return f"""
+    stylesheet = f"""
 QDialog {{ background-color: {c.background}; }}
 QLabel[uiTextRole="summary"] {{
     color: {c.text_primary};
@@ -344,13 +438,14 @@ QHeaderView::section {{
     font-weight: 600;
 }}
 """.strip()
+    return _append_action_button_stylesheet(stylesheet, theme)
 
 
 def build_formula_editor_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
     """Return token-driven styling for the formula definition workflow."""
     c, f = theme.colors, theme.fonts
     controls, padding = theme.controls, theme.padding
-    return f"""
+    stylesheet = f"""
 QDialog[uiDialog="formulaEditor"] {{ background-color: {c.background}; }}
 QWidget[uiFormulaSection="true"] {{
     background-color: {c.surface};
@@ -417,13 +512,14 @@ QSplitter[uiFormulaSplitter="true"]::handle {{
     width: {theme.spacing.xsmall}px;
 }}
 """.strip()
+    return _append_action_button_stylesheet(stylesheet, theme)
 
 
 def build_blf_slice_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
     """Return compact shared styling for the BLF slicing dialog family."""
     c, f = theme.colors, theme.fonts
     controls, padding, spacing = theme.controls, theme.padding, theme.spacing
-    return f"""
+    stylesheet = f"""
 QDialog[uiDialog="blfSlice"] {{ background-color: {c.background}; }}
 QGroupBox[uiBlfSection="true"] {{
     color: {c.text_primary};
@@ -510,13 +606,14 @@ QProgressBar::chunk {{ background-color: {c.primary}; }}
 QRadioButton {{ color: {c.text_primary}; font-size: {f.body}px; }}
 QScrollArea {{ border: none; background-color: transparent; }}
 """.strip()
+    return _append_action_button_stylesheet(stylesheet, theme)
 
 
 def build_arxml_converter_stylesheet(theme: ThemeTokens = DEFAULT_THEME) -> str:
     """Return token-driven styling for the embedded ARXML-to-DBC tool."""
     c, f = theme.colors, theme.fonts
     controls, padding, spacing = theme.controls, theme.padding, theme.spacing
-    return f"""
+    stylesheet = f"""
 QDialog[uiDialog="arxmlConverter"] {{ background-color: {c.background}; }}
 QLabel[uiArxmlTitle="true"] {{
     color: {c.text_primary};
@@ -595,6 +692,7 @@ QTextEdit[uiArxmlLog="true"] {{
     font-size: {f.small}px;
 }}
 """.strip()
+    return _append_action_button_stylesheet(stylesheet, theme)
 
 
 def apply_application_theme(

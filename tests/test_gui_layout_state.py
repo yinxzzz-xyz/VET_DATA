@@ -8,11 +8,9 @@ from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtWidgets import QApplication, QGroupBox, QSplitter
 
 from vet_data_modular.gui_state import (
-    CAN_PANEL_EXPANDED_KEY,
     DEFAULT_GEOMETRY,
     DEFAULT_SPLITTER_SIZES,
     GEOMETRY_KEY,
-    GPS_PANEL_EXPANDED_KEY,
     HORIZONTAL_SPLITTER_SIZES_KEY,
     MIN_LEFT_WIDTH,
     MIN_RIGHT_WIDTH,
@@ -107,7 +105,6 @@ class MainWindowLayoutStateTests(unittest.TestCase):
             set(self.settings.allKeys()),
             {
                 GEOMETRY_KEY, HORIZONTAL_SPLITTER_SIZES_KEY,
-                CAN_PANEL_EXPANDED_KEY, GPS_PANEL_EXPANDED_KEY,
             },
         )
 
@@ -131,13 +128,11 @@ class MainWindowLayoutStateTests(unittest.TestCase):
         self.assertGreaterEqual(left, MIN_LEFT_WIDTH)
         self.assertGreaterEqual(right, MIN_RIGHT_WIDTH)
 
-    def test_existing_vertical_splitter_is_preserved(self):
-        splitter = self.window.left_splitter
-        self.assertEqual(splitter.orientation(), Qt.Orientation.Vertical)
-        self.assertFalse(splitter.childrenCollapsible())
+    def test_left_management_tabs_preserve_the_three_existing_panels(self):
+        self.assertEqual(self.window.left_tabs.count(), 3)
         self.assertEqual(
-            [splitter.widget(index).title() for index in range(splitter.count())],
-            ["可用信号", "CAN通道配置"],
+            [self.window.left_tabs.tabText(index) for index in range(self.window.left_tabs.count())],
+            ["可用信号", "已选信号", "CAN 配置"],
         )
 
     def test_resize_and_splitter_move_preserve_critical_gui_state(self):

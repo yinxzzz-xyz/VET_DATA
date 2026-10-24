@@ -10,7 +10,7 @@ from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtWidgets import QApplication, QGroupBox
 
 from vet_data_modular.gui_state import (
-    CAN_PANEL_EXPANDED_KEY, GPS_PANEL_EXPANDED_KEY,
+    CAN_PANEL_EXPANDED_KEY,
 )
 from vet_data_modular.theme import DEFAULT_THEME, build_main_window_stylesheet
 from vet_data_modular.window import MDFPlotter
@@ -45,24 +45,26 @@ class UiFixLayout2Tests(unittest.TestCase):
         )
 
     def test_default_panels_and_saved_state_restore(self):
-        self.assertFalse(self._group("CAN通道配置").isChecked())
-        self.assertFalse(self._group("GPS轨迹图").isChecked())
+        self.assertFalse(self._group("CAN通道配置").isCheckable())
         self.assertFalse(self._group("可用信号").isCheckable())
+        self.assertNotIn("GPS轨迹图", self.window.collapsible_groups)
+        self.assertFalse(self.window.show_map_button.isChecked())
 
         self.settings.setValue(CAN_PANEL_EXPANDED_KEY, True)
-        self.settings.setValue(GPS_PANEL_EXPANDED_KEY, False)
         restored = MDFPlotter(gui_settings=self.settings)
         try:
-            self.assertTrue(restored.collapsible_groups["CAN通道配置"].isChecked())
-            self.assertFalse(restored.collapsible_groups["GPS轨迹图"].isChecked())
+            self.assertFalse(next(
+                group for group in restored.findChildren(QGroupBox)
+                if group.title() == "CAN通道配置"
+            ).isCheckable())
+            self.assertNotIn("GPS轨迹图", restored.collapsible_groups)
         finally:
             restored.deleteLater()
 
-    def test_successful_blf_message_scan_expands_can_panel_only_for_blf(self):
+    def test_successful_blf_message_scan_keeps_can_page_available(self):
         worker = object()
         self.window._can_detection_generation = 7
         self.window._can_bus_detection_worker = worker
-        can_group = self.window.collapsible_groups["CAN通道配置"]
 
         class DetectionResult(dict):
             def __init__(self, path):
@@ -76,18 +78,16 @@ class UiFixLayout2Tests(unittest.TestCase):
             self.window, "create_bus_config_ui"
         ):
             self.window.mdf_path = os.path.join(self.temporary.name, "capture.BLF")
-            can_group.setChecked(False)
             self.window._finish_can_bus_detection(
                 DetectionResult(self.window.mdf_path), 7, worker
             )
-            self.assertTrue(can_group.isChecked())
+            self.assertFalse(self._group("CAN通道配置").isCheckable())
 
             self.window.mdf_path = os.path.join(self.temporary.name, "capture.asc")
-            can_group.setChecked(False)
             self.window._finish_can_bus_detection(
                 DetectionResult(self.window.mdf_path), 7, worker
             )
-            self.assertFalse(can_group.isChecked())
+            self.assertFalse(self._group("CAN通道配置").isCheckable())
 
     def test_signal_view_checked_text_is_white_and_unchecked_is_normal(self):
         for mode, active, inactive in (
@@ -122,25 +122,38 @@ class UiFixLayout2Tests(unittest.TestCase):
         self.assertIn(f"color: {DEFAULT_THEME.colors.disabled_text};", disabled_rule)
 
     def test_actions_are_reused_in_requested_top_and_bottom_rows(self):
-        top = self.window.top_primary_action_layout
-        bottom = self.window.bottom_action_layout
+        shortcuts = (
+            self.window.load_file_button, self.window.plot_button,
+            self.window.math_channel_button, self.window.single_cursor_button,
+            self.window.dual_cursor_button,
+            self.window.plot_mode_combo,
+        )
+        self.assertEqual(self.window.quick_actions_layout.count(), 6)
         self.assertEqual(
-            [top.itemAt(index).widget() for index in range(top.count())],
-            [self.window.plot_button, self.window.export_button, self.window.save_data_button],
+            [self.window.quick_actions_layout.itemAt(index).widget() for index in range(6)],
+            list(shortcuts),
         )
         self.assertEqual(
-            [bottom.itemAt(index).widget() for index in range(bottom.count())],
-            [self.window.math_channel_button, self.window.blf_slice_button],
+            [self.window.load_file_button.text(), self.window.plot_button.text(),
+             self.window.math_channel_button.text()],
+            ["", "", "公式"],
         )
-        self.assertEqual(
-            {button.y() for button in (
-                self.window.plot_button, self.window.export_button,
-                self.window.save_data_button,
-            )},
-            {self.window.plot_button.y()},
+        self.assertEqual(self.window.load_file_button.toolTip(), "打开文件")
+        self.assertEqual(self.window.plot_button.toolTip(), "绘制曲线")
+        self.assertTrue(self.window.math_channel_button.toolTip())
+        self.assertEqual(self.window.plot_mode_combo.currentData(), "independent")
+        self.assertEqual(self.window.plot_mode_combo.count(), 2)
+        self.assertFalse(self.window.single_cursor_button.isChecked())
+        self.assertFalse(self.window.dual_cursor_button.isChecked())
+        self.assertIn(
+            self.window.save_data_button,
+            [self.window.processing_ribbon_layout.itemAt(index).widget()
+             for index in range(self.window.processing_ribbon_layout.count())],
         )
-        self.assertEqual(
-            self.window.math_channel_button.y(), self.window.blf_slice_button.y()
+        self.assertIn(
+            self.window.export_button,
+            [self.window.export_ribbon_layout.itemAt(index).widget()
+             for index in range(self.window.export_ribbon_layout.count())],
         )
         self.assertIsNotNone(
             self.window._find_layout_containing(
@@ -149,7 +162,7 @@ class UiFixLayout2Tests(unittest.TestCase):
         )
         self.assertIsNotNone(
             self.window._find_layout_containing(
-                self.window.layout(), self.window.math_channel_button
+                self.window.layout(), self.window.blf_slice_button
             )
         )
 
@@ -168,30 +181,35 @@ class UiFixLayout2Tests(unittest.TestCase):
         self.assertGreater(
             self.window.blf_slice_button.receivers(self.window.blf_slice_button.clicked), 0
         )
+        self.assertTrue(all(button.isVisible() for button in (
+            self.window.load_file_button, self.window.plot_button,
+            self.window.math_channel_button, self.window.single_cursor_button,
+            self.window.dual_cursor_button,
+            self.window.plot_mode_combo,
+        )))
 
-    def test_narrow_layout_does_not_overlap_and_still_scrolls_to_bottom(self):
+    def test_narrow_layout_keeps_shortcuts_visible_and_left_panel_scrolls(self):
         self.window.resize(850, 430)
         self.window.main_splitter.setSizes([320, 530])
-        self.window.collapsible_groups["CAN通道配置"].setChecked(True)
-        self.window.collapsible_groups["GPS轨迹图"].setChecked(True)
         APP.processEvents()
 
-        for buttons in (
-            (self.window.plot_button, self.window.export_button, self.window.save_data_button),
-            (self.window.math_channel_button, self.window.blf_slice_button),
-        ):
-            for left, right in zip(buttons, buttons[1:]):
-                self.assertFalse(left.geometry().intersects(right.geometry()))
-            self.assertTrue(all(button.width() > 0 for button in buttons))
+        quick_buttons = (
+            self.window.load_file_button, self.window.plot_button,
+            self.window.math_channel_button, self.window.single_cursor_button,
+            self.window.dual_cursor_button,
+            self.window.plot_mode_combo,
+        )
+        self.assertTrue(all(button.isVisible() and button.width() >= 55 for button in quick_buttons))
+        for left, right in zip(quick_buttons, quick_buttons[1:]):
+            self.assertFalse(left.geometry().intersects(right.geometry()))
 
-        bar = self.window.left_panel_scroll.verticalScrollBar()
-        self.assertGreater(bar.maximum(), 0)
-        bar.setValue(bar.maximum())
+        self.window.ribbon_tabs.setCurrentWidget(self.window.view_ribbon_page)
         APP.processEvents()
-        viewport = self.window.left_panel_scroll.viewport()
-        for button in (self.window.math_channel_button, self.window.blf_slice_button):
-            center = button.mapTo(viewport, button.rect().center())
-            self.assertTrue(viewport.rect().contains(center), button.text())
+        self.assertTrue(self.window.lat_combo.isVisible())
+        self.assertTrue(self.window.show_map_button.isVisible())
+        self.window.ribbon_tabs.setCurrentWidget(self.window.processing_ribbon_page)
+        APP.processEvents()
+        self.assertTrue(self.window.blf_slice_button.isVisible())
 
 
 if __name__ == "__main__":

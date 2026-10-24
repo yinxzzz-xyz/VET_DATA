@@ -29,8 +29,10 @@ class ModularSmokeTests(unittest.TestCase):
         self.assertEqual(self.window.height_spin.minimum(), 80)
         self.assertEqual(self.window.height_spin.maximum(), 900)
         titles = {g.title(): g for g in self.window.findChildren(QGroupBox)}
-        self.assertTrue(titles["CAN通道配置"].isCheckable())
-        self.assertTrue(titles["GPS轨迹图"].isCheckable())
+        self.assertFalse(titles["CAN通道配置"].isCheckable())
+        self.assertFalse(self.window.bus_scroll.isHidden())
+        self.assertNotIn("GPS轨迹图", titles)
+        self.assertFalse(self.window.show_map_button.isChecked())
 
     def test_selection_search_and_order(self):
         self.window.signals.update({

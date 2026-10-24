@@ -64,13 +64,19 @@ class ThemeTokenTests(unittest.TestCase):
             DEFAULT_THEME.colors.disabled_text,
         ):
             self.assertIn(value, stylesheet)
+        self.assertIn("QPushButton", stylesheet)
+        self.assertIn(DEFAULT_THEME.colors.surface, stylesheet)
+        self.assertIn(DEFAULT_THEME.colors.text_primary, stylesheet)
+        self.assertIn('QPushButton[uiRole="stateToggle"]:checked', stylesheet)
 
     def test_semantic_button_styles_cover_every_action_role(self):
         colors = DEFAULT_THEME.colors
         for role in ("primary", "secondary", "danger", "success", "warning"):
             stylesheet = semantic_button_stylesheet(role)
-            self.assertIn(getattr(colors, role), stylesheet)
+            self.assertIn(colors.surface, stylesheet)
+            self.assertIn(colors.text_primary, stylesheet)
             self.assertIn(str(DEFAULT_THEME.controls.standard_height), stylesheet)
+            self.assertIn(colors.disabled_background, stylesheet)
         with self.assertRaisesRegex(ValueError, "unknown semantic button role"):
             semantic_button_stylesheet("unsupported")
 
@@ -91,7 +97,7 @@ class ThemeGuiRegressionTests(unittest.TestCase):
         window = MDFPlotter()
         try:
             titles = {group.title() for group in window.findChildren(QGroupBox)}
-            self.assertTrue({"可用信号", "CAN通道配置", "GPS轨迹图", "信号曲线"} <= titles)
+            self.assertTrue({"可用信号", "CAN通道配置", "信号曲线"} <= titles)
             self.assertEqual(window.blf_slice_button.text(), "BLF 工况切片")
             window.signals["raw"] = {
                 "name": "raw", "display_name": "Raw", "comment": "",

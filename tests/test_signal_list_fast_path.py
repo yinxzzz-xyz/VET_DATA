@@ -180,6 +180,40 @@ class SignalListFastPathTests(unittest.TestCase):
         self.assertNotIn("sig_00001", after_delete)
         self.assertIsNot(after_delete["sig_00000"], previous)
 
+    def test_redundant_bus_suffix_is_removed_only_from_matching_prefixed_display_name(self):
+        self.window.can_bus_data.update({
+            1: {"name": "Bus 1"},
+            2: {"name": "Bus 2"},
+        })
+        self.window.signals = {
+            "CAN_1_SPEED": signal_info(
+                1, bus_id=1, display_name="bus1 — Speed[bus 1]"
+            ),
+            "CAN_2_TEMP": signal_info(
+                2, bus_id=2, display_name="BUS 2 – Temp [BUS 2]"
+            ),
+            "CAN_1_CUSTOM": signal_info(
+                3, bus_id=1, display_name="Speed[bus 2]"
+            ),
+            "raw_speed": signal_info(
+                4, bus_id=None, display_name="Speed"
+            ),
+        }
+        self.window.refresh_signal_list_ui()
+        items = self.items()
+        self.assertEqual(items["CAN_1_SPEED"].data(NAME_ROLE), "bus1 — Speed")
+        self.assertEqual(items["CAN_2_TEMP"].data(NAME_ROLE), "BUS 2 – Temp")
+        self.assertEqual(items["CAN_1_CUSTOM"].data(NAME_ROLE), "Speed[bus 2]")
+        self.assertEqual(items["raw_speed"].data(NAME_ROLE), "Speed")
+        items["CAN_1_SPEED"].setCheckState(Qt.CheckState.Checked)
+        APP.processEvents()
+        selected_item = next(
+            self.window.selected_signal_list_widget.item(row)
+            for row in range(self.window.selected_signal_list_widget.count())
+            if self.window.selected_signal_list_widget.item(row).data(KEY_ROLE) == "CAN_1_SPEED"
+        )
+        self.assertEqual(selected_item.data(NAME_ROLE), "bus1 — Speed")
+
     def test_bus_rename_batch_scales_from_one_to_many_signals(self):
         for count in (1, 1000):
             with self.subTest(count=count):

@@ -195,7 +195,8 @@ class FormulaEditorMainWindowTests(unittest.TestCase):
                 self.window.create_math_channel()
 
     def test_official_button_opens_formula_editor_and_creates_basic_channel(self):
-        self.assertIn("自定义公式", self.window.math_channel_button.text())
+        self.assertEqual(self.window.math_channel_button.text(), "公式")
+        self.assertTrue(self.window.math_channel_button.toolTip())
         dialog = self._dialog("Sum", "S001+S002", ["A", "B"], "kW")
         self._create(dialog, via_button=True)
         created = list(self.window.calculated_signal_definitions)

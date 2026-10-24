@@ -10,7 +10,6 @@ from PyQt6.QtWidgets import QApplication, QGroupBox
 
 from vet_data_modular.gui_state import (
     CAN_PANEL_EXPANDED_KEY,
-    GPS_PANEL_EXPANDED_KEY,
     restore_collapsible_panel_state,
 )
 from vet_data_modular.theme import DEFAULT_THEME
@@ -43,54 +42,44 @@ class MainWindowUi3Tests(unittest.TestCase):
             if group.title() == title
         )
 
-    def test_can_and_gps_default_collapsed_while_signals_stay_expanded(self):
+    def test_can_card_is_not_checkable_and_gps_controls_are_not_in_left_panel(self):
         signal = self._group("可用信号")
         can = self._group("CAN通道配置")
-        gps = self._group("GPS轨迹图")
         self.assertFalse(signal.isCheckable())
-        self.assertFalse(can.isChecked())
-        self.assertFalse(gps.isChecked())
-        self.assertLess(can.maximumHeight(), 100)
-        self.assertLess(gps.maximumHeight(), 100)
-
-    def test_collapse_releases_space_and_keeps_vertical_splitter(self):
-        can = self._group("CAN通道配置")
-        collapsed_height = can.height()
-        signal_height_collapsed = self._group("可用信号").height()
-        self.assertEqual(self.window.left_splitter.orientation(), Qt.Orientation.Vertical)
-        self.assertFalse(self.window.left_splitter.childrenCollapsible())
-        self.assertGreater(signal_height_collapsed, collapsed_height)
-
-        can.setChecked(True)
-        APP.processEvents()
-        self.assertGreater(can.height(), collapsed_height)
-        can.setChecked(False)
-        APP.processEvents()
-        self.assertLess(can.maximumHeight(), 100)
-        self.assertGreater(
-            self._group("可用信号").height(), can.height()
+        self.assertFalse(can.isCheckable())
+        self.assertNotIn("GPS轨迹图", self.window.collapsible_groups)
+        self.assertFalse(self.window.show_map_button.isChecked())
+        self.assertGreaterEqual(
+            self.window.view_ribbon_layout.indexOf(self.window.gps_controls_widget), 0
         )
 
-    def test_collapse_state_round_trip_and_invalid_values_fall_back(self):
-        self._group("CAN通道配置").setChecked(True)
-        self._group("GPS轨迹图").setChecked(False)
+    def test_left_tabs_show_three_panels_and_can_stays_available(self):
+        can = self._group("CAN通道配置")
+        self.assertEqual(self.window.left_tabs.count(), 3)
+        self.assertEqual(
+            [self.window.left_tabs.tabText(index) for index in range(3)],
+            ["可用信号", "已选信号", "CAN 配置"],
+        )
+        self.window.left_tabs.setCurrentWidget(self.window.can_tab_page)
+        APP.processEvents()
+        self.assertTrue(can.isVisible())
+
+    def test_legacy_can_collapse_state_is_ignored(self):
+        self.settings.setValue(CAN_PANEL_EXPANDED_KEY, True)
         self.assertTrue(self.window.close())
         APP.processEvents()
         self.assertTrue(self.settings.value(CAN_PANEL_EXPANDED_KEY, type=bool))
-        self.assertFalse(self.settings.value(GPS_PANEL_EXPANDED_KEY, type=bool))
 
         restored = MDFPlotter(gui_settings=self.settings)
         try:
-            self.assertTrue(restored.collapsible_groups["CAN通道配置"].isChecked())
-            self.assertFalse(restored.collapsible_groups["GPS轨迹图"].isChecked())
+            self.assertFalse(next(g for g in restored.findChildren(QGroupBox) if g.title() == "CAN通道配置").isCheckable())
+            self.assertNotIn("GPS轨迹图", restored.collapsible_groups)
         finally:
             restored.deleteLater()
 
         self.settings.setValue(CAN_PANEL_EXPANDED_KEY, "damaged")
-        self.settings.setValue(GPS_PANEL_EXPANDED_KEY, [True])
         restore_collapsible_panel_state(self.window.collapsible_groups, self.settings)
-        self.assertFalse(self._group("CAN通道配置").isChecked())
-        self.assertFalse(self._group("GPS轨迹图").isChecked())
+        self.assertFalse(self._group("CAN通道配置").isCheckable())
 
     def test_signal_and_plot_empty_states_appear_and_clear(self):
         self.assertTrue(self.window.signal_empty_label.isVisible())
@@ -146,9 +135,6 @@ class MainWindowUi3Tests(unittest.TestCase):
         )
         self.window._set_view_mode("selected")
 
-        self._group("CAN通道配置").setChecked(True)
-        self._group("GPS轨迹图").setChecked(True)
-        self._group("CAN通道配置").setChecked(False)
         APP.processEvents()
 
         self.assertEqual(self.window.get_selected_signals(), ["speed"])
@@ -156,10 +142,10 @@ class MainWindowUi3Tests(unittest.TestCase):
         self.assertEqual(self.window._view_mode, "selected")
         self.assertEqual(self.window.main_splitter.sizes(), original_sizes)
         self.assertTrue(self.window.blf_slice_button.isEnabled())
-        self.assertIsNotNone(
-            self.window._find_layout_containing(
-                self.window.layout(), self.window.save_data_button
-            )
+        self.assertIn(
+            self.window.save_data_button,
+            [self.window.processing_ribbon_layout.itemAt(index).widget()
+             for index in range(self.window.processing_ribbon_layout.count())],
         )
 
 

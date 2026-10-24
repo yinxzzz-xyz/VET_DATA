@@ -102,7 +102,7 @@ class CanAndFormulaUi8Tests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_can_actions_are_compact_inline_and_narrow_layout_stays_safe(self):
+    def test_can_channel_card_actions_and_narrow_layout_stay_safe(self):
         settings = QSettings(
             os.path.join(self.temporary.name, "can.ini"), QSettings.Format.IniFormat
         )
@@ -114,18 +114,18 @@ class CanAndFormulaUi8Tests(unittest.TestCase):
             }}
             with patch.object(baseline.QTimer, "singleShot"):
                 window.create_bus_config_ui()
+            window.left_tabs.setCurrentWidget(window.can_tab_page)
             row = window.bus_config_widgets[1]
             buttons = (row.select_protocol_btn, row.protocol_clear_btn, row.parse_btn)
             window.resize(1280, 800)
-            window.main_splitter.setSizes([440, 840])
-            window.collapsible_groups["CAN通道配置"].setChecked(True)
             window.show()
+            window.main_splitter.setSizes([440, 840])
             APP.processEvents()
             visible_buttons = tuple(button for button in buttons if button.isVisible())
             self.assertEqual(
                 {button.y() for button in visible_buttons}, {visible_buttons[0].y()}
             )
-            self.assertLessEqual(row.sizeHint().height(), 56)
+            self.assertGreater(row.sizeHint().height(), 56)
             self.assertEqual(window.bus_scroll.horizontalScrollBar().maximum(), 0)
 
             window.resize(850, 700)

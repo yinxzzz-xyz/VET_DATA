@@ -63,6 +63,23 @@ class SignalPanelSelectionStyleTests(unittest.TestCase):
             self.item.setSelected(False)
             self.assertEqual(self.item.checkState(), check_state)
 
+    def test_color_swatch_is_right_of_checkbox_region(self):
+        from PyQt6.QtCore import QRect
+
+        swatch = self.delegate.color_rect(QRect(0, 0, 220, 28))
+        self.assertGreaterEqual(swatch.left(), 31)
+        self.assertEqual((swatch.width(), swatch.height()), (10, 10))
+
+    def test_text_region_starts_after_checkbox_and_color_swatch(self):
+        from PyQt6.QtCore import QRect
+
+        swatch = self.delegate.color_rect(QRect(0, 0, 220, 28))
+        text_left = (
+            self.delegate._CHECKBOX_REGION + self.delegate._CHECKBOX_COLOR_GAP
+            + self.delegate._COLOR_SIZE + self.delegate._COLOR_TEXT_GAP
+        )
+        self.assertGreater(text_left, swatch.right())
+
 
 if __name__ == "__main__":
     unittest.main()

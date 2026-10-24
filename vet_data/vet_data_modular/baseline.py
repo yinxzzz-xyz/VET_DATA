@@ -19,9 +19,9 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QInputDialog, QMessageBox, QComboBox,
                              QFrame, QProgressBar,
                              QSplitter, QSizePolicy, QTreeWidget, QTreeWidgetItem,
-                             QTextEdit, QHeaderView)
+                             QTextEdit, QHeaderView, QTabWidget)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
+from PyQt6.QtCore import QPointF, QSize, QSignalBlocker, Qt, QTimer, pyqtSignal, QThread
 import numpy as np
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from collections import defaultdict
@@ -29,7 +29,7 @@ import warnings
 import logging
 from io import StringIO
 import re
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFontMetrics, QIcon, QPainter, QPen, QPixmap, QPolygonF
 import time
 import multiprocessing
 
@@ -49,6 +49,76 @@ from .workers import (
 # 抑制警告
 warnings.filterwarnings("ignore")
 logging.getLogger("cantools").setLevel(logging.ERROR)
+
+
+def _quick_action_icon(kind, color):
+    """Draw small, dependency-free icons for the always-visible shortcuts."""
+    pixmap = QPixmap(20, 20)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor(color), 1.7))
+    if kind == "open":
+        painter.drawPolyline(QPolygonF([QPointF(2, 6), QPointF(8, 6), QPointF(10, 8), QPointF(18, 8), QPointF(16, 16), QPointF(2, 16), QPointF(2, 6)]))
+        painter.drawLine(2, 8, 18, 8)
+    elif kind == "plot":
+        painter.drawLine(3, 16, 3, 4)
+        painter.drawLine(3, 16, 18, 16)
+        painter.drawPolyline(QPolygonF([QPointF(5, 13), QPointF(9, 10), QPointF(12, 12), QPointF(17, 5)]))
+    elif kind == "formula":
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "ƒx")
+    elif kind == "single":
+        painter.drawLine(10, 3, 10, 17)
+        painter.drawLine(2, 10, 8, 10)
+        painter.drawLine(6, 8, 8, 10)
+        painter.drawLine(6, 12, 8, 10)
+        painter.drawLine(18, 10, 12, 10)
+        painter.drawLine(14, 8, 12, 10)
+        painter.drawLine(14, 12, 12, 10)
+    elif kind == "dual":
+        painter.drawLine(8, 3, 8, 17)
+        painter.drawLine(12, 3, 12, 17)
+        painter.drawLine(1, 10, 6, 10)
+        painter.drawLine(4, 8, 6, 10)
+        painter.drawLine(4, 12, 6, 10)
+        painter.drawLine(19, 10, 14, 10)
+        painter.drawLine(16, 8, 14, 10)
+        painter.drawLine(16, 12, 14, 10)
+    painter.end()
+    return QIcon(pixmap)
+
+
+class _AdaptiveRibbonWidget(QWidget):
+    """Place shortcuts beside tabs when they fit, otherwise on a stable row below."""
+    def __init__(self, tabs, shortcuts):
+        super().__init__()
+        self._tabs = tabs
+        self._shortcuts = shortcuts
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(2)
+        self._row = QWidget(self)
+        self._row_layout = QHBoxLayout(self._row)
+        self._row_layout.setContentsMargins(0, 0, 0, 0)
+        self._row_layout.setSpacing(8)
+        self._row_layout.addWidget(tabs, 7)
+        self._row_layout.addWidget(shortcuts, 3)
+        self._layout.addWidget(self._row)
+        self._wrapped = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        needed = max(1, self._shortcuts.minimumSizeHint().width())
+        wrap = self.width() < needed / 0.30 + 8
+        if wrap == self._wrapped:
+            return
+        if wrap:
+            self._row_layout.removeWidget(self._shortcuts)
+            self._layout.addWidget(self._shortcuts)
+        else:
+            self._layout.removeWidget(self._shortcuts)
+            self._row_layout.addWidget(self._shortcuts, 3)
+        self._wrapped = wrap
 
 # CAN 相关库检查
 try:
@@ -1306,75 +1376,92 @@ class BusConfigWidget(QWidget):
         self.setObjectName(f"busConfigRow{self.bus_id}")
         self.setProperty("uiCanRow", "true")
         self.setStyleSheet(build_can_config_stylesheet(DEFAULT_THEME))
-        layout = QGridLayout()
-        layout.setContentsMargins(2, 3, 2, 3)
-        layout.setHorizontalSpacing(1)
-        layout.setVerticalSpacing(1)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 3, 0, 3)
+        self.card_group = QGroupBox("CAN 通道")
+        self.card_group.setObjectName(f"busConfigCard{self.bus_id}")
+        self.card_group.setProperty("uiCanCard", "true")
+        layout = QVBoxLayout(self.card_group)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
 
+        channel_row = QWidget(self.card_group)
+        channel_layout = QHBoxLayout(channel_row)
+        channel_layout.setContentsMargins(0, 0, 0, 0)
+        channel_layout.setSpacing(6)
         self.id_label.setText(f"Bus {self.bus_id}")
         self.id_label.setProperty("uiCanCell", "true")
-        self.id_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.id_label, 0, 0)
-
+        self.id_label.setMinimumWidth(54)
+        channel_layout.addWidget(self.id_label)
+        name_caption = QLabel("通道名称")
+        name_caption.setProperty("uiCanCell", "true")
+        channel_layout.addWidget(name_caption)
         self.name_edit.setPlaceholderText(f"Bus {self.bus_id}")
         self.name_edit.setProperty("uiCanCell", "bus")
         self.name_edit.setToolTip(f"Bus {self.bus_id}")
+        self.name_edit.setMinimumWidth(70)
+        self.name_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.name_edit.textChanged.connect(self.on_name_changed)
         self.name_edit.textChanged.connect(self.name_edit.setToolTip)
-        layout.addWidget(self.name_edit, 1, 0)
+        channel_layout.addWidget(self.name_edit, 1)
+        layout.addWidget(channel_row)
 
+        state_row = QWidget(self.card_group)
+        state_layout = QHBoxLayout(state_row)
+        state_layout.setContentsMargins(0, 0, 0, 0)
+        state_layout.setSpacing(12)
         self.type_label.setText("CAN2.0")
         self.type_label.setProperty("uiCanCell", "true")
-        self.type_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.type_label, 0, 1, 2, 1)
-
+        state_layout.addWidget(self.type_label)
         self.id_count_label.setText("0 IDs")
         self.id_count_label.setProperty("uiCanCell", "true")
-        self.id_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.id_count_label, 0, 2, 2, 1)
+        state_layout.addWidget(self.id_count_label)
+        state_layout.addStretch(1)
+        self.status_indicator.setProperty("uiCanCell", "status")
+        self.status_indicator.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        state_layout.addWidget(self.status_indicator)
+        layout.addWidget(state_row)
 
         self.protocol_label.setText("未配置")
         self.protocol_label.setProperty("uiCanCell", "protocol")
         self.protocol_label.setProperty("statusKind", "missing")
-        self.protocol_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.protocol_label, 0, 3, 2, 1)
+        self.protocol_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.protocol_label.setMinimumWidth(0)
+        protocol_row = QWidget(self.card_group)
+        protocol_layout = QHBoxLayout(protocol_row)
+        protocol_layout.setContentsMargins(0, 0, 0, 0)
+        protocol_layout.setSpacing(6)
+        protocol_caption = QLabel("DBC 文件")
+        protocol_caption.setProperty("uiCanCell", "true")
+        protocol_layout.addWidget(protocol_caption)
+        protocol_layout.addWidget(self.protocol_label, 1)
+        layout.addWidget(protocol_row)
 
         self.select_protocol_btn.setText("选择协议")
         self.select_protocol_btn.setToolTip("选择 DBC 协议文件")
         self.select_protocol_btn.setProperty("uiRole", "secondary")
-        self.select_protocol_btn.setFixedWidth(46)
+        self.select_protocol_btn.setMinimumWidth(72)
         self.select_protocol_btn.clicked.connect(self.select_protocol)
-
         self.protocol_clear_btn.setText("清除")
         self.protocol_clear_btn.setToolTip("清除当前 Bus 的 DBC 选择")
         self.protocol_clear_btn.setProperty("uiRole", "secondary")
-        self.protocol_clear_btn.setFixedWidth(40)
-        self.protocol_clear_btn.setMinimumWidth(0)
-        self.protocol_clear_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.protocol_clear_btn.setMinimumWidth(52)
         self.protocol_clear_btn.clicked.connect(self.clear_protocol)
         self.protocol_clear_btn.setEnabled(False)
-
         self.parse_btn.setText("解析")
         self.parse_btn.setProperty("uiRole", "primary")
+        self.parse_btn.setMinimumWidth(56)
         self.parse_btn.clicked.connect(lambda: self.parse_requested.emit(self.bus_id))
-        action_widget = QWidget()
-        action_layout = QHBoxLayout(action_widget)
+        action_row = QWidget(self.card_group)
+        action_layout = QHBoxLayout(action_row)
         action_layout.setContentsMargins(0, 0, 0, 0)
-        action_layout.setSpacing(1)
+        action_layout.setSpacing(6)
+        action_layout.addStretch(1)
         action_layout.addWidget(self.select_protocol_btn)
         action_layout.addWidget(self.parse_btn)
         action_layout.addWidget(self.protocol_clear_btn)
-        layout.addWidget(action_widget, 0, 4, 2, 1)
-
-        self.status_indicator.setProperty("uiCanCell", "status")
-        self.status_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.status_indicator, 0, 5, 2, 1)
-
-        for column, width in enumerate(CAN_COLUMN_WIDTHS):
-            layout.setColumnMinimumWidth(column, width)
-        layout.setColumnStretch(3, 1)
-
-        self.setLayout(layout)
+        layout.addWidget(action_row)
+        outer_layout.addWidget(self.card_group)
         self.set_status('idle')
 
     def on_name_changed(self, text):
@@ -1925,21 +2012,7 @@ class ParseProgressDialog(QDialog):
         btn_layout.addStretch()
         self.cancel_btn.setText("取消")
         self.cancel_btn.setFixedWidth(80)
-        self.cancel_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 6px 12px;
-            }
-            QPushButton:hover {
-                background-color: #c0392b;
-            }
-            QPushButton:disabled {
-                background-color: #95a5a6;
-            }
-        """)
+        self.cancel_btn.setProperty("uiRole", "secondary")
         self.cancel_btn.clicked.connect(self.on_cancel)
         btn_layout.addWidget(self.cancel_btn)
         layout.addLayout(btn_layout)
@@ -2795,6 +2868,11 @@ class MDFPlotter(QWidget):
         self.gps_df = None
         self._temp_map_dir = None
         self.cursor2_pos = None
+        self.cursor_mode = None
+        self._single_cursor_time = None
+        self._dragging_cursor = None
+        self._cursor_a_time = None
+        self._cursor_b_time = None
         self._arxml_converter = None
 
         self.custom_math_data = {}
@@ -2829,8 +2907,44 @@ class MDFPlotter(QWidget):
     def init_ui(self):
         self.setWindowTitle('VET_DATA_v26.08.28')
         self.setGeometry(100, 100, 1450, 950)
+        self._ribbon_action_mirrors = {}
 
-        main_layout = QHBoxLayout(self)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(6)
+
+        # Keep the ribbon tabs and existing shortcut controls on one row.
+        self.ribbon_tabs = QTabWidget()
+        self.ribbon_tabs.setObjectName("mainFunctionalTabs")
+        self.ribbon_tabs.setDocumentMode(True)
+        self.ribbon_tabs.setMaximumHeight(82)
+
+        def add_ribbon_page(title):
+            page = QWidget()
+            layout = QHBoxLayout(page)
+            layout.setContentsMargins(8, 4, 8, 4)
+            layout.setSpacing(6)
+            layout.addStretch(1)
+            self.ribbon_tabs.addTab(page, title)
+            return page, layout
+
+        self.file_ribbon_page, self.file_ribbon_layout = add_ribbon_page("文件")
+        self.signal_ribbon_page, self.signal_ribbon_layout = add_ribbon_page("信号管理")
+        self.curve_ribbon_page, self.curve_ribbon_layout = add_ribbon_page("曲线显示")
+        self.analysis_ribbon_page, self.analysis_ribbon_layout = add_ribbon_page("分析工具")
+        self.processing_ribbon_page, self.processing_ribbon_layout = add_ribbon_page("数据处理")
+        self.export_ribbon_page, self.export_ribbon_layout = add_ribbon_page("导出")
+        self.view_ribbon_page, self.view_ribbon_layout = add_ribbon_page("视图")
+
+        self.quick_actions_widget = QWidget()
+        self.quick_actions_layout = QHBoxLayout(self.quick_actions_widget)
+        self.quick_actions_layout.setContentsMargins(4, 0, 4, 0)
+        self.quick_actions_layout.setSpacing(6)
+        self.quick_actions_widget.setObjectName("mainQuickActions")
+        self.ribbon_widget = _AdaptiveRibbonWidget(
+            self.ribbon_tabs, self.quick_actions_widget
+        )
+        main_layout.addWidget(self.ribbon_widget)
 
         # ====== 左侧面板 ======
         self.left_panel_widget = QWidget()
@@ -2856,51 +2970,105 @@ class MDFPlotter(QWidget):
         self.left_panel_scroll.setWidget(self.left_panel_content)
         left_panel_shell.addWidget(self.left_panel_scroll)
 
-        file_select_layout = QHBoxLayout()
-        self.current_file_label = QLabel("未选择数据文件")
-        self.current_file_label.setWordWrap(True)
-        self.load_file_button = QPushButton("选择数据文件")
-        file_select_layout.addWidget(self.current_file_label)
-        file_select_layout.addWidget(self.load_file_button)
-        file_select_layout.setStretch(0, 1)
+        self.current_file_label = ElidedLabel("未选择数据文件")
+        self.current_file_label.setMinimumWidth(140)
+        self.current_file_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.current_file_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.load_file_button = QPushButton("打开文件")
+        self.load_file_button.setText("")
+        self.load_file_button.setToolTip("打开文件")
+        self._add_ribbon_mirror(
+            self.file_ribbon_layout, "打开数据文件…", self.load_file_button,
+            self.load_file_dialog,
+        )
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("搜索信号...")
 
-        self.top_action_layout = QHBoxLayout()
-        self.top_action_layout.setObjectName("topActionLayout")
-        self.top_action_layout.setSpacing(4)
-        self.top_action_layout.setContentsMargins(0, 0, 0, 0)
         self.select_all_button = QPushButton("全选")
         self.deselect_all_button = QPushButton("全部取消")
         self.save_config_button = QPushButton("保存配置")
         self.load_config_button = QPushButton("加载配置")
-        for button in (
-            self.select_all_button, self.deselect_all_button,
-            self.save_config_button, self.load_config_button,
-        ):
-            button.setMinimumWidth(0)
-            self.top_action_layout.addWidget(button, 1)
+        self.signal_ribbon_layout.insertWidget(0, self.select_all_button)
+        self.signal_ribbon_layout.insertWidget(1, self.deselect_all_button)
+        self.file_ribbon_layout.insertWidget(1, self.save_config_button)
+        self.file_ribbon_layout.insertWidget(2, self.load_config_button)
+        self.current_file_status = QWidget(self.file_ribbon_page)
+        current_file_status_layout = QHBoxLayout(self.current_file_status)
+        current_file_status_layout.setContentsMargins(0, 0, 0, 0)
+        current_file_status_layout.addStretch(1)
+        current_file_status_layout.addWidget(self.current_file_label)
+        self.file_ribbon_layout.takeAt(self.file_ribbon_layout.count() - 1)
+        self.file_ribbon_layout.addWidget(self.current_file_status, 1)
 
-        self.math_channel_button = QPushButton("➕ 创建计算通道 (加减乘除)")
+        self.math_channel_button = QPushButton("自定义公式计算")
+        self.math_channel_button.setText("")
+        self.math_channel_button.setToolTip("自定义公式计算")
 
-        self.top_primary_action_layout = QHBoxLayout()
-        self.top_primary_action_layout.setObjectName("topPrimaryActionLayout")
-        self.top_primary_action_layout.setSpacing(4)
-        self.top_primary_action_layout.setContentsMargins(0, 0, 0, 0)
-        self.plot_button = QPushButton("绘制所选信号")
+        self.plot_button = QPushButton("绘制曲线")
+        self.plot_button.setText("")
+        self.plot_button.setToolTip("绘制曲线")
         self.export_button = QPushButton("导出为CSV")
         self.save_data_button = QPushButton("数据截取")
-        for button in (
-            self.plot_button, self.export_button, self.save_data_button,
+        self._add_ribbon_mirror(
+            self.curve_ribbon_layout, "绘制所选信号",
+            self.plot_button, self.plot_selected_signals,
+        )
+        self.export_ribbon_layout.insertWidget(0, self.export_button)
+        self.processing_ribbon_layout.insertWidget(0, self.save_data_button)
+
+        self.single_cursor_button = QPushButton("单游标")
+        self.single_cursor_button.setText("")
+        self.single_cursor_button.setObjectName("singleCursorToggle")
+        self.single_cursor_button.setCheckable(True)
+        self.single_cursor_button.setProperty("uiRole", "stateToggle")
+        self.single_cursor_button.setToolTip("单游标")
+        self.dual_cursor_button = QPushButton("双游标")
+        self.dual_cursor_button.setText("")
+        self.dual_cursor_button.setObjectName("dualCursorToggle")
+        self.dual_cursor_button.setCheckable(True)
+        self.dual_cursor_button.setProperty("uiRole", "stateToggle")
+        self.dual_cursor_button.setToolTip("双游标")
+        self.load_file_button.setIcon(_quick_action_icon("open", DEFAULT_THEME.colors.text_secondary))
+        self.plot_button.setIcon(_quick_action_icon("plot", DEFAULT_THEME.colors.text_secondary))
+        self.math_channel_button.setIcon(_quick_action_icon("formula", DEFAULT_THEME.colors.text_secondary))
+        self.single_cursor_button.setIcon(_quick_action_icon("single", DEFAULT_THEME.colors.success))
+        self.dual_cursor_button.setIcon(_quick_action_icon("dual", DEFAULT_THEME.colors.primary))
+        for shortcut_button in (
+            self.load_file_button, self.plot_button, self.math_channel_button,
+            self.single_cursor_button, self.dual_cursor_button,
         ):
-            button.setMinimumWidth(0)
-            self.top_primary_action_layout.addWidget(button, 1)
+            shortcut_button.setIconSize(QSize(18, 18))
+        for shortcut_button in (
+            self.load_file_button, self.plot_button, self.math_channel_button,
+            self.single_cursor_button, self.dual_cursor_button,
+        ):
+            shortcut_button.setMinimumWidth(32)
+
+        self.plot_mode_combo = QComboBox()
+        self.plot_mode_combo.setObjectName("curveDisplayModeSelector")
+        self.plot_mode_combo.addItem("单信号独立图表", "independent")
+        self.plot_mode_combo.addItem("多信号叠加到同一图表", "overlay")
+        self.plot_mode_combo.setToolTip("选择每个信号单独成图，或将所选信号叠加显示")
+        self.plot_mode_combo.setProperty("uiControl", "main")
+        self.plot_mode_combo.setMinimumWidth(130)
+
+        self.quick_actions_layout.addWidget(self.load_file_button)
+        self.quick_actions_layout.addWidget(self.plot_button)
+        self.quick_actions_layout.addWidget(self.math_channel_button)
+        self._add_ribbon_mirror(
+            self.analysis_ribbon_layout, "自定义公式计算…",
+            self.math_channel_button, self.create_math_channel,
+        )
+        self.quick_actions_layout.addWidget(self.single_cursor_button)
+        self.quick_actions_layout.addWidget(self.dual_cursor_button)
+        self.quick_actions_layout.addWidget(self.plot_mode_combo)
 
         # ====== 可用信号区域 ======
         signal_groupbox = QGroupBox("可用信号")
         signal_layout_outer = QVBoxLayout()
         signal_groupbox.setLayout(signal_layout_outer)
+        signal_layout_outer.addWidget(self.search_box)
 
         self.signal_container = QWidget()
         self.signal_layout = QVBoxLayout(self.signal_container)
@@ -2926,11 +3094,8 @@ class MDFPlotter(QWidget):
         # ====== CAN通道配置区域 ======
         bus_groupbox = QGroupBox("CAN通道配置")
         bus_layout = QVBoxLayout()
-        bus_layout.setSpacing(2)
-
-        self.bus_header = create_bus_config_header()
-        self.bus_header.setStyleSheet(build_can_config_stylesheet(DEFAULT_THEME))
-        bus_layout.addWidget(self.bus_header)
+        bus_layout.setSpacing(8)
+        self.bus_header = None
 
         self.bus_scroll = QScrollArea()
         self.bus_scroll.setObjectName("busConfigScrollArea")
@@ -2949,20 +3114,19 @@ class MDFPlotter(QWidget):
         bus_layout.addWidget(self.bus_scroll)
 
         # ARXML2DBC 按钮
-        bus_btn_layout = QHBoxLayout()
         self.arxml2dbc_btn = QPushButton("🔧 ARXML2DBC")
         self.arxml2dbc_btn.setProperty("uiToolEntry", "true")
         self.arxml2dbc_btn.setToolTip("启动 ARXML 转 DBC 工具")
         self.arxml2dbc_btn.clicked.connect(self.open_arxml_converter)
-        bus_btn_layout.addWidget(self.arxml2dbc_btn)
-        bus_btn_layout.addStretch()
-        bus_layout.addLayout(bus_btn_layout)
+        self.processing_ribbon_layout.insertWidget(1, self.arxml2dbc_btn)
 
         bus_groupbox.setLayout(bus_layout)
 
-        # ====== GPS地图面板 ======
-        map_groupbox = QGroupBox("GPS轨迹图")
-        map_layout = QVBoxLayout()
+        # ====== GPS controls in the View ribbon ======
+        gps_controls = QWidget(self.view_ribbon_page)
+        self.gps_controls_widget = gps_controls
+        map_layout = QHBoxLayout(gps_controls)
+        map_layout.setContentsMargins(0, 0, 0, 0)
         lat_layout = QHBoxLayout()
         lat_label = QLabel("纬度信号:")
         self.lat_combo = QComboBox()
@@ -2974,44 +3138,71 @@ class MDFPlotter(QWidget):
         lon_layout.addWidget(lon_label)
         lon_layout.addWidget(self.lon_combo)
         self.show_map_button = QPushButton("显示GPS轨迹")
+        self.show_map_button.setObjectName("gpsViewToggle")
+        self.show_map_button.setCheckable(True)
+        self.show_map_button.setChecked(False)
+        self.show_map_button.setProperty("uiRole", "stateToggle")
+        self.show_map_button.setToolTip("显示或隐藏 GPS 轨迹窗口")
         map_layout.addLayout(lat_layout)
         map_layout.addLayout(lon_layout)
         map_layout.addWidget(self.show_map_button)
-        map_groupbox.setLayout(map_layout)
+        self.view_ribbon_layout.insertWidget(0, gps_controls)
 
-        # ====== 底部按钮 ======
-        self.bottom_action_layout = QHBoxLayout()
-        self.bottom_action_layout.setObjectName("bottomActionLayout")
-        self.bottom_action_layout.setSpacing(4)
-        self.bottom_action_layout.setContentsMargins(0, 0, 0, 0)
-        self.bottom_action_layout.addWidget(self.math_channel_button, 2)
+        # ====== 左侧信号与 CAN 三选项卡 ======
+        self.left_tabs = QTabWidget()
+        self.left_tabs.setObjectName("leftManagementTabs")
+        self.available_signals_page = signal_groupbox
+        self.selected_signals_page = QWidget()
+        self.selected_signals_layout = QVBoxLayout(self.selected_signals_page)
+        self.selected_signals_layout.setContentsMargins(6, 6, 6, 6)
+        self.can_tab_page = bus_groupbox
+        self.left_tabs.addTab(self.available_signals_page, "可用信号")
+        self.left_tabs.addTab(self.selected_signals_page, "已选信号")
+        self.left_tabs.addTab(self.can_tab_page, "CAN 配置")
 
-        # ====== 使用 QSplitter ======
-        self.left_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.left_splitter.addWidget(signal_groupbox)
-        self.left_splitter.addWidget(bus_groupbox)
-        self.left_splitter.setSizes([400, 250])
-        self.left_splitter.setChildrenCollapsible(False)
-
-        left_panel.addLayout(file_select_layout)
-        left_panel.addWidget(self.search_box)
-        left_panel.addLayout(self.top_action_layout)
-        left_panel.addLayout(self.top_primary_action_layout)
-        left_panel.addWidget(self.left_splitter)
-        left_panel.addWidget(map_groupbox)
-        left_panel.addLayout(self.bottom_action_layout)
-        left_panel.setStretch(4, 1)
+        left_panel.addWidget(self.left_tabs, 1)
 
         # ====== 右侧面板 ======
         right_panel = QGroupBox("信号曲线")
         right_panel_layout = QVBoxLayout(right_panel)
         self.plot_container = QWidget()
         self.plot_layout = QVBoxLayout(self.plot_container)
+        self.plot_layout.setContentsMargins(9, 9, 9, 9)
         self.plot_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll_area_right = QScrollArea()
+        self.plot_scroll_area = scroll_area_right
         scroll_area_right.setWidgetResizable(True)
         scroll_area_right.setWidget(self.plot_container)
         right_panel_layout.addWidget(scroll_area_right)
+        self.shared_time_axis_widget = pg.PlotWidget()
+        self.shared_time_axis_widget.setObjectName("sharedTimeAxis")
+        self.shared_time_axis_widget.setMinimumHeight(48)
+        self.shared_time_axis_widget.setMaximumHeight(48)
+        self.shared_time_axis_widget.setMenuEnabled(False)
+        self.shared_time_axis_widget.showAxis("left")
+        self.shared_time_axis_widget.hideAxis("right")
+        self.shared_time_axis_widget.hideAxis("top")
+        self.shared_time_axis_widget.setLabel("bottom", "时间", units="s")
+        shared_left_axis = self.shared_time_axis_widget.getPlotItem().getAxis("left")
+        shared_left_axis.setStyle(showValues=False, tickLength=0, autoExpandTextSpace=False)
+        shared_left_axis.setPen(None)
+        shared_left_axis.setTextPen(None)
+        self.shared_time_axis_widget.getPlotItem().layout.setContentsMargins(2, 2, 2, 2)
+        shared_viewbox = self.shared_time_axis_widget.getViewBox()
+        shared_viewbox.setMouseEnabled(x=True, y=False)
+        shared_viewbox.setMouseMode(shared_viewbox.PanMode)
+        self.shared_time_axis_widget.setVisible(False)
+        self.shared_time_axis_row = QWidget(right_panel)
+        self.shared_time_axis_row.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.shared_time_axis_row_layout = QHBoxLayout(self.shared_time_axis_row)
+        shared_left_inset = scroll_area_right.frameWidth() + self.plot_layout.contentsMargins().left()
+        self.shared_time_axis_row_layout.setContentsMargins(shared_left_inset, 0, 0, 0)
+        self.shared_time_axis_row_layout.setSpacing(0)
+        self.shared_time_axis_row_layout.addWidget(self.shared_time_axis_widget)
+        self.shared_time_axis_row_layout.addStretch(1)
+        right_panel_layout.addWidget(self.shared_time_axis_row)
 
         self.left_panel_widget.setMinimumWidth(320)
         right_panel.setMinimumWidth(480)
@@ -3024,7 +3215,7 @@ class MDFPlotter(QWidget):
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.handle(1).setCursor(Qt.CursorShape.SplitHCursor)
-        main_layout.addWidget(self.main_splitter)
+        main_layout.addWidget(self.main_splitter, 1)
 
         # ====== 信号连接 ======
         self.load_file_button.clicked.connect(self.load_file_dialog)
@@ -3036,10 +3227,54 @@ class MDFPlotter(QWidget):
         self.search_box.textChanged.connect(self.search_signals)
         self.save_config_button.clicked.connect(self.save_signal_config)
         self.load_config_button.clicked.connect(self.load_signal_config)
-        self.show_map_button.clicked.connect(self.show_map)
+        self.show_map_button.toggled.connect(self._toggle_gps_view)
         self.math_channel_button.clicked.connect(self.create_math_channel)
 
         self.set_buttons_enabled(False)
+
+    def _add_ribbon_mirror(self, layout, text, source, callback):
+        """Add a category-page copy of an action while sharing enabled state."""
+        button = QPushButton(text)
+        button.setProperty("uiRole", "secondary")
+        button.clicked.connect(callback)
+        insert_at = max(0, layout.count() - 1)  # Keep the trailing stretch last.
+        layout.insertWidget(insert_at, button)
+        self._ribbon_action_mirrors.setdefault(source, []).append(button)
+        return button
+
+    def set_current_file_status(self, path=None):
+        if not path:
+            self.current_file_label.setText("当前文件: 未选择")
+            self.current_file_label.setToolTip("")
+            return
+        path = os.fspath(path)
+        self.current_file_label.setText(
+            f"当前文件: {os.path.basename(path)}"
+        )
+        self.current_file_label.setToolTip(path)
+
+    def _toggle_gps_view(self, visible):
+        self.show_map_button.setText("隐藏GPS轨迹" if visible else "显示GPS轨迹")
+        if visible:
+            if not self.show_map():
+                blocker = QSignalBlocker(self.show_map_button)
+                self.show_map_button.setChecked(False)
+                del blocker
+                self.show_map_button.setText("显示GPS轨迹")
+        elif self.map_dialog is not None and self.map_dialog.isVisible():
+            self.map_dialog.close()
+
+    def _gps_dialog_finished(self, *_args):
+        if self.show_map_button.isChecked():
+            blocker = QSignalBlocker(self.show_map_button)
+            self.show_map_button.setChecked(False)
+            del blocker
+        self.show_map_button.setText("显示GPS轨迹")
+
+    def _sync_ribbon_action_mirrors(self):
+        for source, mirrors in getattr(self, "_ribbon_action_mirrors", {}).items():
+            for button in mirrors:
+                button.setEnabled(source.isEnabled())
 
     def auto_parse_all_buses(self):
         if not self.bus_protocols:
@@ -3318,6 +3553,7 @@ class MDFPlotter(QWidget):
         self.math_channel_button.setEnabled(enabled)
         self.lat_combo.setEnabled(enabled)
         self.lon_combo.setEnabled(enabled)
+        self._sync_ribbon_action_mirrors()
 
     def clear_signal_list(self):
         for i in reversed(range(self.signal_layout.count())):
@@ -3347,6 +3583,7 @@ class MDFPlotter(QWidget):
             "All Supported Files (*.mdf *.mf4 *.csv *.vbo *.blf *.asc *.trc);;MDF/MF4 Files (*.mdf *.mf4);;CSV Files (*.csv);;VBO Files (*.vbo);;CAN Log Files (*.blf *.asc *.trc);;All Files (*)"
         )
         if file_name:
+            self._clear_cursor_positions_for_data_change()
             if self.can_parsed_data:
                 self._reusable_can_selection = self._capture_can_selection()
             self._parse_generation += 1
@@ -3364,8 +3601,8 @@ class MDFPlotter(QWidget):
 
             if hasattr(self, 'map_dialog') and self.map_dialog:
                 self.map_dialog.close()
-                self.map_dialog = None
-                self.web_view = None
+            if self.show_map_button.isChecked():
+                self.show_map_button.setChecked(False)
 
             self.gps_df = None
             self.custom_math_data.clear()
@@ -3378,7 +3615,7 @@ class MDFPlotter(QWidget):
             self.bus_config_widgets.clear()
             self.signals.clear()
             self.mdf_path = file_name
-            self.current_file_label.setText(f"当前文件: {os.path.basename(file_name)}")
+            self.set_current_file_status(file_name)
 
             self.clear_bus_config()
 
@@ -3425,6 +3662,7 @@ class MDFPlotter(QWidget):
 
     def _clear_current_can_results(self):
         """Invalidate file-bound CAN samples and visible curves immediately."""
+        self._clear_cursor_positions_for_data_change()
         for bus_id, worker in tuple(getattr(self, 'parse_workers', {}).items()):
             try:
                 if worker.isRunning():
@@ -4539,6 +4777,10 @@ class MDFPlotter(QWidget):
             widget.deleteLater()
         self.plot_widgets.clear()
         self.master_viewbox = None
+        for index in reversed(range(self.plot_layout.count())):
+            item = self.plot_layout.itemAt(index)
+            if item is not None and item.spacerItem() is not None:
+                self.plot_layout.takeAt(index)
 
         if not hasattr(self, 'rescale_timer'):
             self.rescale_timer = QTimer()
@@ -4562,7 +4804,7 @@ class MDFPlotter(QWidget):
 
             signal = self._get_signal(sig_info)
             if signal is not None and len(signal.timestamps) > 0:
-                all_data_list.append((sig_info, signal))
+                all_data_list.append((unique_key, sig_info, signal))
                 all_timestamps.extend([signal.timestamps[0], signal.timestamps[-1]])
 
         if not all_data_list:
@@ -4575,11 +4817,19 @@ class MDFPlotter(QWidget):
         t_min = np.min(all_timestamps)
         t_max = np.max(all_timestamps)
 
-        for i, (signal_info, signal) in enumerate(all_data_list):
+        display_mode = getattr(self, "curve_display_mode", "independent")
+        display_groups = (
+            [(item,) for item in all_data_list]
+            if display_mode == "independent"
+            else [tuple(all_data_list)]
+        )
+
+        for i, signal_group in enumerate(display_groups):
+            signal_key, signal_info, signal = signal_group[0]
             try:
                 plot_widget = pg.PlotWidget(viewBox=LimitedViewBox())
                 self.plot_widgets.append(plot_widget)
-                self.plot_layout.addWidget(plot_widget)
+                self.plot_layout.addWidget(plot_widget, 1)
 
                 vb = plot_widget.getPlotItem().getViewBox()
                 plot_widget.getPlotItem().enableAutoRange(x=False)
@@ -4589,73 +4839,155 @@ class MDFPlotter(QWidget):
                 left_axis = plot_widget.getPlotItem().getAxis('left')
                 self._configure_plot_y_axis(left_axis)
 
-                # ===== 判断是否为文字信号 =====
-                is_text_signal = hasattr(signal, 'is_text_signal') and signal.is_text_signal
-                has_text_mapping = hasattr(signal, 'text_mapping') and signal.text_mapping is not None
+                # Each display group owns one plot; overlay groups add one curve
+                # per selected signal to that shared plot and its ViewBox.
+                records = []
+                legend = (
+                    plot_widget.addLegend(offset=(8, 8))
+                    if len(signal_group) > 1 else None
+                )
+                if legend is not None:
+                    legend.setColumnCount(max(1, min(
+                        len(signal_group), max(1, plot_widget.width() // 180)
+                    )))
+                y_min_data = float("inf")
+                y_max_data = float("-inf")
+                for curve_index, (item_key, item_info, item_signal) in enumerate(signal_group):
+                    is_text_signal = bool(
+                        getattr(item_signal, "is_text_signal", False)
+                    )
+                    if (
+                        len(signal_group) == 1
+                        and is_text_signal
+                        and getattr(item_signal, "text_mapping", None) is not None
+                    ):
+                        axis = plot_widget.getPlotItem().getAxis("left")
+                        axis.setTicks([[
+                            (j, label)
+                            for j, label in enumerate(item_signal.text_mapping)
+                        ]])
 
-                if is_text_signal and has_text_mapping:
-                    data_curve = plot_widget.plot(signal.timestamps, signal.samples, pen='y')
-
-                    ay = plot_widget.getPlotItem().getAxis('left')
-                    ticks = [(j, label) for j, label in enumerate(signal.text_mapping)]
-                    ay.setTicks([ticks])
-
-                    if len(signal.text_mapping) > 0:
-                        plot_widget.setYRange(-0.5, len(signal.text_mapping) - 0.5, padding=0.1)
-
-                    title = f"信号: {signal_info['display_name']}"
-                else:
-                    samples = signal.samples
+                    samples = np.asarray(item_signal.samples)
                     valid_mask = ~np.isnan(samples)
                     if valid_mask.any():
-                        y_min_data = np.min(samples[valid_mask])
-                        y_max_data = np.max(samples[valid_mask])
-                    else:
-                        y_min_data, y_max_data = 0.0, 1.0
+                        y_min_data = min(y_min_data, float(np.min(samples[valid_mask])))
+                        y_max_data = max(y_max_data, float(np.max(samples[valid_mask])))
 
-                    self._configure_plot_y_axis(
-                        left_axis,
-                        max(abs(float(y_min_data)), abs(float(y_max_data))),
+                    color = (
+                        self._signal_color(item_key)
+                        if hasattr(self, "_signal_color")
+                        else pg.intColor(curve_index, hues=max(1, len(signal_group)))
                     )
+                    curve = plot_widget.plot(
+                        item_signal.timestamps,
+                        item_signal.samples,
+                        pen=pg.mkPen(color, width=1.4),
+                        name=item_info.get("display_name", item_info.get("name", "信号")),
+                    )
+                    if legend is not None and legend.items:
+                        legend_label = legend.items[-1][1]
+                        full_name = item_info.get("display_name", item_info.get("name", "信号"))
+                        font_metrics = QFontMetrics(legend_label.item.font())
+                        legend_label.setText(font_metrics.elidedText(
+                            full_name, Qt.TextElideMode.ElideRight, 140
+                        ))
+                        legend_label.setToolTip(full_name)
+                    if not is_text_signal:
+                        curve.setDownsampling(auto=True, method="peak")
+                        curve.setClipToView(True)
+                        plot_widget.sigXRangeChanged.connect(self.on_x_range_changed)
 
-                    y_range = y_max_data - y_min_data
-                    if y_range == 0:
-                        y_padding = 1.0 if y_min_data == 0 else np.abs(y_min_data) * 0.1
-                        if y_padding == 0:
-                            y_padding = 1.0
-                    else:
-                        y_padding = y_range * 0.4
+                    spot = pg.ScatterPlotItem(
+                        size=8, pen=pg.mkPen(None), brush=pg.mkBrush(color)
+                    )
+                    plot_widget.addItem(spot)
+                    spot.setVisible(False)
+                    records.append({
+                        "signal_key": item_key,
+                        "signal_info": item_info,
+                        "signal_data": item_signal,
+                        "data_curve": curve,
+                        "spot_item": spot,
+                        "is_text_signal": is_text_signal,
+                    })
 
-                    plot_widget.setYRange(y_min_data - y_padding, y_max_data + y_padding, padding=0)
-                    data_curve = plot_widget.plot(signal.timestamps, signal.samples, pen='y')
-                    data_curve.setDownsampling(auto=True, method='peak')
-                    data_curve.setClipToView(True)
-                    plot_widget.sigXRangeChanged.connect(self.on_x_range_changed)
+                if not np.isfinite(y_min_data) or not np.isfinite(y_max_data):
+                    y_min_data, y_max_data = 0.0, 1.0
+                self._configure_plot_y_axis(
+                    left_axis, max(abs(y_min_data), abs(y_max_data))
+                )
+                y_range = y_max_data - y_min_data
+                y_padding = (
+                    1.0 if y_min_data == 0 else abs(y_min_data) * 0.1
+                ) if y_range == 0 else y_range * 0.4
+                if y_padding == 0:
+                    y_padding = 1.0
+                if len(signal_group) == 1 and records[0]["is_text_signal"]:
+                    mapping = getattr(signal, "text_mapping", None) or ()
+                    if mapping:
+                        y_min_data, y_max_data = -0.5, len(mapping) - 0.5
+                        y_padding = 0.1
+                plot_widget.setYRange(
+                    y_min_data - y_padding, y_max_data + y_padding, padding=0
+                )
 
-                    title = f"信号: {signal_info['display_name']}"
-
-                bus_id = signal_info.get('bus_id')
-                if bus_id is not None:
+                title = f"信号: {signal_info.get('display_name', signal_info.get('name', ''))}"
+                if len(signal_group) > 1:
+                    title = f"叠加显示 · {len(signal_group)} 个信号"
+                bus_id = signal_info.get("bus_id")
+                if bus_id is not None and len(signal_group) == 1:
                     title += f" [Bus {bus_id}]"
-                plot_widget.setTitle(title)
+                if display_mode == "independent":
+                    plot_widget.setTitle(title, size="10pt")
+                else:
+                    plot_widget.setTitle(title)
 
-                # ===== 光标和标注 =====
-                spot_item = pg.ScatterPlotItem(size=8, pen=pg.mkPen(None), brush=pg.mkBrush('r'))
-                plot_widget.addItem(spot_item)
-
-                v_line = pg.InfiniteLine(angle=90, movable=False, pen='g')
+                cursor_green = DEFAULT_THEME.colors.success
+                cursor_blue = DEFAULT_THEME.colors.primary
+                v_line = pg.InfiniteLine(
+                    angle=90, movable=False,
+                    pen=pg.mkPen(cursor_green, width=1.5),
+                )
+                v_line.setVisible(False)
                 plot_widget.addItem(v_line, ignoreBounds=True)
+                measurement_lines = {}
+                for cursor_name, cursor_color in (("A", cursor_green), ("B", cursor_blue)):
+                    measurement_line = pg.InfiniteLine(
+                        angle=90, movable=False,
+                        pen=pg.mkPen(cursor_color, width=1.5),
+                    )
+                    measurement_line.setVisible(False)
+                    plot_widget.addItem(measurement_line, ignoreBounds=True)
+                    measurement_lines[cursor_name] = measurement_line
 
-                text_item = pg.TextItem(text="", color=(255, 255, 0), anchor=(0, 1))
-                plot_widget.addItem(text_item, ignoreBounds=True)
+                cursor_labels = {"single": [], "A": [], "B": []}
+                for record in records:
+                    for cursor_name, cursor_color in (
+                        ("single", cursor_green), ("A", cursor_green), ("B", cursor_blue)
+                    ):
+                        label = pg.TextItem(
+                            text="", color=cursor_color, anchor=(0, 0.5),
+                            fill=pg.mkColor(255, 255, 255, 220),
+                            border=pg.mkColor(cursor_color),
+                        )
+                        label.setFont(pg.QtGui.QFont("Arial", 8))
+                        label.setVisible(False)
+                        plot_widget.addItem(label, ignoreBounds=True)
+                        cursor_labels[cursor_name].append(label)
+                text_item = cursor_labels["single"][0]
 
                 plot_widget.vLine = v_line
+                plot_widget.measurement_lines = measurement_lines
                 plot_widget.text_item = text_item
-                plot_widget.spot_item = spot_item
+                plot_widget.cursor_labels = cursor_labels
+                plot_widget.signal_records = records
+                plot_widget.cursor_spots = [record["spot_item"] for record in records]
+                plot_widget.spot_item = records[0]["spot_item"]
                 plot_widget.signal_data = signal
                 plot_widget.signal_info = signal_info
-                plot_widget.is_text_signal = is_text_signal
-                plot_widget.data_curve = data_curve
+                plot_widget.is_text_signal = records[0]["is_text_signal"]
+                plot_widget.data_curve = records[0]["data_curve"]
+                plot_widget.legend_item = legend
 
                 # ===== 右上角统计信息 =====
                 stats_text_item = pg.TextItem(
@@ -4690,19 +5022,19 @@ class MDFPlotter(QWidget):
 
                 plot_widget.setLabel('bottom', '时间', units='s')
                 plot_widget.showGrid(x=True, y=True)
+                plot_widget.getPlotItem().layout.setContentsMargins(2, 2, 2, 2)
 
                 if i == 0:
                     self.master_viewbox = vb
                     self.master_viewbox.setXRange(t_min, t_max)
                 else:
                     vb.setXLink(self.master_viewbox)
-
-                plot_widget.scene().sigMouseMoved.connect(self.update_cursor_positions)
+                plot_widget.initial_view_range = tuple(
+                    tuple(axis_range) for axis_range in vb.viewRange()
+                )
 
             except Exception as e:
                 print(f"警告: 无法绘制信号 '{signal_info.get('display_name')}'。错误: {e}")
-
-        self.plot_layout.addStretch(1)
 
         if self.map_dialog and self.map_dialog.isVisible():
             QTimer.singleShot(300, self.update_map_marker)
@@ -4712,6 +5044,40 @@ class MDFPlotter(QWidget):
         try:
             # 检查 widget 是否有效
             if plot_widget is None:
+                return
+
+            signal_records = getattr(plot_widget, "signal_records", ())
+            if len(signal_records) > 1:
+                view_box = plot_widget.getViewBox()
+                if view_box is None:
+                    return
+                x_min, x_max = view_box.viewRange()[0]
+                stats_lines = []
+                for record in signal_records:
+                    signal = record["signal_data"]
+                    start = int(np.searchsorted(signal.timestamps, x_min))
+                    stop = int(np.searchsorted(signal.timestamps, x_max))
+                    values = np.asarray(signal.samples[start:stop])
+                    if not len(values):
+                        continue
+                    valid = values[~np.isnan(values)]
+                    if not len(valid):
+                        summary = "无有效数据"
+                    else:
+                        summary = (
+                            f"最大 {np.max(valid):.3g} · 最小 {np.min(valid):.3g}"
+                            f" · 平均 {np.mean(valid):.3g} · 标准差 {np.std(valid):.3g}"
+                        )
+                    name = record["signal_info"].get(
+                        "display_name", record["signal_info"].get("name", "信号")
+                    )
+                    stats_lines.append(f"{name}: {summary}")
+                item = plot_widget.stats_text_item
+                if item is not None:
+                    current = view_box.viewRange()
+                    y_min, y_max = current[1]
+                    item.setPos(current[0][1], y_max - (y_max - y_min) * 0.02)
+                    item.setText("\n".join(stats_lines))
                 return
 
             signal = plot_widget.signal_data
@@ -4826,79 +5192,103 @@ class MDFPlotter(QWidget):
         for pw in self.plot_widgets:
             if not hasattr(pw, 'signal_data'):
                 continue
-
-            signal = pw.signal_data
-
-            # 文字信号不需要自动缩放Y轴
-            if hasattr(signal, 'is_text_signal') and signal.is_text_signal:
-                continue
-
-            # 数值信号的自动缩放
             view_range = pw.getViewBox().viewRange()[0]
-            idx_start = np.searchsorted(signal.timestamps, view_range[0])
-            idx_end = np.searchsorted(signal.timestamps, view_range[1])
-            visible_data = signal.samples[idx_start:idx_end]
-
-            v_mask = ~np.isnan(visible_data)
-            if len(visible_data) > 0 and v_mask.any():
-                ymin, ymax = np.min(visible_data[v_mask]), np.max(visible_data[v_mask])
+            visible_values = []
+            for record in getattr(pw, "signal_records", ()):
+                signal = record["signal_data"]
+                if record["is_text_signal"] and len(getattr(pw, "signal_records", ())) == 1:
+                    continue
+                start = int(np.searchsorted(signal.timestamps, view_range[0]))
+                stop = int(np.searchsorted(signal.timestamps, view_range[1]))
+                values = np.asarray(signal.samples[start:stop])
+                if len(values):
+                    valid = values[~np.isnan(values)]
+                    if len(valid):
+                        visible_values.append(valid)
+            if visible_values:
+                values = np.concatenate(visible_values)
+                ymin, ymax = np.min(values), np.max(values)
                 yrange = ymax - ymin
                 padding = yrange * 0.1 if yrange > 0 else 1.0
                 pw.setYRange(ymin - padding, ymax + padding, padding=0)
 
-    def update_cursor_positions(self, evt):
-        if not self.plot_widgets or self.master_viewbox is None:
+    def update_cursor_positions(self, evt, source_plot=None):
+        if (
+            self.cursor_mode != "single"
+            or self._dragging_cursor is None
+            or self._dragging_cursor.get("name") != "single"
+            or not self.plot_widgets
+            or self.master_viewbox is None
+        ):
+            return
+        source_plot = source_plot or self._dragging_cursor.get("plot")
+        if source_plot is None:
+            return
+        try:
+            x_pos = float(source_plot.getViewBox().mapSceneToView(evt).x())
+            x_min, x_max = self.master_viewbox.viewRange()[0]
+            x_pos = min(max(x_pos, x_min), x_max)
+        except (RuntimeError, TypeError, ValueError):
+            return
+        self._single_cursor_time = x_pos
+        self._render_single_cursor_at(x_pos)
+        master_y = sum(self.master_viewbox.viewRange()[1]) * 0.5
+        self.update_map_marker(
+            self.master_viewbox.mapViewToScene(QPointF(x_pos, master_y))
+        )
+
+    def _render_single_cursor_at(self, x_pos):
+        if not self.plot_widgets:
             return
 
-        mouse_point_master = self.master_viewbox.mapSceneToView(evt)
-        x_pos = mouse_point_master.x()
-
         for plot_widget in self.plot_widgets:
-            signal = plot_widget.signal_data
-            if signal is None or len(signal.timestamps) == 0:
+            records = getattr(plot_widget, "signal_records", ())
+            if not records:
                 continue
+            cursor_x = x_pos
+            single_labels = getattr(plot_widget, "cursor_labels", {}).get("single", ())
+            for record_index, record in enumerate(records):
+                signal = record["signal_data"]
+                if signal is None or len(signal.timestamps) == 0:
+                    record["spot_item"].setData([], [])
+                    if record_index < len(single_labels):
+                        single_labels[record_index].setVisible(False)
+                    continue
 
-            idx = np.searchsorted(signal.timestamps, x_pos)
-            idx = np.clip(idx, 0, len(signal.timestamps) - 1)
+                idx = int(np.clip(np.searchsorted(signal.timestamps, x_pos), 0, len(signal.timestamps) - 1))
+                x_val = float(signal.timestamps[idx])
+                y_val = signal.samples[idx]
+                cursor_x = x_pos if len(records) > 1 else x_val
 
-            x_val = signal.timestamps[idx]
-            y_val = signal.samples[idx]
-
-            plot_widget.vLine.setPos(x_val)
-
-            if np.isnan(y_val):
-                plot_widget.spot_item.setData([], [])
-                display_y_val = "NaN (无效数据)"
-            else:
-                # ===== 处理文字信号显示 =====
-                if hasattr(signal, 'is_text_signal') and signal.is_text_signal:
-                    # 对于文字信号，显示对应的文字
-                    if hasattr(signal, 'text_mapping') and signal.text_mapping:
-                        # 找到最近的文字值
-                        if hasattr(signal, 'raw_text_values') and len(signal.raw_text_values) > idx:
-                            display_y_val = signal.raw_text_values[idx]
-                        else:
-                            # 通过映射查找
-                            label_idx = int(round(y_val))
-                            if 0 <= label_idx < len(signal.text_mapping):
-                                display_y_val = signal.text_mapping[label_idx]
-                            else:
-                                display_y_val = f"{y_val:.0f}"
-                    else:
-                        display_y_val = f"{y_val:.3f}"
+                if np.isnan(y_val):
+                    record["spot_item"].setData([], [])
+                    shown = "NaN (无效数据)"
                 else:
-                    display_y_val = f"{y_val:.3f}"
+                    if record["is_text_signal"]:
+                        raw_text = getattr(signal, "raw_text_values", None)
+                        mapping = getattr(signal, "text_mapping", None)
+                        if raw_text is not None and len(raw_text) > idx:
+                            shown = str(raw_text[idx])
+                        elif mapping:
+                            label_index = int(round(y_val))
+                            shown = mapping[label_index] if 0 <= label_index < len(mapping) else str(y_val)
+                        else:
+                            shown = str(y_val)
+                    else:
+                        shown = f"{float(y_val):.6f}"
+                    record["spot_item"].setData([x_val], [y_val])
+                if record_index < len(single_labels):
+                    label = single_labels[record_index]
+                    label.setText(f"{cursor_x:.6f}, {shown}")
+                    label.setVisible(self.cursor_mode == "single")
+                    self._position_cursor_label(
+                        plot_widget, label, cursor_x,
+                        float(y_val) if not np.isnan(y_val) else None,
+                    )
 
-                plot_widget.spot_item.setData([x_val], [y_val])
-
-            view_range = plot_widget.getPlotItem().getViewBox().viewRange()
-            y_min, y_max = view_range[1]
-            text_y_pos = y_max - (y_max - y_min) * 0.2
-
-            plot_widget.text_item.setPos(x_val, text_y_pos)
-            plot_widget.text_item.setText(f"t={x_val:.3f}s, val={display_y_val}")
-
-        self.update_map_marker(evt)
+            plot_widget.vLine.setPos(cursor_x)
+            plot_widget.text_item = single_labels[0] if single_labels else plot_widget.text_item
+            self._separate_cursor_labels(plot_widget, "single")
 
     def convert_to_decimal(self, series, is_lat=True):
         samples = pd.to_numeric(series, errors='coerce').astype(float)
@@ -4935,19 +5325,19 @@ class MDFPlotter(QWidget):
 
         if not lat_key or not lon_key:
             QMessageBox.warning(self, "显示轨迹", "请选择纬度和经度信号。")
-            return
+            return False
 
         lat_info = self.signals.get(lat_key)
         lon_info = self.signals.get(lon_key)
         if not lat_info or not lon_info:
             QMessageBox.warning(self, "显示轨迹", "无法获取选定的信号信息。")
-            return
+            return False
 
         lat_signal = self._get_signal(lat_info)
         lon_signal = self._get_signal(lon_info)
         if lat_signal is None or lon_signal is None or len(lat_signal) < 2:
             QMessageBox.warning(self, "显示轨迹", "GPS信号为空或数据不足。")
-            return
+            return False
 
         df_lat = pd.DataFrame({'t': lat_signal.timestamps, 'lat_raw': lat_signal.samples})
         df_lon = pd.DataFrame({'t': lon_signal.timestamps, 'lon_raw': lon_signal.samples})
@@ -4973,7 +5363,7 @@ class MDFPlotter(QWidget):
 
         if not segments:
             QMessageBox.warning(self, "显示轨迹", "未检测到任何有效GPS点（全为0,0、无效格式或断续太严重）。")
-            return
+            return False
 
         df_clean = pd.concat(segments, ignore_index=True)
 
@@ -5050,27 +5440,26 @@ class MDFPlotter(QWidget):
         </html>
         """
 
-        if self.map_dialog:
-            self.map_dialog.close()
+        if self.map_dialog is None:
+            self.map_dialog = QDialog(self)
+            self.map_dialog.setWindowTitle("GPS轨迹图")
+            self.map_dialog.resize(900, 650)
+            self.map_dialog.finished.connect(self._gps_dialog_finished)
 
-        self.map_dialog = QDialog(self)
-        self.map_dialog.setWindowTitle("GPS轨迹图")
-        self.map_dialog.resize(900, 650)
+            layout = QVBoxLayout(self.map_dialog)
+            self.web_view = QWebEngineView()
+            self.web_view.settings().setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+            self.web_view.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            layout.addWidget(self.web_view)
+            self.web_view.loadFinished.connect(self._gps_map_loaded)
 
-        layout = QVBoxLayout(self.map_dialog)
-        self.web_view = QWebEngineView()
-        self.web_view.settings().setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-        self.web_view.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-
-        layout.addWidget(self.web_view)
         self.web_view.setHtml(html_content)
-
-        def on_load(ok):
-            if ok:
-                QTimer.singleShot(500, self.update_map_marker)
-
-        self.web_view.loadFinished.connect(on_load)
         self.map_dialog.show()
+        return True
+
+    def _gps_map_loaded(self, ok):
+        if ok and self.map_dialog is not None and self.map_dialog.isVisible():
+            QTimer.singleShot(500, self.update_map_marker)
 
     def update_map_marker(self, evt=None):
         if self.gps_df is None or not hasattr(self, 'web_view') or not self.web_view:

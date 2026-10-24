@@ -156,7 +156,6 @@ class ArxmlMainWindowEntryUi7Tests(unittest.TestCase):
             self.assertEqual(window.arxml2dbc_btn.property("uiRole"), "secondary")
             self.assertEqual(window.arxml2dbc_btn.property("uiToolEntry"), "true")
             self.assertEqual(window.arxml2dbc_btn.styleSheet(), "")
-            window.collapsible_groups["CAN通道配置"].setChecked(True)
             window.set_buttons_enabled(False)
             self.assertTrue(window.arxml2dbc_btn.isEnabled())
             window.arxml2dbc_btn.click()

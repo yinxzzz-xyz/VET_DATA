@@ -1,7 +1,12 @@
 """Curve interaction enhancements."""
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSpinBox, QWidget
+import math
+
+import numpy as np
+from PyQt6.QtCore import QEvent, QPointF, QSignalBlocker, QSize, QTimer, Qt
+from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QWidget
+
+from .signal_panel import INTERVAL_ROLE, KEY_ROLE, MEASUREMENT_ROLE
 
 
 class PlotPanelMixin:
@@ -10,17 +15,46 @@ class PlotPanelMixin:
 
     def _setup_plot_panel(self):
         self.plot_min_height = 150
+        self.curve_display_mode = self.plot_mode_combo.currentData() or "independent"
+        self.cursor_enabled = False
+        self._shared_axis_syncing = False
+        self._aligning_shared_axis_geometry = False
+        self.plot_scroll_area.viewport().installEventFilter(self)
         panel = next((g for g in self.findChildren(QWidget) if getattr(g, "title", lambda: "")() == "信号曲线"), None)
         if panel is None: return
-        controls = QWidget(panel)
+        controls = QWidget(self.curve_ribbon_page)
         row = QHBoxLayout(controls); row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(QLabel("信号高度:"))
         self.height_spin = QSpinBox()
         self.height_spin.setRange(80, 900); self.height_spin.setSingleStep(10)
         self.height_spin.setValue(self.plot_min_height); self.height_spin.setSuffix(" px")
         row.addWidget(self.height_spin); row.addStretch()
-        panel.layout().insertWidget(0, controls)
+        self.measurement_bar = QLabel("A: —    B: —    Δt: —")
+        self.measurement_bar.setObjectName("measurementSummary")
+        row.addWidget(self.measurement_bar)
+        self.measurement_bar.setVisible(False)
+        self.box_zoom_button = QPushButton("框选放大")
+        self.box_zoom_button.setCheckable(True)
+        self.box_zoom_button.setProperty("uiRole", "stateToggle")
+        self.box_zoom_button.setToolTip("拖动框选时间范围；只缩放横轴，纵轴保持当前范围")
+        self.reset_zoom_button = QPushButton("复位视图")
+        row.addWidget(self.box_zoom_button)
+        row.addWidget(self.reset_zoom_button)
+        self.curve_ribbon_layout.insertWidget(
+            max(0, self.curve_ribbon_layout.count() - 1), controls
+        )
         self.height_spin.valueChanged.connect(self._plot_height_changed)
+        self.box_zoom_button.toggled.connect(self._set_box_zoom_enabled)
+        self.reset_zoom_button.clicked.connect(self.reset_plot_view)
+        self.plot_mode_combo.currentIndexChanged.connect(
+            lambda _index: self.set_curve_display_mode(self.plot_mode_combo.currentData())
+        )
+        self.single_cursor_button.toggled.connect(
+            lambda checked: self._cursor_mode_button_toggled("single", checked)
+        )
+        self.dual_cursor_button.toggled.connect(
+            lambda checked: self._cursor_mode_button_toggled("dual", checked)
+        )
         self.plot_empty_label = QLabel("选择信号并点击“绘制所选信号”")
         self.plot_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.plot_empty_label.setProperty("uiEmptyState", True)
@@ -31,12 +65,548 @@ class PlotPanelMixin:
         self.plot_empty_label.setVisible(bool(message))
 
     def plot_selected_signals(self):
+        self._clear_cursor_drag_state()
         self._set_plot_empty_state(None)
         super().plot_selected_signals()
+        self.shared_time_axis_widget.setVisible(bool(self.plot_widgets))
+        if self.master_viewbox is not None:
+            shared_viewbox = self.shared_time_axis_widget.getViewBox()
+            shared_viewbox.enableAutoRange(x=False)
+            previous_master = getattr(self, "_shared_time_axis_master", None)
+            if previous_master is not self.master_viewbox:
+                if previous_master is not None:
+                    try:
+                        previous_master.sigXRangeChanged.disconnect(
+                            self._shared_time_axis_range_changed
+                        )
+                    except (RuntimeError, TypeError):
+                        pass
+                try:
+                    shared_viewbox.sigXRangeChanged.disconnect(
+                        self._master_x_range_changed_by_shared_axis
+                    )
+                except (RuntimeError, TypeError):
+                    pass
+                self.master_viewbox.sigXRangeChanged.connect(
+                    self._shared_time_axis_range_changed
+                )
+                shared_viewbox.sigXRangeChanged.connect(
+                    self._master_x_range_changed_by_shared_axis
+                )
+                self._shared_time_axis_master = self.master_viewbox
+            self._set_shared_time_axis_range(self.master_viewbox.viewRange()[0])
+            self._align_shared_time_axis_geometry()
+            QTimer.singleShot(0, self._align_shared_time_axis_geometry)
         for plot in self.plot_widgets:
+            plot.getPlotItem().hideAxis("bottom")
             plot.setMinimumHeight(self.plot_min_height)
-            plot.getViewBox().setMouseEnabled(x=True, y=True)
+            plot.getViewBox().setMouseEnabled(
+                x=True, y=not self.box_zoom_button.isChecked()
+            )
+            plot.getViewBox().setMouseMode(
+                plot.getViewBox().RectMode
+                if self.box_zoom_button.isChecked()
+                else plot.getViewBox().PanMode
+            )
+            plot.viewport().installEventFilter(self)
+            plot.getViewBox().sigRangeChanged.connect(
+                lambda *_args: QTimer.singleShot(
+                    0, self._align_shared_time_axis_geometry
+                )
+            )
+            left_axis = plot.getPlotItem().getAxis("left")
+            left_axis.geometryChanged.connect(
+                lambda *_args: QTimer.singleShot(
+                    0, self._align_shared_time_axis_geometry
+                )
+            )
+            single_visible = self.cursor_mode == "single"
+            plot.vLine.setVisible(single_visible)
+            for label in getattr(plot, "cursor_labels", {}).get("single", ()):
+                label.setVisible(single_visible)
+            plot.text_item.setVisible(single_visible)
+            for spot in getattr(plot, "cursor_spots", (plot.spot_item,)):
+                spot.setVisible(single_visible)
             self._register_plot_stats_responsiveness(plot)
+        self._initialize_cursor_positions()
+        self._apply_cursor_visibility()
+        self._update_measurement_display()
+        QTimer.singleShot(50, self._align_shared_time_axis_geometry)
+        if self.cursor_mode == "single" and self._single_cursor_time is not None:
+            self._render_single_cursor_at(self._single_cursor_time)
+            self._current_cursor_time = self._single_cursor_time
+            self._mouse_in_plot = True
+            if self._view_mode == "selected":
+                self._list_update_timer.start()
+
+    def _shared_time_axis_range_changed(self, _view, ranges):
+        self._set_shared_time_axis_range(ranges)
+
+    def _set_shared_time_axis_range(self, target_range):
+        if self._shared_axis_syncing or self.master_viewbox is None:
+            return
+        shared_viewbox = self.shared_time_axis_widget.getViewBox()
+        if np.allclose(shared_viewbox.viewRange()[0], target_range, rtol=0, atol=1e-10):
+            return
+        self._shared_axis_syncing = True
+        try:
+            shared_viewbox.setXRange(*target_range, padding=0)
+        except RuntimeError:
+            return
+        finally:
+            self._shared_axis_syncing = False
+
+    def _master_x_range_changed_by_shared_axis(self, _view, ranges):
+        master = self.master_viewbox
+        target_range = ranges
+        if master is None or self._shared_axis_syncing:
+            return
+        if np.allclose(master.viewRange()[0], target_range, rtol=0, atol=1e-10):
+            return
+        self._shared_axis_syncing = True
+        try:
+            master.setXRange(*target_range, padding=0)
+        except RuntimeError:
+            return
+        finally:
+            self._shared_axis_syncing = False
+
+    def _align_shared_time_axis_geometry(self):
+        if self._aligning_shared_axis_geometry:
+            return
+        plots = tuple(getattr(self, "plot_widgets", ()))
+        if not plots or self.master_viewbox is None:
+            return
+        self._aligning_shared_axis_geometry = True
+        try:
+            margins = self.plot_layout.contentsMargins()
+            viewport_width = self.plot_scroll_area.viewport().width()
+            target_width = max(1, viewport_width - margins.left() - margins.right())
+            self.shared_time_axis_widget.setFixedWidth(target_width)
+            left_width = max(
+                max(
+                    plot.getPlotItem().getAxis("left").width(),
+                    plot.getPlotItem().getAxis("left").textWidth,
+                )
+                for plot in plots
+            )
+            for plot in plots:
+                plot.getPlotItem().layout.setColumnMinimumWidth(0, left_width)
+
+            plot_margins = plots[0].getPlotItem().layout.getContentsMargins()
+            self.shared_time_axis_widget.getPlotItem().layout.setContentsMargins(
+                *plot_margins
+            )
+            shared_left_axis = self.shared_time_axis_widget.getPlotItem().getAxis("left")
+            self.shared_time_axis_widget.getPlotItem().layout.setColumnMinimumWidth(
+                0, left_width
+            )
+            timestamps = [
+                record["signal_data"].timestamps
+                for plot in plots
+                for record in getattr(plot, "signal_records", ())
+                if record.get("signal_data") is not None
+                and len(record["signal_data"].timestamps)
+            ]
+            if timestamps:
+                shared_viewbox = self.shared_time_axis_widget.getViewBox()
+                shared_viewbox.setLimits(
+                    xMin=min(float(values[0]) for values in timestamps),
+                    xMax=max(float(values[-1]) for values in timestamps),
+                )
+        except RuntimeError:
+            return
+        finally:
+            self._aligning_shared_axis_geometry = False
+
+    def set_curve_display_mode(self, mode):
+        if mode not in {"independent", "overlay"}:
+            return
+        if mode == self.curve_display_mode:
+            return
+        previous_x_range = None
+        if self.master_viewbox is not None:
+            previous_x_range = tuple(self.master_viewbox.viewRange()[0])
+        self.curve_display_mode = mode
+        if self.plot_widgets:
+            self.plot_selected_signals()
+            if previous_x_range is not None:
+                for plot in self.plot_widgets:
+                    plot.getViewBox().setXRange(
+                        previous_x_range[0], previous_x_range[1], padding=0
+                    )
+
+    def _cursor_mode_button_toggled(self, mode, checked):
+        if checked:
+            self.set_cursor_mode(mode)
+        elif self.cursor_mode == mode:
+            self.set_cursor_mode(None)
+
+    def set_cursor_mode(self, mode):
+        if mode not in {None, "single", "dual"}:
+            raise ValueError(f"unknown cursor mode: {mode}")
+        self._clear_cursor_drag_state()
+        self.cursor_mode = mode
+        self.cursor_enabled = mode is not None
+        single_blocker = QSignalBlocker(self.single_cursor_button)
+        dual_blocker = QSignalBlocker(self.dual_cursor_button)
+        try:
+            self.single_cursor_button.setChecked(mode == "single")
+            self.dual_cursor_button.setChecked(mode == "dual")
+        finally:
+            del single_blocker
+            del dual_blocker
+        self._update_cursor_button_icons()
+        self._single_cursor_time = None
+        self._cursor_a_time = None
+        self._cursor_b_time = None
+        self._current_cursor_time = None
+        self._mouse_in_plot = False
+        self._clear_signal_values()
+        self._initialize_cursor_positions()
+        self._apply_cursor_visibility()
+        self._update_measurement_display()
+        if mode == "single" and self._single_cursor_time is not None:
+            self._render_single_cursor_at(self._single_cursor_time)
+            self._current_cursor_time = self._single_cursor_time
+            self._mouse_in_plot = True
+            if self._view_mode == "selected":
+                self._list_update_timer.start()
+
+    def _initialize_cursor_positions(self):
+        if not self.plot_widgets or self.master_viewbox is None:
+            return
+        x_min, x_max = self.master_viewbox.viewRange()[0]
+        if not np.isfinite(x_min) or not np.isfinite(x_max):
+            return
+        span = x_max - x_min
+        if self.cursor_mode == "single" and self._single_cursor_time is None:
+            self._single_cursor_time = float(x_min + span * 0.5)
+        elif self.cursor_mode == "dual" and (
+            self._cursor_a_time is None or self._cursor_b_time is None
+        ):
+            self._cursor_a_time = float(x_min + span / 3.0)
+            self._cursor_b_time = float(x_min + span * 2.0 / 3.0)
+
+    def _apply_cursor_visibility(self):
+        single_visible = self.cursor_mode == "single"
+        dual_visible = self.cursor_mode == "dual"
+        for plot in tuple(getattr(self, "plot_widgets", ())):
+            try:
+                plot.vLine.setVisible(single_visible)
+                for label in getattr(plot, "cursor_labels", {}).get("single", ()):
+                    label.setVisible(single_visible)
+                plot.text_item.setVisible(single_visible)
+                for spot in getattr(plot, "cursor_spots", (plot.spot_item,)):
+                    spot.setVisible(single_visible)
+                if single_visible and self._single_cursor_time is not None:
+                    plot.vLine.setPos(self._single_cursor_time)
+                for name, line in getattr(plot, "measurement_lines", {}).items():
+                    time_value = self._cursor_a_time if name == "A" else self._cursor_b_time
+                    line.setVisible(dual_visible and time_value is not None)
+                    if dual_visible and time_value is not None:
+                        line.setPos(time_value)
+                    for label in getattr(plot, "cursor_labels", {}).get(name, ()):
+                        label.setVisible(dual_visible and time_value is not None)
+            except RuntimeError:
+                continue
+
+    def _clear_cursor_drag_state(self):
+        self._dragging_cursor = None
+
+    def _clear_cursor_positions_for_data_change(self):
+        self._clear_cursor_drag_state()
+        self._single_cursor_time = None
+        self._cursor_a_time = None
+        self._cursor_b_time = None
+        self._current_cursor_time = None
+        self._mouse_in_plot = False
+        self._clear_signal_values()
+        self._update_measurement_display()
+
+    def _cursor_line_at_position(self, plot, position):
+        view_box = plot.getViewBox()
+        scene_position = plot.mapToScene(position)
+        if not view_box.sceneBoundingRect().contains(scene_position):
+            return None
+        y_min, y_max = view_box.viewRange()[1]
+        center_y = (y_min + y_max) * 0.5
+        if self.cursor_mode == "single":
+            candidates = (("single", plot.vLine),)
+        elif self.cursor_mode == "dual":
+            candidates = tuple(getattr(plot, "measurement_lines", {}).items())
+        else:
+            return None
+        hits = []
+        for name, line in candidates:
+            if not line.isVisible():
+                continue
+            scene_line = view_box.mapViewToScene(QPointF(line.value(), center_y))
+            viewport_line = plot.mapFromScene(scene_line)
+            distance = abs(viewport_line.x() - position.x())
+            if distance <= 9:
+                hits.append((distance, name))
+        return min(hits)[1] if hits else None
+
+    def eventFilter(self, watched, event):
+        if watched is self.plot_scroll_area.viewport():
+            if event.type() == QEvent.Type.Resize:
+                QTimer.singleShot(0, self._align_shared_time_axis_geometry)
+            return False
+        plot = next((
+            candidate for candidate in tuple(getattr(self, "plot_widgets", ()))
+            if candidate.viewport() is watched
+        ), None)
+        if plot is None:
+            return False
+
+        event_type = event.type()
+        drag = self._dragging_cursor
+        if drag is not None:
+            if event_type == QEvent.Type.MouseMove:
+                owner = drag["plot"]
+                try:
+                    local = owner.viewport().mapFromGlobal(
+                        event.globalPosition().toPoint()
+                    )
+                    scene_position = owner.mapToScene(local)
+                    self._move_active_cursor(owner, drag["name"], scene_position)
+                except RuntimeError:
+                    self._clear_cursor_drag_state()
+                return True
+            if event_type == QEvent.Type.MouseButtonRelease:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._clear_cursor_drag_state()
+                    return True
+                return False
+
+        if (
+            event_type == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            name = self._cursor_line_at_position(plot, event.position().toPoint())
+            if name is not None:
+                self._dragging_cursor = {"plot": plot, "name": name}
+                return True
+        return False
+
+    def _move_active_cursor(self, plot, name, scene_position):
+        if self.cursor_mode == "single" and name == "single":
+            self.update_cursor_positions(scene_position, plot)
+            return
+        if self.cursor_mode != "dual" or name not in {"A", "B"}:
+            return
+        cursor_time = float(plot.getViewBox().mapSceneToView(scene_position).x())
+        x_min, x_max = self.master_viewbox.viewRange()[0]
+        cursor_time = min(max(cursor_time, x_min), x_max)
+        if name == "A":
+            self._cursor_a_time = cursor_time
+        else:
+            self._cursor_b_time = cursor_time
+        self._update_measurement_display()
+        master_y = sum(self.master_viewbox.viewRange()[1]) * 0.5
+        self.update_map_marker(
+            self.master_viewbox.mapViewToScene(QPointF(cursor_time, master_y))
+        )
+
+    def _set_box_zoom_enabled(self, enabled):
+        for plot in tuple(getattr(self, "plot_widgets", ())):
+            try:
+                view_box = plot.getViewBox()
+                view_box.setMouseEnabled(x=True, y=not enabled)
+                view_box.setMouseMode(
+                    view_box.RectMode if enabled else view_box.PanMode
+                )
+            except RuntimeError:
+                continue
+
+    def reset_plot_view(self):
+        self.box_zoom_button.setChecked(False)
+        for plot in tuple(getattr(self, "plot_widgets", ())):
+            try:
+                view_box = plot.getViewBox()
+                initial_range = getattr(plot, "initial_view_range", None)
+                if initial_range is not None:
+                    view_box.setRange(
+                        xRange=initial_range[0],
+                        yRange=initial_range[1],
+                        padding=0,
+                    )
+                else:
+                    view_box.enableAutoRange(x=True, y=True)
+                    view_box.autoRange(padding=0.02)
+                    view_box.enableAutoRange(x=False, y=False)
+            except RuntimeError:
+                continue
+
+    def _format_measurement_value(self, record, cursor_time):
+        signal = record.get("signal_data")
+        if signal is None or not len(signal.timestamps):
+            return None
+        timestamps = signal.timestamps
+        index = int(np.searchsorted(timestamps, cursor_time))
+        if index >= len(timestamps) or cursor_time < timestamps[0]:
+            return None
+        if index > 0 and abs(cursor_time - timestamps[index - 1]) <= abs(timestamps[index] - cursor_time):
+            index -= 1
+        value = signal.samples[index]
+        try:
+            if not math.isfinite(float(value)):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if record.get("is_text_signal"):
+            raw = getattr(signal, "raw_text_values", None)
+            if raw is not None and index < len(raw):
+                return str(raw[index])
+            mapping = getattr(signal, "text_mapping", None) or ()
+            number = int(round(float(value)))
+            return str(mapping[number]) if 0 <= number < len(mapping) else str(value)
+        return float(value)
+
+    def _measurement_sample_y(self, record, cursor_time):
+        signal = record.get("signal_data")
+        if signal is None or not len(signal.timestamps):
+            return None
+        timestamps = signal.timestamps
+        index = int(np.searchsorted(timestamps, cursor_time))
+        if index >= len(timestamps) or cursor_time < timestamps[0]:
+            return None
+        if index > 0 and abs(cursor_time - timestamps[index - 1]) <= abs(timestamps[index] - cursor_time):
+            index -= 1
+        try:
+            return float(signal.samples[index])
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _position_cursor_label(plot, label, cursor_time, sample_y):
+        view_box = plot.getViewBox()
+        if sample_y is None or not np.isfinite(sample_y):
+            sample_y = sum(view_box.viewRange()[1]) * 0.5
+        anchor = plot.mapFromScene(
+            view_box.mapViewToScene(QPointF(float(cursor_time), float(sample_y)))
+        )
+        scene_pos = plot.mapToScene(QPointF(anchor.x() + 8, anchor.y() - 10).toPoint())
+        label.setPos(view_box.mapSceneToView(scene_pos))
+        bounds = plot.mapFromScene(view_box.sceneBoundingRect()).boundingRect()
+        label_rect = plot.mapFromScene(label.sceneBoundingRect()).boundingRect()
+        dx = max(bounds.left() + 2 - label_rect.left(), 0)
+        dy = max(bounds.top() + 2 - label_rect.top(), 0)
+        if label_rect.right() > bounds.right() - 2:
+            dx = bounds.right() - 2 - label_rect.right()
+        if label_rect.bottom() > bounds.bottom() - 2:
+            dy = bounds.bottom() - 2 - label_rect.bottom()
+        if dx or dy:
+            anchor_pos = plot.mapFromScene(label.scenePos())
+            adjusted = plot.mapToScene(QPointF(anchor_pos.x() + dx, anchor_pos.y() + dy).toPoint())
+            label.setPos(view_box.mapSceneToView(adjusted))
+
+    @staticmethod
+    def _separate_cursor_labels(plot, cursor_name):
+        if cursor_name == "single":
+            return
+        labels = getattr(plot, "cursor_labels", {})
+        for a_label, b_label in zip(labels.get("A", ()), labels.get("B", ())):
+            if not (a_label.isVisible() and b_label.isVisible()):
+                continue
+            a_rect = a_label.sceneBoundingRect()
+            b_rect = b_label.sceneBoundingRect()
+            if a_rect.intersects(b_rect):
+                view_box = plot.getViewBox()
+                anchor = plot.mapFromScene(b_label.scenePos())
+                bounds = plot.mapFromScene(view_box.sceneBoundingRect()).boundingRect()
+                target_y = anchor.y() + a_rect.height() + 4
+                if target_y + b_rect.height() > bounds.bottom() - 2:
+                    target_y = anchor.y() - a_rect.height() - 4
+                target_y = min(max(target_y, bounds.top() + 2), bounds.bottom() - b_rect.height() - 2)
+                scene_pos = plot.mapToScene(QPointF(anchor.x(), target_y).toPoint())
+                b_label.setPos(view_box.mapSceneToView(scene_pos))
+
+    def _update_measurement_display(self):
+        blocker = QSignalBlocker(self.selected_signal_list_widget)
+        dual_enabled = self.cursor_mode == "dual"
+        a_time = getattr(self, "_cursor_a_time", None) if dual_enabled else None
+        b_time = getattr(self, "_cursor_b_time", None) if dual_enabled else None
+        a_label = f"{a_time:.6f} s" if a_time is not None else "—"
+        b_label = f"{b_time:.6f} s" if b_time is not None else "—"
+        delta_label = f"{abs(b_time - a_time):.6f} s" if a_time is not None and b_time is not None else "—"
+        self.measurement_bar.setText(f"A: {a_label}    B: {b_label}    Δt: {delta_label}")
+        self.measurement_bar.setVisible(dual_enabled)
+        for plot in tuple(getattr(self, "plot_widgets", ())):
+            lines = getattr(plot, "measurement_lines", {})
+            for name, cursor_time in (("A", a_time), ("B", b_time)):
+                line = lines.get(name)
+                if line is not None:
+                    line.setVisible(dual_enabled and cursor_time is not None)
+                    if cursor_time is not None:
+                        line.setPos(cursor_time)
+                labels = getattr(plot, "cursor_labels", {}).get(name, ())
+                for record_index, label in enumerate(labels):
+                    if cursor_time is None or record_index >= len(plot.signal_records):
+                        label.setVisible(False)
+                        continue
+                    record = plot.signal_records[record_index]
+                    value = self._format_measurement_value(record, cursor_time)
+                    if value is None:
+                        label.setVisible(False)
+                        continue
+                    shown = f"{value:.3f}" if isinstance(value, (int, float)) else str(value)
+                    label.setText(f"{cursor_time:.6f}, {shown}")
+                    label.setVisible(dual_enabled)
+                    self._position_cursor_label(
+                        plot, label, cursor_time,
+                        self._measurement_sample_y(record, cursor_time),
+                    )
+                self._separate_cursor_labels(plot, name)
+        for row in range(self.selected_signal_list_widget.count()):
+            item = self.selected_signal_list_widget.item(row)
+            key = item.data(KEY_ROLE)
+            record = next((
+                record for plot in self.plot_widgets
+                for record in getattr(plot, "signal_records", ())
+                if record.get("signal_key") == key
+            ), None)
+            if record is None or a_time is None or b_time is None:
+                item.setData(MEASUREMENT_ROLE, None)
+                item.setData(INTERVAL_ROLE, None)
+                continue
+            a_value = self._format_measurement_value(record, a_time)
+            b_value = self._format_measurement_value(record, b_time)
+            if isinstance(a_value, (int, float)) and isinstance(b_value, (int, float)):
+                display = f"A {a_value:.3f}  B {b_value:.3f}  Δ {b_value-a_value:+.3f}"
+            else:
+                display = f"A {a_value if a_value is not None else '—'}  B {b_value if b_value is not None else '—'}"
+            item.setData(MEASUREMENT_ROLE, display)
+            interval = self._interval_statistics(record, a_time, b_time)
+            item.setData(INTERVAL_ROLE, interval)
+            item.setSizeHint(QSize(0, 54))
+        del blocker
+
+    @staticmethod
+    def _interval_statistics(record, start_time, end_time):
+        if record.get("is_text_signal"):
+            return "区间统计：文本信号不适用"
+        signal = record.get("signal_data")
+        if signal is None or not len(signal.timestamps):
+            return "区间统计：无有效数据"
+        lower, upper = sorted((start_time, end_time))
+        lower = float(np.nextafter(lower, -np.inf))
+        upper = float(np.nextafter(upper, np.inf))
+        start = int(np.searchsorted(signal.timestamps, lower, side="left"))
+        stop = int(np.searchsorted(signal.timestamps, upper, side="right"))
+        try:
+            values = np.asarray(signal.samples[start:stop], dtype=float)
+        except (TypeError, ValueError):
+            return "区间统计：无有效数值"
+        values = values[np.isfinite(values)]
+        if not len(values):
+            return "区间统计：无有效样本"
+        rms = float(np.sqrt(np.mean(np.square(values))))
+        return (
+            f"区间 min {np.min(values):.3f}  max {np.max(values):.3f}  "
+            f"平均 {np.mean(values):.3f}  RMS {rms:.3f}"
+        )
 
     def _register_plot_stats_responsiveness(self, plot):
         """Keep statistics readable using the individual plot's usable width."""
@@ -56,6 +626,7 @@ class PlotPanelMixin:
             plot._stats_last_width = width
             if abs(width - previous) >= 1.0:
                 self._plot_stats_visibility_changed(plot)
+                self._align_shared_time_axis_geometry()
         except RuntimeError:
             return
 
@@ -84,22 +655,19 @@ class PlotPanelMixin:
         self._plot_stats_visibility_changed(plot)
         super()._update_stats(plot)
 
-    def update_cursor_positions(self, evt):
-        super().update_cursor_positions(evt)
-        if not self.plot_widgets or self.master_viewbox is None: return
-        point = self.master_viewbox.mapSceneToView(evt)
-        master_range = self.master_viewbox.viewRange()
-        inside = master_range[0][0] <= point.x() <= master_range[0][1] and master_range[1][0] <= point.y() <= master_range[1][1]
-        self._mouse_in_plot = inside
-        if not inside:
-            self._clear_signal_values()
+    def update_cursor_positions(self, evt, source_plot=None):
+        if (
+            self.cursor_mode != "single"
+            or self._dragging_cursor is None
+            or self._dragging_cursor.get("name") != "single"
+        ):
             return
-        for plot in self.plot_widgets:
-            x_min, x_max = plot.getViewBox().viewRange()[0]
-            x_range = x_max - x_min
-            plot.text_item.setAnchor((1, 1) if x_range > 0 and x_max - point.x() < x_range * .30 else (0, 1))
+        super().update_cursor_positions(evt, source_plot)
+        if self._single_cursor_time is None:
+            return
+        self._mouse_in_plot = True
         if self._view_mode == "selected":
-            self._current_cursor_time = point.x()
+            self._current_cursor_time = self._single_cursor_time
             self._list_update_timer.start()
 
     def _plot_height_changed(self, value):
