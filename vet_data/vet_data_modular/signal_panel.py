@@ -4,10 +4,10 @@ import numpy as np
 import pyqtgraph as pg
 import re
 from PyQt6.QtCore import QEvent, QSignalBlocker, QRect, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QPainterPath
 from PyQt6.QtWidgets import (
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
-    QColorDialog, QStyledItemDelegate, QStyle, QWidget,
+    QColorDialog, QSizePolicy, QStyledItemDelegate, QStyle, QWidget,
 )
 
 
@@ -19,6 +19,7 @@ AVAILABLE_ROLE = Qt.ItemDataRole.UserRole + 4
 COLOR_ROLE = Qt.ItemDataRole.UserRole + 5
 MEASUREMENT_ROLE = Qt.ItemDataRole.UserRole + 6
 INTERVAL_ROLE = Qt.ItemDataRole.UserRole + 7
+CURVE_VISIBLE_ROLE = Qt.ItemDataRole.UserRole + 8
 _UNCHANGED_VALUE = object()
 SELECTED_TEXT_COLOR = QColor("#2c3e50")
 SIGNAL_COLORS = (
@@ -29,11 +30,49 @@ SIGNAL_COLORS = (
 
 class SignalItemDelegate(QStyledItemDelegate):
     colorRequested = pyqtSignal(str)
+    visibilityRequested = pyqtSignal(str)
 
     _CHECKBOX_REGION = 22
     _CHECKBOX_COLOR_GAP = 9
     _COLOR_SIZE = 10
     _COLOR_TEXT_GAP = 7
+    _VISIBILITY_BUTTON_WIDTH = 26
+
+    @staticmethod
+    def visibility_button_rect(rect):
+        return QRect(
+            rect.right() - SignalItemDelegate._VISIBILITY_BUTTON_WIDTH + 2,
+            rect.center().y() - 10,
+            22,
+            20,
+        )
+
+    def _paint_visibility_button(self, painter, option, index):
+        button_rect = self.visibility_button_rect(option.rect)
+        is_visible = index.data(CURVE_VISIBLE_ROLE) is not False
+        painter.save()
+        if option.state & QStyle.StateFlag.State_MouseOver:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#e8edf3"))
+            painter.drawRoundedRect(button_rect, 4, 4)
+        color = QColor("#475569" if is_visible else "#94a3b8")
+        painter.setPen(color)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        eye = QPainterPath()
+        eye.moveTo(button_rect.left() + 3, button_rect.center().y())
+        eye.quadTo(button_rect.center().x(), button_rect.top() + 2,
+                   button_rect.right() - 3, button_rect.center().y())
+        eye.quadTo(button_rect.center().x(), button_rect.bottom() - 2,
+                   button_rect.left() + 3, button_rect.center().y())
+        painter.drawPath(eye)
+        if is_visible:
+            painter.drawEllipse(button_rect.center(), 2, 2)
+        else:
+            painter.drawLine(
+                button_rect.left() + 4, button_rect.bottom() - 3,
+                button_rect.right() - 4, button_rect.top() + 3,
+            )
+        painter.restore()
 
     @staticmethod
     def color_rect(rect):
@@ -56,6 +95,15 @@ class SignalItemDelegate(QStyledItemDelegate):
     def editorEvent(self, event, model, option, index):
         if event.type() == QEvent.Type.MouseButtonRelease:
             position = event.position().toPoint()
+            if (
+                self.parent().objectName() == "selectedSignalList"
+                and event.button() == Qt.MouseButton.LeftButton
+                and self.visibility_button_rect(option.rect).contains(position)
+            ):
+                key = index.data(KEY_ROLE)
+                if key is not None:
+                    self.visibilityRequested.emit(str(key))
+                return True
             if self.color_rect(option.rect).contains(position):
                 key = index.data(KEY_ROLE)
                 if key is not None:
@@ -93,6 +141,8 @@ class SignalItemDelegate(QStyledItemDelegate):
             + self._COLOR_SIZE + self._COLOR_TEXT_GAP
         )
         left = option.rect.adjusted(text_left, 0, -8, 0)
+        if is_selected_list:
+            left.setRight(self.visibility_button_rect(option.rect).left() - 4)
         value_width = 0 if measurement else (105 if value is not None else 0)
         show_comment = not is_selected_list
         comment_width = min(150, max(0, left.width() // 3)) if show_comment else 0
@@ -118,6 +168,7 @@ class SignalItemDelegate(QStyledItemDelegate):
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 display_value,
             )
+            self._paint_visibility_button(painter, option, index)
             painter.restore()
             return
         display_name = option.fontMetrics.elidedText(
@@ -149,6 +200,8 @@ class SignalItemDelegate(QStyledItemDelegate):
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 str(interval),
             )
+        if is_selected_list:
+            self._paint_visibility_button(painter, option, index)
         painter.restore()
 
 
@@ -171,6 +224,7 @@ class SignalPanelMixin:
         self._current_cursor_time = None
         self._mouse_in_plot = False
         self._sig_value_cache = {}
+        self._signal_curve_visibility = {}
         self._last_signal_list_snapshot = None
         self._signal_panel_ready = True
 
@@ -199,6 +253,21 @@ class SignalPanelMixin:
         self.signal_view_controls = controls
         self.signal_ribbon_layout.insertWidget(2, controls)
 
+        # Keep the dual-cursor time summary beside the per-signal Δ readouts
+        # instead of in the curve toolbar, so all comparison values are visible
+        # in one place while the user is analyzing the selected-signal list.
+        self.measurement_bar = QLabel("A: —    B: —\nΔt: —", self.selected_signals_page)
+        self.measurement_bar.setObjectName("selectedMeasurementSummary")
+        self.measurement_bar.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.measurement_bar.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.measurement_bar.setMinimumHeight(42)
+        self.measurement_bar.setVisible(False)
+        self.selected_signals_layout.addWidget(self.measurement_bar)
+
         selected_header = QWidget(self.selected_signals_page)
         selected_header_layout = QHBoxLayout(selected_header)
         selected_header_layout.setContentsMargins(0, 0, 0, 0)
@@ -218,6 +287,9 @@ class SignalPanelMixin:
         self.selected_signal_list_widget.setSpacing(1)
         self.selected_signal_delegate = SignalItemDelegate(self.selected_signal_list_widget)
         self.selected_signal_delegate.colorRequested.connect(self._choose_signal_color)
+        self.selected_signal_delegate.visibilityRequested.connect(
+            self._toggle_signal_curve_visibility
+        )
         self.selected_signal_list_widget.setItemDelegate(self.selected_signal_delegate)
         self.selected_signal_list_widget.setDragDropMode(
             QListWidget.DragDropMode.InternalMove
@@ -316,6 +388,11 @@ class SignalPanelMixin:
     def refresh_signal_list_ui(self):
         if not getattr(self, "_signal_panel_ready", False):
             return super().refresh_signal_list_ui()
+        valid_keys = set(self.signals)
+        self._signal_curve_visibility = {
+            key: False for key, visible in self._signal_curve_visibility.items()
+            if key in valid_keys and not visible
+        }
         snapshot = self._signal_list_snapshot()
         if snapshot == self._last_signal_list_snapshot:
             has_signals = bool(self.signals)
@@ -442,7 +519,17 @@ class SignalPanelMixin:
                 for role in (KEY_ROLE, NAME_ROLE, COMMENT_ROLE, AVAILABLE_ROLE, COLOR_ROLE, MEASUREMENT_ROLE, INTERVAL_ROLE):
                     item.setData(role, source_item.data(role))
                 item.setData(VALUE_ROLE, source_item.data(VALUE_ROLE))
-                item.setToolTip(source_item.toolTip())
+                item.setData(
+                    CURVE_VISIBLE_ROLE,
+                    self.is_signal_curve_visible(key),
+                )
+                item.setToolTip(
+                    f"{source_item.toolTip()}\n单击右侧眼睛图标隐藏/显示曲线"
+                )
+                item.setData(
+                    Qt.ItemDataRole.AccessibleDescriptionRole,
+                    "单击右侧眼睛图标隐藏/显示曲线",
+                )
         finally:
             widget.setUpdatesEnabled(True)
             widget.blockSignals(False)
@@ -475,6 +562,108 @@ class SignalPanelMixin:
         item.setData(INTERVAL_ROLE, None)
         item.setSizeHint(QSize(0, 54))
         return item
+
+    def is_signal_curve_visible(self, signal_key):
+        return self._signal_curve_visibility.get(signal_key, True)
+
+    def clear_signal_curve_visibility(self):
+        self._signal_curve_visibility.clear()
+
+    def _toggle_signal_curve_visibility(self, signal_key):
+        self._set_signal_curve_visibility(
+            signal_key, not self.is_signal_curve_visible(signal_key)
+        )
+
+    def _set_signal_curve_visibility(self, signal_key, visible):
+        visible = bool(visible)
+        if signal_key not in self.signals:
+            self._signal_curve_visibility.pop(signal_key, None)
+            return
+        if visible:
+            self._signal_curve_visibility.pop(signal_key, None)
+        else:
+            self._signal_curve_visibility[signal_key] = False
+
+        widget = self.selected_signal_list_widget
+        blocker = QSignalBlocker(widget)
+        try:
+            for row in range(widget.count()):
+                item = widget.item(row)
+                if item.data(KEY_ROLE) == signal_key:
+                    item.setData(CURVE_VISIBLE_ROLE, visible)
+                    break
+        finally:
+            del blocker
+        widget.viewport().update()
+
+        for plot in tuple(getattr(self, "plot_widgets", ())):
+            matched_plot = False
+            for index, record in enumerate(getattr(plot, "signal_records", ())):
+                if record.get("signal_key") != signal_key:
+                    continue
+                matched_plot = True
+                record["curve_visible"] = visible
+                record["data_curve"].setVisible(visible)
+                record["spot_item"].setVisible(
+                    visible and self.cursor_mode == "single"
+                )
+                for cursor_name in ("single", "A", "B"):
+                    labels = getattr(plot, "cursor_labels", {}).get(cursor_name, ())
+                    if index < len(labels):
+                        label_visible = visible and (
+                            self.cursor_mode == "single" if cursor_name == "single"
+                            else self.cursor_mode == "dual"
+                            and (self._cursor_a_time if cursor_name == "A"
+                                 else self._cursor_b_time) is not None
+                        )
+                        labels[index].setVisible(label_visible)
+                legend = getattr(plot, "legend_item", None)
+                if legend is not None:
+                    legend_name = str(record["signal_info"].get(
+                        "display_name", record["signal_info"].get("name", "")
+                    ))
+                    if visible:
+                        if not any(
+                            sample.item is record["data_curve"]
+                            for sample, _label in legend.items
+                        ):
+                            legend.addItem(record["data_curve"], legend_name)
+                    else:
+                        legend.removeItem(record["data_curve"])
+            records = tuple(getattr(plot, "signal_records", ()))
+            if matched_plot and getattr(self, "curve_display_mode", "independent") == "independent":
+                # In independent mode each PlotWidget represents exactly one
+                # signal, so hiding its curve should also hide that plot row.
+                plot.setVisible(visible)
+                continue
+            has_visible_curve = any(
+                record.get("curve_visible", True) for record in records
+            )
+            if matched_plot and len(records) > 1:
+                visible_count = sum(
+                    1 for record in records if record.get("curve_visible", True)
+                )
+                title = f"叠加显示 · {visible_count} 个信号"
+                hidden_count = len(records) - visible_count
+                if hidden_count:
+                    title += f"（已隐藏 {hidden_count}）"
+                plot.setTitle(title)
+            if hasattr(plot, "vLine"):
+                plot.vLine.setVisible(
+                    has_visible_curve and self.cursor_mode == "single"
+                )
+            for name, line in getattr(plot, "measurement_lines", {}).items():
+                time_value = self._cursor_a_time if name == "A" else self._cursor_b_time
+                line.setVisible(
+                    has_visible_curve and self.cursor_mode == "dual"
+                    and time_value is not None
+                )
+            if hasattr(plot, "text_item") and records:
+                plot.text_item.setVisible(
+                    self.cursor_mode == "single"
+                    and records[0].get("curve_visible", True)
+                )
+                plot.update()
 
     def _move_signal_item(self, key, target_row):
         item = self.signal_widgets[key]["checkbox"].item

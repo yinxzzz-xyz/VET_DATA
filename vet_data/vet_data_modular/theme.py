@@ -287,6 +287,22 @@ QLabel[uiEmptyState="true"] {{
     padding: {padding.comfortable}px;
     font-size: {f.body}px;
 }}
+QLabel#selectedMeasurementSummary {{
+    color: {c.text_primary};
+    background-color: {c.background};
+    border: 1px solid {c.border};
+    border-radius: {controls.corner_radius}px;
+    padding: {padding.compact}px {padding.standard}px;
+    font-size: 13px;
+    font-weight: 500;
+}}
+QLabel#leftCurrentFileLabel {{
+    color: {c.text_primary};
+    background-color: {c.surface};
+    border-bottom: 1px solid {c.border};
+    padding: 0 {padding.standard}px;
+    font-size: {f.small}px;
+}}
 QSplitter[uiSplitter="main"]::handle {{
     background-color: {c.border};
 }}

@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import QApplication, QDialog
 from asammdf import Signal
 
 from vet_data_modular import baseline
+from vet_data_modular.data_cutout import CutoutOption, OutputFormat, OutputScope
 from vet_data_modular.math_channel import SearchableMathChannelDialog
 from vet_data_modular.window import MDFPlotter
 from vet_data_modular.workers import LoadResult
@@ -38,6 +39,15 @@ def _wait_for_csv_export(window, timeout=5.0):
         time.sleep(0.005)
     APP.processEvents()
     assert window._csv_export_worker is None
+
+
+def _wait_for_cutout(window, timeout=20.0):
+    deadline = time.monotonic() + timeout
+    while getattr(window, "_cutout_worker", None) is not None and time.monotonic() < deadline:
+        APP.processEvents()
+        time.sleep(0.005)
+    APP.processEvents()
+    assert getattr(window, "_cutout_worker", None) is None
 
 
 def _info(name):
@@ -62,6 +72,23 @@ class _AcceptedMathDialog:
 
     def get_config(self):
         return dict(self.config)
+
+
+class _AcceptedCutoutDialog:
+    option = None
+    path = None
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def exec(self):
+        return QDialog.DialogCode.Accepted
+
+    def selected_option(self):
+        return _AcceptedCutoutDialog.option
+
+    def output_path(self):
+        return _AcceptedCutoutDialog.path
 
 
 class LegacyMathChannelCompatibilityTests(unittest.TestCase):
@@ -276,9 +303,14 @@ class LegacyMathChannelCompatibilityTests(unittest.TestCase):
             self.window.mdf_file = asammdf.MDF(source)
             self._set_signal("MATH_memory_only", [0, 1], [9, 9])
             self.window.master_viewbox = type("Range", (), {"viewRange": lambda _self: [[0.0, 1.0], [0.0, 1.0]]})()
-            with patch.object(baseline.QFileDialog, "getSaveFileName", return_value=(str(output), "")), \
+            _AcceptedCutoutDialog.option = CutoutOption(
+                OutputFormat.MDF, OutputScope.ALL, "全部信号", "",
+            )
+            _AcceptedCutoutDialog.path = output
+            with patch.object(baseline, "CutoutDialog", _AcceptedCutoutDialog), \
                  patch.object(baseline.QMessageBox, "information"):
                 self.window.save_data_cutout()
+                _wait_for_cutout(self.window)
             cut = asammdf.MDF(output)
             names = [channel.name for channel in cut.iter_channels()]
             cut.close()

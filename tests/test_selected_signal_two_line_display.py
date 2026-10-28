@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QApplication, QListWidget, QListWidgetItem
 
 from vet_data_modular.signal_panel import (
     COLOR_ROLE,
+    CURVE_VISIBLE_ROLE,
     KEY_ROLE,
     NAME_ROLE,
     VALUE_ROLE,
@@ -90,6 +91,17 @@ class SelectedSignalTwoLineDisplayTests(unittest.TestCase):
         self.window._dragging_cursor = {"plot": plot, "name": "single"}
         self.window._move_active_cursor(plot, "single", scene_position)
         QTest.qWait(80)
+        APP.processEvents()
+
+    def _click_curve_visibility(self, key):
+        widget = self.window.selected_signal_list_widget
+        item = self._selected_item(key)
+        rect = self.window.selected_signal_delegate.visibility_button_rect(
+            widget.visualItemRect(item)
+        )
+        QTest.mouseClick(
+            widget.viewport(), Qt.MouseButton.LeftButton, pos=rect.center()
+        )
         APP.processEvents()
 
     def test_name_and_value_use_separate_fixed_rows_and_keep_selection_metadata(self):
@@ -180,6 +192,140 @@ class SelectedSignalTwoLineDisplayTests(unittest.TestCase):
             self.assertIsNone(
                 self.window.selected_signal_list_widget.item(row).data(VALUE_ROLE)
             )
+
+    def test_curve_visibility_button_works_in_both_modes_and_survives_rebuilds(self):
+        self.window.plot_selected_signals()
+        selected_widget = self.window.selected_signal_list_widget
+        self.assertEqual(len(self.window.plot_widgets), 2)
+        self.assertEqual(selected_widget.count(), 3)
+        original_order = [
+            selected_widget.item(row).data(KEY_ROLE)
+            for row in range(selected_widget.count())
+        ]
+        speed_plot = next(
+            plot for plot in self.window.plot_widgets
+            if plot.signal_info["name"] == "speed"
+        )
+        rpm_plot = next(
+            plot for plot in self.window.plot_widgets
+            if plot.signal_info["name"] == "rpm"
+        )
+        original_curve = speed_plot.data_curve
+        original_color = original_curve.opts["pen"].color()
+        self.window._update_stats(speed_plot)
+        original_stats = speed_plot.stats_text_item.textItem.toPlainText()
+
+        self.window.single_cursor_button.click()
+        self.window._render_single_cursor_at(0.5)
+        self.assertTrue(speed_plot.data_curve.isVisible())
+        self._click_curve_visibility("speed")
+
+        self.assertFalse(speed_plot.data_curve.isVisible())
+        self.assertFalse(speed_plot.isVisible())
+        self.assertTrue(rpm_plot.isVisible())
+        self.window._update_stats(speed_plot)
+        self.assertTrue(speed_plot.stats_text_item.textItem.toPlainText())
+        self.assertTrue(rpm_plot.data_curve.isVisible())
+        self.assertEqual(selected_widget.count(), 3)
+        self.assertEqual(
+            [selected_widget.item(row).data(KEY_ROLE)
+             for row in range(selected_widget.count())],
+            original_order,
+        )
+        self.assertEqual(self._selected_item("speed").checkState(), Qt.CheckState.Checked)
+        self.assertFalse(self._selected_item("speed").data(CURVE_VISIBLE_ROLE))
+        self.assertFalse(speed_plot.spot_item.isVisible())
+        self.assertFalse(speed_plot.cursor_labels["single"][0].isVisible())
+        self.assertTrue(rpm_plot.cursor_labels["single"][0].isVisible())
+        speed_source = self.window.signal_widgets["speed"]["checkbox"].item
+        speed_source.setCheckState(Qt.CheckState.Unchecked)
+        self.assertNotIn("speed", self.window.get_selected_signals())
+        self.assertFalse(self.window.is_signal_curve_visible("speed"))
+        speed_source.setCheckState(Qt.CheckState.Checked)
+        self.assertFalse(self._selected_item("speed").data(CURVE_VISIBLE_ROLE))
+
+        # Rebuilding independent plots reuses the cached data and keyed visibility state.
+        self.window.plot_selected_signals()
+        speed_plot = next(
+            plot for plot in self.window.plot_widgets
+            if plot.signal_info["name"] == "speed"
+        )
+        rpm_plot = next(
+            plot for plot in self.window.plot_widgets
+            if plot.signal_info["name"] == "rpm"
+        )
+        self.assertFalse(speed_plot.data_curve.isVisible())
+        self.assertFalse(speed_plot.isVisible())
+        self.assertTrue(rpm_plot.data_curve.isVisible())
+        self.assertEqual(speed_plot.data_curve.opts["pen"].color(), original_color)
+        self._click_curve_visibility("speed")
+        self.assertTrue(speed_plot.data_curve.isVisible())
+        self.assertTrue(speed_plot.isVisible())
+        self.assertIsNot(speed_plot.data_curve, original_curve)
+
+        # Overlay mode hides the curve only; its independent axis state is unchanged.
+        self.window.plot_mode_combo.setCurrentIndex(
+            self.window.plot_mode_combo.findData("overlay")
+        )
+        self.assertEqual(len(self.window.plot_widgets), 1)
+        overlay = self.window.plot_widgets[0]
+        manager = overlay.multi_y_axis_manager
+        selected_widget.setCurrentItem(self._selected_item("rpm"))
+        before_axis_states = {
+            key: manager.axis_visible(key) for key in manager.signal_keys
+        }
+        self._click_curve_visibility("rpm")
+        rpm_record = next(
+            record for record in overlay.signal_records
+            if record["signal_key"] == "rpm"
+        )
+        speed_record = next(
+            record for record in overlay.signal_records
+            if record["signal_key"] == "speed"
+        )
+        self.assertFalse(rpm_record["data_curve"].isVisible())
+        self.assertTrue(speed_record["data_curve"].isVisible())
+        self.assertEqual(
+            {key: manager.axis_visible(key) for key in manager.signal_keys},
+            before_axis_states,
+        )
+        self.window.plot_selected_signals()
+        self.assertFalse(next(
+            record["data_curve"].isVisible()
+            for record in self.window.plot_widgets[0].signal_records
+            if record["signal_key"] == "rpm"
+        ))
+
+        # Removing a signal prunes its state; a later signal with the same key is visible.
+        self.window.signals.pop("rpm")
+        self.window.can_parsed_data.pop("rpm")
+        self.window.refresh_signal_list_ui()
+        self.assertNotIn("rpm", self.window._signal_curve_visibility)
+        self.window.signals["rpm"] = {
+            "name": "rpm", "display_name": "Engine RPM",
+            "comment": "rpm", "bus_id": None,
+        }
+        self.window.can_parsed_data["rpm"] = {
+            "timestamps": np.array([0.0, 1.0, 2.0]),
+            "samples": np.array([100.0, 200.0, 300.0]),
+            "unit": "rpm",
+        }
+        self.window.refresh_signal_list_ui()
+        rpm_source = next(
+            self.window.signal_list_widget.item(row)
+            for row in range(self.window.signal_list_widget.count())
+            if self.window.signal_list_widget.item(row).data(KEY_ROLE) == "rpm"
+        )
+        rpm_source.setCheckState(Qt.CheckState.Checked)
+        self.window.plot_selected_signals()
+        self.assertTrue(next(
+            record["data_curve"].isVisible()
+            for plot in self.window.plot_widgets
+            for record in plot.signal_records
+            if record["signal_key"] == "rpm"
+        ))
+        self.window._clear_current_can_state()
+        self.assertFalse(self.window._signal_curve_visibility)
 
 
 if __name__ == "__main__":

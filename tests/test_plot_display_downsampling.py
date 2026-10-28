@@ -4,12 +4,14 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from PyQt6.QtCore import QPoint, QPointF, Qt
+from PyQt6 import sip
+from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
 from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtTest import QTest
 
 from vet_data_modular.signal_panel import INTERVAL_ROLE, KEY_ROLE, MEASUREMENT_ROLE
+from vet_data_modular.multi_y_axis import MultiYAxisManager
 from vet_data_modular.window import MDFPlotter
 
 
@@ -284,12 +286,58 @@ class PlotDisplayDownsamplingTests(unittest.TestCase):
         self.assertEqual([record["signal_key"] for record in records], selected_before)
         self.assertEqual(len(records), 2)
         self.assertEqual(len({id(record["data_curve"]) for record in records}), 2)
-        plot_items = plot.listDataItems()
-        self.assertTrue(all(record["data_curve"] in plot_items for record in records))
+        manager = plot.multi_y_axis_manager
+        self.assertIsInstance(manager, MultiYAxisManager)
+        self.assertIs(plot.parentWidget(), plot.axis_scroll_container)
+        self.assertFalse(plot.y_axis_scroll_bar.isVisible())
+        self.assertEqual(plot.y_axis_scroll_bar.maximum(), 0)
+        APP.processEvents()
+        current_axis_key = manager.current_signal_key
+        self.assertEqual(manager.displayed_axis_keys, (current_axis_key,))
+        self.assertTrue(manager.axis_visible(current_axis_key))
+        for record in records:
+            axis_item = manager.axis_item(record["signal_key"])
+            self.assertIsNotNone(axis_item)
+            self.assertIs(axis_item.linkedView(), record["view_box"])
+            self.assertEqual(
+                axis_item.pen().color(), record["data_curve"].opts["pen"].color()
+            )
+            self.assertEqual(axis_item.isVisible(), record["signal_key"] == current_axis_key)
+            if record["signal_key"] in manager.displayed_axis_keys:
+                view_rect = record["view_box"].sceneBoundingRect()
+                self.assertAlmostEqual(
+                    axis_item.geometry().height(), view_rect.height(), delta=1.0
+                )
+        initial_axis_ranges = {key: manager.y_range(key) for key in manager.signal_keys}
+        other_axis_key = next(
+            key for key in manager.signal_keys if key != current_axis_key
+        )
+        manager.set_axis_visible(other_axis_key, True)
+        APP.processEvents()
+        self.assertCountEqual(manager.displayed_axis_keys, manager.signal_keys)
+        manager.set_axis_visible(other_axis_key, False)
+        APP.processEvents()
+        self.assertEqual(
+            {key: manager.y_range(key) for key in manager.signal_keys}, initial_axis_ranges
+        )
+        visible_axis_width = sum(
+            manager.axis_item(key).boundingRect().width()
+            for key in manager.displayed_axis_keys
+        )
+        self.assertLessEqual(visible_axis_width, plot.width() * 0.5 + 1)
         self.assertTrue(all(
-            record["data_curve"].getViewBox() is plot.getViewBox()
+            record["data_curve"].getViewBox() is manager.view_box(record["signal_key"])
+            is record["view_box"]
             for record in records
         ))
+        self.assertEqual(
+            len({id(record["view_box"]) for record in records}), len(records)
+        )
+        self.assertEqual(
+            {record["signal_key"]: manager.y_range(record["signal_key"])
+             for record in records},
+            {"speed": (-4.0, 14.0), "rpm": (-400.0, 1400.0)},
+        )
         self.assertEqual(
             {record["signal_key"]: record["data_curve"].opts["pen"].color()
              for record in records},
@@ -318,6 +366,8 @@ class PlotDisplayDownsamplingTests(unittest.TestCase):
         )
         self.assertEqual(self.window.get_selected_signals(), selected_before)
         self.assertEqual(plot.stats_text_item.isVisible(), True)
+        initial_current_signal = manager.current_signal_key
+        self.assertTrue(manager.axis_visible(initial_current_signal))
 
         selected_list = self.window.selected_signal_list_widget
         moved_item = selected_list.takeItem(1)
@@ -326,12 +376,30 @@ class PlotDisplayDownsamplingTests(unittest.TestCase):
         self.window.plot_selected_signals()
         plot = self.window.plot_widgets[0]
         records = plot.signal_records
+        manager = plot.multi_y_axis_manager
         self.assertEqual(
             [record["signal_key"] for record in records],
             self.window.get_selected_signals(),
         )
         self.assertEqual(self.window.get_selected_signals(), list(reversed(selected_before)))
         selected_before = self.window.get_selected_signals()
+        manager = plot.multi_y_axis_manager
+        self.assertIn(manager.current_signal_key, manager.signal_keys)
+        self.assertTrue(manager.axis_visible(manager.current_signal_key))
+        visible_axes_before_switch = {
+            key for key in manager.signal_keys if manager.axis_visible(key)
+        }
+        current_speed_item = next(
+            self.window.selected_signal_list_widget.item(row)
+            for row in range(self.window.selected_signal_list_widget.count())
+            if self.window.selected_signal_list_widget.item(row).data(KEY_ROLE) == "speed"
+        )
+        self.window.selected_signal_list_widget.setCurrentItem(current_speed_item)
+        self.assertEqual(manager.current_signal_key, "speed")
+        self.assertTrue(manager.axis_visible("speed"))
+        self.assertTrue(all(
+            manager.axis_visible(key) for key in visible_axes_before_switch
+        ))
 
         self.window.master_viewbox.setXRange(3.0, 7.0, padding=0)
         APP.processEvents()
@@ -339,8 +407,35 @@ class PlotDisplayDownsamplingTests(unittest.TestCase):
             self.window.shared_time_axis_widget.getViewBox().viewRange()[0],
             self.window.master_viewbox.viewRange()[0],
         )
+        previous_x_range = tuple(self.window.master_viewbox.viewRange()[0])
+        previous_y_ranges = {
+            key: manager.y_range(key) for key in manager.signal_keys
+        }
+        viewport = plot.viewport()
+        wheel_point = QPoint(viewport.width() // 2, viewport.height() // 2)
+        wheel_event = QWheelEvent(
+            QPointF(wheel_point),
+            QPointF(viewport.mapToGlobal(wheel_point)),
+            QPoint(0, 0), QPoint(0, 120),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate, False,
+        )
+        QApplication.sendEvent(viewport, wheel_event)
+        APP.processEvents()
+        self.assertFalse(np.allclose(
+            self.window.master_viewbox.viewRange()[0], previous_x_range
+        ))
+        for key in manager.signal_keys:
+            np.testing.assert_allclose(
+                manager.view_box(key).viewRange()[0],
+                self.window.master_viewbox.viewRange()[0],
+            )
+            self.assertEqual(manager.y_range(key), previous_y_ranges[key])
 
         self.window.single_cursor_button.click()
+        self.window.master_viewbox.setXRange(0.0, 10.0, padding=0)
+        APP.processEvents()
+        plot.vLine.setPos(0.0)
         self._drag_cursor(plot, "single", 5.0)
         self.assertTrue(all(
             len(record["spot_item"].getData()[0]) == 1 for record in records
@@ -351,7 +446,17 @@ class PlotDisplayDownsamplingTests(unittest.TestCase):
             shown_time, shown_value = label.textItem.toPlainText().split(", ")
             self.assertAlmostEqual(float(shown_time), 5.0, delta=0.02)
             shown_values.append(float(shown_value))
-        self.assertCountEqual(shown_values, (5.1, 510.0))
+        expected_cursor_values = []
+        for record in records:
+            index = int(np.searchsorted(
+                record["signal_data"].timestamps, plot.vLine.value()
+            ))
+            index = min(index, len(record["signal_data"].samples) - 1)
+            expected_cursor_values.append(float(record["signal_data"].samples[index]))
+        self.assertCountEqual(
+            [round(value, 3) for value in shown_values],
+            [round(value, 3) for value in expected_cursor_values],
+        )
         self.window.single_cursor_button.click()
         self.assertFalse(plot.vLine.isVisible())
         self.assertTrue(all(not record["spot_item"].isVisible() for record in records))
@@ -382,12 +487,30 @@ class PlotDisplayDownsamplingTests(unittest.TestCase):
 
         # Independent mode remains one plot per signal; switching preserves selection.
         self.window.signal_list_widget.item(0).setCheckState(Qt.CheckState.Checked)
+        old_managed_views = tuple(
+            manager.view_box(key) for key in manager.signal_keys
+        )
+        old_axis_items = tuple(
+            manager.axis_item(key) for key in manager.signal_keys
+        )
+        old_scroll_bar = plot.y_axis_scroll_bar
+        old_axis_container = plot.axis_scroll_container
         self.window.plot_mode_combo.setCurrentIndex(
             self.window.plot_mode_combo.findData("independent")
         )
         self.assertEqual(len(self.window.plot_widgets), 2)
         self.assertTrue(all(len(widget.signal_records) == 1
                             for widget in self.window.plot_widgets))
+        self.assertTrue(all(
+            getattr(widget, "multi_y_axis_manager", None) is None
+            for widget in self.window.plot_widgets
+        ))
+        APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        APP.processEvents()
+        self.assertTrue(all(sip.isdeleted(view_box) for view_box in old_managed_views))
+        self.assertTrue(all(sip.isdeleted(axis) for axis in old_axis_items))
+        self.assertTrue(sip.isdeleted(old_scroll_bar))
+        self.assertTrue(sip.isdeleted(old_axis_container))
         self.assertEqual(self.window.get_selected_signals(), selected_before)
         self.window.plot_mode_combo.setCurrentIndex(
             self.window.plot_mode_combo.findData("overlay")

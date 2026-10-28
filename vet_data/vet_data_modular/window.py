@@ -41,7 +41,7 @@ from .signal_resolver import SignalResolver
 from .theme import DEFAULT_THEME, build_main_window_stylesheet
 from .workers import (
     BusyLoadDialog, CanBusDetectionDialog, CanBusDetectionWorker,
-    CsvExportSignal, CsvExportSnapshot, CsvExportWorker, DataLoadWorker,
+    CanRawMessageCache, CsvExportSignal, CsvExportSnapshot, CsvExportWorker, DataLoadWorker,
     FormulaRestoreWorker, normalized_can_path,
 )
 
@@ -69,10 +69,15 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self._csv_export_worker = None
         self._csv_export_dialog = None
         self._close_after_csv_export = False
+        self._cutout_worker = None
+        self._cutout_progress = None
+        self._cutout_option = None
+        self._close_after_cutout = False
         self._close_after_arxml_conversion = False
         self._pending_can_config = None
         self._pending_signal_restore = None
         self._can_task_generation = 0
+        self._can_raw_message_cache = {}
         self._reusable_can_config = None
         self._selected_can_config = {}
         self.math_channel_button.setText("公式")
@@ -486,7 +491,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         token = self._selection_record_token(saved_key, identity)
         self._selected_can_config.pop(token, None)
 
-    def _apply_can_selection(self, selected_keys, identity_map=None):
+    def _apply_can_selection(self, selected_keys, identity_map=None, *, plot=True):
         selected_keys = list(dict.fromkeys(selected_keys or ()))
         identity_map = identity_map or {}
         self._selected_can_config.clear()
@@ -530,7 +535,8 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                 "以下已选信号在当前解析目录中暂未匹配，仍保留为已选配置；请检查 DBC 和通道映射：\n"
                 + "\n".join(undefined),
             )
-        self.plot_selected_signals()
+        if plot:
+            self.plot_selected_signals()
         return undefined
 
     def _identity_has_dbc_definition(self, identity):
@@ -598,15 +604,22 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             }
             self._add_pending_selection_rows()
             self.auto_parse_enabled = True
+            self._auto_parse_suppressed_for_restore = True
             readable_protocols = []
             for bus_id, protocol in self.bus_protocols.items():
                 if os.path.isfile(protocol) and os.access(protocol, os.R_OK):
                     readable_protocols.append(bus_id)
-                    QTimer.singleShot(0, lambda b=bus_id: self.start_parse_with_progress(b))
+                    self.on_bus_protocol_changed(bus_id, protocol)
+            self._select_restored_can_catalog_signals(readable_protocols)
+            expected_buses = set(self._pending_signal_restore["expected_buses"])
+            for bus_id in expected_buses - set(readable_protocols):
+                self.can_bus_data.setdefault(bus_id, {})["parse_state"] = "failed"
+                self.can_bus_data[bus_id]["parse_error"] = "DBC 不存在或不可读"
+                self._complete_pending_signal_restore(bus_id, plot=False)
             if not readable_protocols and not unavailable:
                 QMessageBox.warning(
                     self, "需要选择 DBC",
-                    "配置已读取并保留。请在每个 CAN 通道中重新选择可读取的 DBC，然后点击“解析”。",
+                    "配置已读取并保留。请在每个 CAN 通道中重新选择可读取的 DBC，然后选择信号并点击“绘图”。",
                 )
         except Exception as exc:
             self._pending_can_config = None
@@ -623,6 +636,24 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             lines.extend(("", "已将旧二元计算配置迁移为 Config V2 定义。"))
         return "\n".join(lines)
 
+    def _select_restored_can_catalog_signals(self, readable_buses):
+        """Restore checkboxes from DBC identities before deferred decoding."""
+        pending = self._pending_signal_restore
+        if not pending:
+            return
+        selected = pending.get("selected", ())
+        identities = pending.get("identities", {})
+        self._apply_can_selection(selected, identities, plot=False)
+        needed_buses = {
+            self.signals[key].get("bus_id")
+            for key in selected if key in self.signals
+            and self.signals[key].get("bus_id") is not None
+        }
+        pending["expected_buses"] = needed_buses & set(readable_buses)
+        if not pending["expected_buses"]:
+            for bus_id in tuple(readable_buses):
+                self._complete_pending_signal_restore(bus_id, plot=False)
+
     def _finish_loaded_config(self, report, managed_ids, config_data, context):
         if context != self._formula_context_token():
             return
@@ -632,7 +663,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         selected_keys = set(config_data.get("selected_signals", ()))
         if Path(self.mdf_path).suffix.casefold() in {".blf", ".asc", ".trc"}:
             self._apply_can_selection(
-                selected_keys, config_data.get("signal_identities", {})
+                selected_keys, config_data.get("signal_identities", {}), plot=False
             )
         else:
             for unique_key, widgets in self.signal_widgets.items():
@@ -1035,6 +1066,25 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             items = [item for item in items if isinstance(item, dict)]
             label = next((item.get("signal_name") for item in items if item.get("signal_name")), saved_key)
             bus_id = next((item.get("bus_id") for item in items if item.get("bus_id") is not None), None)
+            aliases = {
+                alias for item in items
+                for alias in self._identity_alias_tokens(item, bus_id)
+            }
+            existing_key = None
+            for candidate_key, candidate in self.signals.items():
+                candidate_identity = candidate.get("signal_identity") or candidate.get("config_identity")
+                candidate_aliases = set(self._identity_alias_tokens(candidate_identity, candidate.get("bus_id")))
+                if aliases and aliases.intersection(candidate_aliases):
+                    existing_key = candidate_key
+                    break
+                if candidate.get("selection_key") == saved_key:
+                    existing_key = candidate_key
+                    break
+            if existing_key is not None:
+                record["ui_key"] = existing_key
+                if existing_key in self.signal_widgets:
+                    self.signal_widgets[existing_key]["checkbox"].setChecked(True)
+                continue
             self.signals[key] = {
                 "name": key,
                 "display_name": f"🚌 {label}（等待当前 BLF 解析）",
@@ -1055,6 +1105,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
 
     def _clear_current_can_state(self):
         self._clear_cursor_positions_for_data_change()
+        self._close_overlay_y_axis_managers(preserve_state=False)
         for worker in tuple(getattr(self, "parse_workers", {}).values()):
             try:
                 if worker.isRunning():
@@ -1064,6 +1115,9 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                 pass
         getattr(self, "parse_workers", {}).clear()
         getattr(self, "_parsing_bus_ids", set()).clear()
+        getattr(self, "_can_raw_message_cache", {}).clear()
+        self._pending_signal_restore = None
+        self.clear_signal_curve_visibility()
         self.signals.clear()
         self.can_parsed_data.clear()
         self.bus_signal_map.clear()
@@ -1077,8 +1131,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.can_detection_snapshot = None
         self.bus_loaded = False
         for plot in self.plot_widgets:
-            plot.setParent(None)
-            plot.deleteLater()
+            self._delete_plot_widget(plot)
         self.plot_widgets.clear()
         self.master_viewbox = None
         self._sig_value_cache.clear()
@@ -1087,6 +1140,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
 
     def _clear_can_parse_results_keep_detection(self):
         self._clear_cursor_positions_for_data_change()
+        self._close_overlay_y_axis_managers(preserve_state=False)
         for worker in tuple(self.parse_workers.values()):
             try:
                 if worker.isRunning():
@@ -1096,15 +1150,16 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                 pass
         self.parse_workers.clear()
         self._parsing_bus_ids.clear()
+        getattr(self, "_can_raw_message_cache", {}).clear()
         for key in tuple(self.can_parsed_data):
             self.can_parsed_data.pop(key, None)
+        self.clear_signal_curve_visibility()
         self.bus_signal_map.clear()
         self.custom_math_data.clear()
         self.signals.clear()
         self._sig_value_cache.clear()
         for plot in self.plot_widgets:
-            plot.setParent(None)
-            plot.deleteLater()
+            self._delete_plot_widget(plot)
         self.plot_widgets.clear()
         self.master_viewbox = None
         for dialog in tuple(self.progress_dialogs.values()):
@@ -1128,6 +1183,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
         self.calculated_signal_definitions.clear()
         self._formula_restore_report = None
         self.can_bus_data.clear(); self.db_per_bus.clear(); self.bus_protocols.clear(); self.can_bus_signals.clear()
+        getattr(self, "_can_raw_message_cache", {}).clear()
         self.can_bus_mapping = None
         self.can_detection_snapshot = None
         self.clear_bus_config(); self._sig_value_cache.clear(); self._user_signal_order.clear()
@@ -1173,6 +1229,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                 )
             self.auto_parse_enabled = True
             readable_protocols = []
+            self._auto_parse_suppressed_for_restore = True
             self._pending_signal_restore = {
                 "selected": list(self._reusable_can_selection or {}),
                 "identities": {
@@ -1187,9 +1244,10 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
                 protocol = self.bus_protocols.get(bus_id)
                 if protocol and os.path.isfile(protocol) and os.access(protocol, os.R_OK):
                     readable_protocols.append(bus_id)
-                    QTimer.singleShot(0, lambda b=bus_id: self.start_parse_with_progress(b))
+                    self.on_bus_protocol_changed(bus_id, protocol)
                 elif protocol:
                     QMessageBox.warning(self, "DBC 不可用", f"无法读取 DBC：{protocol}\n请重新选择 DBC。")
+            self._select_restored_can_catalog_signals(readable_protocols)
             if not readable_protocols and not unavailable:
                 QMessageBox.warning(
                     self, "需要选择 DBC",
@@ -1198,7 +1256,7 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             for bus_id in self._pending_signal_restore["expected_buses"] - set(readable_protocols):
                 self.can_bus_data.setdefault(bus_id, {})["parse_state"] = "failed"
                 self.can_bus_data[bus_id]["parse_error"] = "DBC 不存在或不可读"
-                self._complete_pending_signal_restore(bus_id)
+                self._complete_pending_signal_restore(bus_id, plot=False)
         if Path(self.mdf_path).suffix.casefold() == ".blf":
             self.left_tabs.setCurrentWidget(self.can_tab_page)
 
@@ -1245,6 +1303,13 @@ class MDFPlotter(SignalPanelMixin, PlotPanelMixin, CollapsiblePanelsMixin, basel
             event.ignore()
             return
         self._close_after_arxml_conversion = False
+        if self._cutout_worker is not None and self._cutout_worker.isRunning():
+            self._cutout_worker.cancel()
+            self._close_after_cutout = True
+            if self._cutout_progress is not None:
+                self._cutout_progress.set_status("正在安全停止数据截取…")
+            event.ignore()
+            return
         if self._csv_export_worker is not None and self._csv_export_worker.isRunning():
             self._csv_export_worker.cancel()
             self._close_after_csv_export = True

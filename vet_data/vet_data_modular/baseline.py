@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QInputDialog, QMessageBox, QComboBox,
                              QFrame, QProgressBar,
                              QSplitter, QSizePolicy, QTreeWidget, QTreeWidgetItem,
-                             QTextEdit, QHeaderView, QTabWidget)
+                             QTextEdit, QHeaderView, QTabWidget, QScrollBar)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtCore import QPointF, QSize, QSignalBlocker, Qt, QTimer, pyqtSignal, QThread
 import numpy as np
@@ -34,12 +34,21 @@ import time
 import multiprocessing
 
 from .signal_resolver import SignalResolutionError, SignalResolver
+from .multi_y_axis import MultiYAxisManager
+from .cutout_dialog import CutoutDialog, CutoutProgressDialog, load_last_mode
+from .cutout_worker import CutoutWorker
+from .data_cutout import (
+    CutoutContext, CutoutJob, CutoutWindow, OutputFormat,
+    OutputScope, SignalSeries, SourceKind, clean_signal_name,
+    execute_cutout_job, source_kind,
+)
 from .theme import (
     DEFAULT_THEME, build_arxml_converter_stylesheet, build_can_config_stylesheet,
     build_signal_filter_stylesheet,
 )
 from .workers import (
     CanDetectionSnapshot,
+    CanRawMessageCache,
     capture_can_file_identity,
     detect_can_bus_info,
     message_raw_channel,
@@ -1672,7 +1681,13 @@ class BusConfigWidget(QWidget):
         new_messages = []
         auto_added = 0
         for msg_def in db.messages:
-            selected_names = set(selected_signals.get(msg_def.frame_id, ()))
+            frame_key = (
+                int(msg_def.frame_id),
+                bool(getattr(msg_def, 'is_extended_frame', False)),
+            )
+            selected_names = set(selected_signals.get(
+                frame_key, selected_signals.get(msg_def.frame_id, ())
+            ))
             if not selected_names:
                 continue
 
@@ -2107,6 +2122,10 @@ class ParseWorker(QThread):
         self.db = db
         self.arxml_sub_bus = arxml_sub_bus
         self._is_running = True
+        self.raw_message_cache = None
+        self.raw_cache_collectors = {}
+        self.raw_cache_frame_keys = frozenset()
+        self.progress_message_total = msg_count
 
         # ===== 多路复用映射（从 main_py.py 移植） =====
         self.multiplexer_signals = {}
@@ -2374,30 +2393,8 @@ class ParseWorker(QThread):
     def stop(self):
         self._is_running = False
 
-    def run(self):
+    def _parse_stream(self):
         try:
-            if capture_can_file_identity(self.log_path) != self.file_identity:
-                raise ValueError("CAN日志在解析启动前发生变化，请重新探测")
-            print(f"\n{'=' * 70}")
-            print(f"🚀 [Bus {self.bus_id}] 开始解析")
-            print(f"   日志文件: {self.log_path}")
-            print(f"   数据库消息数: {len(self.db.messages)}")
-            print(f"   是否多路复用: {self.is_multiplexer}")
-            if self.is_multiplexer:
-                print(f"   检测到 {len(self.container_frames_info)} 个容器帧:")
-                for _frame_key, info in self.container_frames_info.items():
-                    frame_id = info['frame_id']
-                    print(
-                        f"     0x{frame_id:X} ({info['frame_name']}) - Header总位数: {info['header_total_bits']} bits")
-                    print(f"     分组数: {len(info['multiplexer_signals'])}")
-            print(f"{'=' * 70}")
-
-            # 打开日志文件
-            if self.log_path.lower().endswith('.blf'):
-                reader = can.BLFReader(self.log_path)
-            else:
-                reader = can.LogReader(self.log_path)
-
             # ===== 构建消息映射 =====
             msg_shard = {}
             signal_identity = {}
@@ -2425,7 +2422,7 @@ class ParseWorker(QThread):
                 f"{message_labels}"
             )
 
-            total_msgs = self.msg_count
+            total_msgs = self.progress_message_total
             print(f"总线 {self.bus_id}: 探测消息总数: {total_msgs}")
 
             t0 = None
@@ -2453,17 +2450,20 @@ class ParseWorker(QThread):
 
             last_progress_update = 0
             last_progress_percent = 0
+            frame_match_seconds = 0.0
+            signal_decode_seconds = 0.0
+            result_append_seconds = 0.0
 
             # ===== 遍历所有消息 =====
             print(f"\n📖 开始遍历消息...")
 
-            for msg in reader:
-                if not self._is_running:
-                    print("⏹ 解析被用户停止")
+            while True:
+                stream_item = yield
+                if stream_item is None:
                     break
-
+                msg, file_t0 = stream_item
                 if t0 is None:
-                    t0 = msg.timestamp
+                    t0 = file_t0
 
                 raw_channel = message_raw_channel(msg)
                 if raw_channel != self.target_raw_channel:
@@ -2500,7 +2500,9 @@ class ParseWorker(QThread):
                     print(f"   raw_channel: {raw_channel}, bus_id: {self.bus_id}")
 
                 message_key = (msg_id, is_extended_id)
+                match_started = time.perf_counter()
                 msg_def = msg_shard.get(message_key)
+                frame_match_seconds += time.perf_counter() - match_started
                 if msg_def is None:
                     unmatched_msg_ids.add(msg_id)
                     dbc_undefined_frames += 1
@@ -2509,6 +2511,7 @@ class ParseWorker(QThread):
                 matched_msg_ids.add(msg_id)
                 matched_frames.add(message_key)
                 total_messages_processed += 1
+                decode_started = time.perf_counter()
                 frame_signals_before = total_signals_decoded
                 frame_decode_failed = False
                 is_truncated = (
@@ -2603,8 +2606,10 @@ class ParseWorker(QThread):
                                                     f"               start={sig_info['start']}, length={sig_info['length']}")
 
                                             pack = pool[sig_info['name']]
+                                            append_started = time.perf_counter()
                                             pack['t'].append(rel_t)
                                             pack['v'].append(physical_value)
+                                            result_append_seconds += time.perf_counter() - append_started
                                             if not pack['unit']:
                                                 pack['unit'] = sig_info['unit']
                                                 pack['comment'] = f"ID: 0x{msg_id:X}, Header_ID: 0x{header_id:X}"
@@ -2688,8 +2693,10 @@ class ParseWorker(QThread):
                                         if raw_value is not None:
                                             physical_value = raw_value * sig_info['scale'] + sig_info['offset']
                                             pack = pool[sig_info['name']]
+                                            append_started = time.perf_counter()
                                             pack['t'].append(rel_t)
                                             pack['v'].append(physical_value)
+                                            result_append_seconds += time.perf_counter() - append_started
                                             if not pack['unit']:
                                                 pack['unit'] = sig_info['unit']
                                                 pack['comment'] = f"ID: 0x{msg_id:X}, Header_ID: 0x{header_id:X}"
@@ -2742,8 +2749,10 @@ class ParseWorker(QThread):
                             if not isinstance(sig_val, (int, float)):
                                 continue
                             pack = pool[sig_name]
+                            append_started = time.perf_counter()
                             pack['t'].append(rel_t)
                             pack['v'].append(float(sig_val))
+                            result_append_seconds += time.perf_counter() - append_started
                             if not pack['unit']:
                                 sig_obj = msg_def.get_signal_by_name(sig_name)
                                 if sig_obj:
@@ -2761,16 +2770,7 @@ class ParseWorker(QThread):
                     decoded_frames += 1
                 elif not frame_decode_failed:
                     empty_decoded_frames += 1
-
-            try:
-                reader.stop()
-            except Exception:
-                pass
-            if not self._is_running:
-                self.parse_cancelled.emit(self.bus_id)
-                return
-            if capture_can_file_identity(self.log_path) != self.file_identity:
-                raise ValueError("CAN日志在解析期间发生变化，请重新探测")
+                signal_decode_seconds += time.perf_counter() - decode_started
 
             # ===== 打印统计 =====
             print(f"\n{'=' * 70}")
@@ -2843,15 +2843,355 @@ class ParseWorker(QThread):
                 },
                 'pool': pool,
                 'signal_identity': signal_identity,
+                'target_frame_match_seconds': frame_match_seconds,
+                'signal_decode_seconds': signal_decode_seconds,
+                'result_append_seconds': result_append_seconds,
+                'generated_sample_count': sum(len(pack['t']) for pack in pool.values()),
             }
 
-            self.parse_finished.emit(self.bus_id, stats)
+            return stats
 
+        except GeneratorExit:
+            raise
+
+    def run(self):
+        reader = None
+        context = None
+        scan_collectors = ()
+        try:
+            if capture_can_file_identity(self.log_path) != self.file_identity:
+                raise ValueError("CAN日志在解析启动前发生变化，请重新探测")
+            print(f"\n{'=' * 70}")
+            print(f"🚀 [Bus {self.bus_id}] 开始解析")
+            print(f"   日志文件: {self.log_path}")
+            print(f"   数据库消息数: {len(self.db.messages)}")
+            print(f"   是否多路复用: {self.is_multiplexer}")
+            if self.is_multiplexer:
+                print(f"   检测到 {len(self.container_frames_info)} 个容器帧:")
+                for _frame_key, info in self.container_frames_info.items():
+                    print(f"     0x{info['frame_id']:X} ({info['frame_name']}) - Header总位数: {info['header_total_bits']} bits")
+                    print(f"     分组数: {len(info['multiplexer_signals'])}")
+            context = ParseContext(self)
+            context.start()
+            cache_replay = self.raw_message_cache
+            if cache_replay is not None and cache_replay.complete:
+                frame_keys = {
+                    (int(message.frame_id), bool(getattr(message, 'is_extended_frame', False)))
+                    for message in self.db.messages
+                }
+                replay_count = cache_replay.count_frame_keys(frame_keys)
+                self.progress_message_total = max(1, replay_count)
+                self.progress_updated.emit(self.bus_id, 1, "正在从原始报文缓存增量解析…")
+                replay_started = time.perf_counter()
+                for msg, file_t0 in cache_replay.iter_messages(frame_keys):
+                    if not self._is_running:
+                        break
+                    context.feed(msg, file_t0)
+                replay_seconds = time.perf_counter() - replay_started
+                if not self._is_running:
+                    context.close()
+                    for cache in scan_collectors:
+                        cache.reset()
+                    self.parse_cancelled.emit(self.bus_id)
+                    return
+                stats = context.finish()
+                stats.update({
+                    'cache_hit': True,
+                    'cache_replayed_frames': replay_count,
+                    'full_file_scan_seconds': 0.0,
+                    'cache_replay_seconds': replay_seconds,
+                    'raw_cache_frame_count': cache_replay.frame_count,
+                    'raw_cache_payload_bytes': cache_replay.payload_bytes,
+                    'raw_cache_memory_bytes': cache_replay.memory_bytes,
+                })
+            else:
+                reader = can.BLFReader(self.log_path) if self.log_path.lower().endswith('.blf') else can.LogReader(self.log_path)
+                collectors_by_raw = self.raw_cache_collectors or {}
+                collectors = tuple({
+                    id(cache): cache
+                    for group in collectors_by_raw.values()
+                    for cache in group
+                }.values())
+                scan_collectors = collectors
+                file_t0 = None
+                target_processing_seconds = 0.0
+                cache_collection_seconds = 0.0
+                scan_started = time.perf_counter()
+                for msg in reader:
+                    if not self._is_running:
+                        break
+                    if file_t0 is None:
+                        file_t0 = msg.timestamp
+                    raw_channel = message_raw_channel(msg)
+                    cache_started = time.perf_counter()
+                    for cache in collectors_by_raw.get(raw_channel, ()):
+                        cache.append(msg, file_t0, raw_channel=raw_channel)
+                    cache_collection_seconds += time.perf_counter() - cache_started
+                    if raw_channel == self.target_raw_channel:
+                        target_started = time.perf_counter()
+                        context.feed(msg, file_t0)
+                        target_processing_seconds += time.perf_counter() - target_started
+                scan_seconds = time.perf_counter() - scan_started
+                if not self._is_running:
+                    context.close()
+                    self.parse_cancelled.emit(self.bus_id)
+                    return
+                stats = context.finish()
+                stats.update({
+                    'cache_hit': False,
+                    'cache_replayed_frames': 0,
+                    'full_file_scan_seconds': scan_seconds,
+                    'target_processing_seconds': target_processing_seconds,
+                    'cache_collection_seconds': cache_collection_seconds,
+                    'raw_cache_frame_count': sum(cache.frame_count for cache in collectors),
+                    'raw_cache_payload_bytes': sum(cache.payload_bytes for cache in collectors),
+                    'raw_cache_memory_bytes': sum(cache.memory_bytes for cache in collectors),
+                })
+            if capture_can_file_identity(self.log_path) != self.file_identity:
+                raise ValueError("CAN日志在解析期间发生变化，请重新探测")
+            if not (cache_replay is not None and cache_replay.complete):
+                for cache in scan_collectors:
+                    cache.finish_scan(file_t0)
+            if not (cache_replay is not None and cache_replay.complete) and stats['scanned_frames'] != self.msg_count:
+                raise ValueError(f"Bus {self.bus_id} 扫描计数与探测快照不一致: {stats['scanned_frames']} != {self.msg_count}")
+            self.parse_finished.emit(self.bus_id, stats)
         except Exception as e:
+            if context is not None:
+                context.close()
+            for cache in scan_collectors:
+                if not cache.complete:
+                    cache.reset()
             print(f"❌ [Bus {self.bus_id}] 解析异常: {e}")
             import traceback
             traceback.print_exc()
             self.parse_error.emit(self.bus_id, str(e))
+        finally:
+            if reader is not None:
+                try:
+                    reader.stop()
+                except Exception:
+                    pass
+
+
+class ParseContext:
+    """Incremental per-bus parser state shared by standalone and batch workers."""
+    def __init__(self, parser):
+        self.parser = parser
+        self._stream = parser._parse_stream()
+        self._started = False
+        self._finished = False
+
+    def start(self):
+        if not self._started:
+            next(self._stream)
+            self._started = True
+
+    def feed(self, message, file_t0):
+        if self._finished:
+            raise RuntimeError("解析上下文已结束")
+        self.start()
+        try:
+            self._stream.send((message, file_t0))
+        except StopIteration as exc:
+            self._finished = True
+            raise RuntimeError("解析上下文提前结束") from exc
+
+    def finish(self):
+        if self._finished:
+            raise RuntimeError("解析上下文已结束")
+        self.start()
+        try:
+            self._stream.send(None)
+        except StopIteration as exc:
+            self._finished = True
+            return exc.value
+        raise RuntimeError("解析上下文未正常结束")
+
+    def close(self):
+        if not self._finished:
+            self._stream.close()
+            self._finished = True
+
+
+class MultiBusParseWorker(QThread):
+    """Scan one CAN log once and feed each raw channel to its own parser."""
+
+    def __init__(self, parsers, parent=None):
+        super().__init__(parent)
+        self.parsers = {parser.bus_id: parser for parser in parsers}
+        self.contexts = {
+            bus_id: ParseContext(parser)
+            for bus_id, parser in self.parsers.items()
+        }
+        self._cancelled_bus_ids = set()
+        self.raw_cache_collectors = (
+            next(iter(self.parsers.values())).raw_cache_collectors
+            if self.parsers else {}
+        )
+
+    def cancel_bus(self, bus_id):
+        if bus_id in self.parsers:
+            self._cancelled_bus_ids.add(bus_id)
+            self.parsers[bus_id].stop()
+
+    def stop(self):
+        for bus_id in self.parsers:
+            self.cancel_bus(bus_id)
+
+    def _emit_error(self, bus_id, error):
+        self.parsers[bus_id].parse_error.emit(bus_id, str(error))
+
+    def run(self):
+        readers = None
+        file_identity = None
+        terminal_bus_ids = set()
+        try:
+            if not self.parsers:
+                return
+            first_parser = next(iter(self.parsers.values()))
+            file_identity = first_parser.file_identity
+            for parser in self.parsers.values():
+                if parser.file_identity != file_identity or parser.log_path != first_parser.log_path:
+                    raise ValueError("批量解析目标必须来自同一文件快照")
+            if capture_can_file_identity(first_parser.log_path) != file_identity:
+                raise ValueError("CAN日志在解析启动前发生变化，请重新探测")
+
+            for context in self.contexts.values():
+                context.start()
+            parsers_by_raw_channel = defaultdict(list)
+            for bus_id, parser in self.parsers.items():
+                parsers_by_raw_channel[parser.target_raw_channel].append(
+                    (bus_id, parser)
+                )
+            reader = (
+                can.BLFReader(first_parser.log_path)
+                if first_parser.log_path.lower().endswith('.blf')
+                else can.LogReader(first_parser.log_path)
+            )
+            readers = reader
+            file_t0 = None
+            scanned_frames = {bus_id: 0 for bus_id in self.parsers}
+            failed_bus_ids = set()
+            messages_seen = 0
+            target_processing_seconds = {bus_id: 0.0 for bus_id in self.parsers}
+            cache_collection_seconds = 0.0
+            scan_started = time.perf_counter()
+            scan_completed = False
+
+            for msg in reader:
+                messages_seen += 1
+                if (
+                    messages_seen % 256 == 0
+                    and len(self._cancelled_bus_ids | failed_bus_ids)
+                    >= len(self.parsers)
+                ):
+                    break
+                if file_t0 is None:
+                    file_t0 = msg.timestamp
+                raw_channel = message_raw_channel(msg)
+                cache_started = time.perf_counter()
+                for cache in self.raw_cache_collectors.get(raw_channel, ()):
+                    cache.append(msg, file_t0, raw_channel=raw_channel)
+                cache_collection_seconds += time.perf_counter() - cache_started
+                for bus_id, parser in parsers_by_raw_channel.get(raw_channel, ()):
+                    if bus_id in self._cancelled_bus_ids or bus_id in failed_bus_ids:
+                        continue
+                    scanned_frames[bus_id] += 1
+                    try:
+                        target_started = time.perf_counter()
+                        self.contexts[bus_id].feed(msg, file_t0)
+                        target_processing_seconds[bus_id] += time.perf_counter() - target_started
+                    except Exception as exc:
+                        failed_bus_ids.add(bus_id)
+                        self.contexts[bus_id].close()
+                        self._emit_error(bus_id, exc)
+                        terminal_bus_ids.add(bus_id)
+            else:
+                scan_completed = True
+            scan_seconds = time.perf_counter() - scan_started
+
+            if capture_can_file_identity(first_parser.log_path) != file_identity:
+                raise ValueError("CAN日志在解析期间发生变化，请重新探测")
+            if scan_completed:
+                for group in self.raw_cache_collectors.values():
+                    for cache in group:
+                        cache.finish_scan(file_t0)
+            else:
+                for group in self.raw_cache_collectors.values():
+                    for cache in group:
+                        cache.reset()
+
+            for bus_id, parser in self.parsers.items():
+                context = self.contexts[bus_id]
+                if bus_id in self._cancelled_bus_ids:
+                    context.close()
+                    parser.parse_cancelled.emit(bus_id)
+                    terminal_bus_ids.add(bus_id)
+                    continue
+                if bus_id in failed_bus_ids:
+                    continue
+                if scanned_frames[bus_id] != parser.msg_count:
+                    context.close()
+                    self._emit_error(
+                        bus_id,
+                        "扫描计数与探测快照不一致: "
+                        f"{scanned_frames[bus_id]} != {parser.msg_count}",
+                    )
+                    terminal_bus_ids.add(bus_id)
+                    continue
+                try:
+                    stats = context.finish()
+                except Exception as exc:
+                    context.close()
+                    self._emit_error(bus_id, exc)
+                    terminal_bus_ids.add(bus_id)
+                    continue
+                stats.update({
+                    'cache_hit': False,
+                    'cache_replayed_frames': 0,
+                    'full_file_scan_seconds': scan_seconds,
+                    'target_processing_seconds': target_processing_seconds[bus_id],
+                    'cache_collection_seconds': cache_collection_seconds,
+                    'raw_cache_frame_count': sum(
+                        cache.frame_count
+                        for group in self.raw_cache_collectors.values()
+                        for cache in group
+                    ),
+                    'raw_cache_payload_bytes': sum(
+                        cache.payload_bytes
+                        for group in self.raw_cache_collectors.values()
+                        for cache in group
+                    ),
+                    'raw_cache_memory_bytes': sum(
+                        cache.memory_bytes
+                        for group in self.raw_cache_collectors.values()
+                        for cache in group
+                    ),
+                })
+                parser.parse_finished.emit(bus_id, stats)
+                terminal_bus_ids.add(bus_id)
+
+        except Exception as exc:
+            for group in self.raw_cache_collectors.values():
+                for cache in group:
+                    if not cache.complete:
+                        cache.reset()
+            for bus_id, parser in self.parsers.items():
+                if bus_id in terminal_bus_ids:
+                    continue
+                context = self.contexts[bus_id]
+                context.close()
+                if bus_id in self._cancelled_bus_ids:
+                    parser.parse_cancelled.emit(bus_id)
+                else:
+                    self._emit_error(bus_id, exc)
+                terminal_bus_ids.add(bus_id)
+        finally:
+            if readers is not None:
+                try:
+                    readers.stop()
+                except Exception:
+                    pass
 
 
 class MDFPlotter(QWidget):
@@ -2863,6 +3203,9 @@ class MDFPlotter(QWidget):
         self.mdf_file = None
         self.plot_widgets = []
         self.master_viewbox = None
+        self._overlay_y_axis_state = {}
+        self._overlay_current_signal_key = None
+        self._overlay_axis_scroll_position = 0
         self.map_dialog = None
         self.web_view = None
         self.gps_df = None
@@ -2974,6 +3317,22 @@ class MDFPlotter(QWidget):
         self.current_file_label.setMinimumWidth(140)
         self.current_file_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.current_file_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+        # Keep the active file visible at the top of the left management panel.
+        # The ribbon copy remains for the compact file actions row.
+        self.left_current_file_label = ElidedLabel("当前文件: 未选择")
+        self.left_current_file_label.setObjectName("leftCurrentFileLabel")
+        self.left_current_file_label.setProperty("uiTextRole", "secondary")
+        self.left_current_file_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.left_current_file_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
+        self.left_current_file_label.setMinimumHeight(28)
+        self.left_current_file_label.setContentsMargins(8, 2, 8, 2)
+        self.left_current_file_label.setToolTip("当前未选择数据文件")
+        left_panel_shell.insertWidget(0, self.left_current_file_label)
         self.load_file_button = QPushButton("打开文件")
         self.load_file_button.setText("")
         self.load_file_button.setToolTip("打开文件")
@@ -3010,6 +3369,7 @@ class MDFPlotter(QWidget):
         self.plot_button.setToolTip("绘制曲线")
         self.export_button = QPushButton("导出为CSV")
         self.save_data_button = QPushButton("数据截取")
+        self.save_data_button.setToolTip("截取当前曲线视图显示的时间段，另存为 BLF、MDF4 或 CSV")
         self._add_ribbon_mirror(
             self.curve_ribbon_layout, "绘制所选信号",
             self.plot_button, self.plot_selected_signals,
@@ -3246,12 +3606,19 @@ class MDFPlotter(QWidget):
         if not path:
             self.current_file_label.setText("当前文件: 未选择")
             self.current_file_label.setToolTip("")
+            left_label = getattr(self, "left_current_file_label", None)
+            if left_label is not None:
+                left_label.setText("当前文件: 未选择")
+                left_label.setToolTip("")
             return
         path = os.fspath(path)
-        self.current_file_label.setText(
-            f"当前文件: {os.path.basename(path)}"
-        )
+        display_name = f"当前文件: {os.path.basename(path)}"
+        self.current_file_label.setText(display_name)
         self.current_file_label.setToolTip(path)
+        left_label = getattr(self, "left_current_file_label", None)
+        if left_label is not None:
+            left_label.setText(display_name)
+            left_label.setToolTip(path)
 
     def _toggle_gps_view(self, visible):
         self.show_map_button.setText("隐藏GPS轨迹" if visible else "显示GPS轨迹")
@@ -3277,6 +3644,9 @@ class MDFPlotter(QWidget):
                 button.setEnabled(source.isEnabled())
 
     def auto_parse_all_buses(self):
+        if getattr(self, '_auto_parse_suppressed_for_restore', False):
+            self._auto_parse_suppressed_for_restore = False
+            return
         if not self.bus_protocols:
             return
 
@@ -3663,6 +4033,7 @@ class MDFPlotter(QWidget):
     def _clear_current_can_results(self):
         """Invalidate file-bound CAN samples and visible curves immediately."""
         self._clear_cursor_positions_for_data_change()
+        getattr(self, '_can_raw_message_cache', {}).clear()
         for bus_id, worker in tuple(getattr(self, 'parse_workers', {}).items()):
             try:
                 if worker.isRunning():
@@ -3675,6 +4046,8 @@ class MDFPlotter(QWidget):
         self.can_parsed_data.clear()
         self.bus_signal_map.clear()
         self.custom_math_data.clear()
+        if hasattr(self, "clear_signal_curve_visibility"):
+            self.clear_signal_curve_visibility()
         self.signals.clear()
         self._sig_value_cache.clear()
         self.clear_bus_config()
@@ -3685,9 +4058,9 @@ class MDFPlotter(QWidget):
             except RuntimeError:
                 pass
         getattr(self, 'progress_dialogs', {}).clear()
+        self._close_overlay_y_axis_managers(preserve_state=False)
         for plot in self.plot_widgets:
-            plot.setParent(None)
-            plot.deleteLater()
+            self._delete_plot_widget(plot)
         self.plot_widgets.clear()
         self.master_viewbox = None
         if hasattr(self, 'plot_layout') and self.plot_layout is not None:
@@ -3751,8 +4124,6 @@ class MDFPlotter(QWidget):
             self.bus_config_widgets[bus_id] = config_widget
 
         self.bus_container_layout.addStretch()
-
-        QTimer.singleShot(1000, self.auto_parse_all_buses)
 
     def on_bus_protocol_removed(self, bus_id):
         worker = self.parse_workers.get(bus_id)
@@ -3819,14 +4190,202 @@ class MDFPlotter(QWidget):
 
     def on_bus_protocol_changed(self, bus_id, protocol_info):
         # 普通 DBC
+        if bus_id in getattr(self, 'parse_workers', {}):
+            self.cancel_parse_bus(bus_id)
+        generations = getattr(self, '_bus_config_generations', None)
+        if generations is None:
+            self._bus_config_generations = generations = {}
+        generations[bus_id] = generations.get(bus_id, 0) + 1
         self.bus_protocols[bus_id] = protocol_info
         if bus_id not in self.db_per_bus:
             self.db_per_bus[bus_id] = {}
         self.db_per_bus[bus_id]['arxml_sub_bus'] = ''
         self.db_per_bus[bus_id]['is_arxml'] = False
+        self.db_per_bus[bus_id].pop('catalog_db', None)
+        self.db_per_bus[bus_id].pop('parsed', None)
+        getattr(self, '_can_raw_message_cache', {}).pop(bus_id, None)
+        bus_name = self.can_bus_data.get(bus_id, {}).get('name', f"Bus {bus_id}")
+        prefix = f"CAN_{bus_name}_"
+        for key in tuple(self.can_parsed_data):
+            if key.startswith(prefix):
+                self.can_parsed_data.pop(key, None)
+        for key, info in tuple(self.signals.items()):
+            if info.get('bus_id') == bus_id and key.startswith(prefix):
+                self.signals.pop(key, None)
+
+        # DBC metadata is enough to populate the signal browser; BLF samples
+        # are decoded only when the user asks to plot a signal.
+        try:
+            if cantools is None:
+                raise ImportError("cantools 库未安装")
+            db = cantools.database.load_file(protocol_info)
+            self.db_per_bus[bus_id]['catalog_db'] = db
+            self.db_per_bus[bus_id]['catalog_file_identity'] = capture_can_file_identity(protocol_info)
+            bus_name = self.can_bus_data.get(bus_id, {}).get('name', f"Bus {bus_id}")
+            for msg_def in db.messages:
+                for sig in msg_def.signals:
+                    key = f"CAN_{bus_name}_{sig.name}"
+                    identity = {
+                        'raw_channel': int(self.can_bus_data[bus_id].get('raw_channel', bus_id)),
+                        'frame_id': int(msg_def.frame_id),
+                        'is_extended': bool(getattr(msg_def, 'is_extended_frame', False)),
+                        'message_name': str(msg_def.name),
+                        'signal_name': str(sig.name),
+                    }
+                    identity_aliases = set(self._identity_alias_tokens(identity, bus_id)) if hasattr(self, '_identity_alias_tokens') else set()
+                    for pending_key, pending in tuple(self.signals.items()):
+                        if not pending.get('pending_selection_placeholder'):
+                            continue
+                        aliases = set(self._identity_alias_tokens(
+                            pending.get('signal_identity'), pending.get('bus_id')
+                        )) if hasattr(self, '_identity_alias_tokens') else set()
+                        if identity_aliases.intersection(aliases):
+                            self.signals.pop(pending_key, None)
+                    info = self.signals.setdefault(key, {
+                        'name': key, 'display_name': f"🚌 {bus_name} - {sig.name}",
+                        'group': -88, 'channel': -88, 'bus_id': bus_id,
+                        'signal_type': 'can', 'available': False,
+                    })
+                    prior = info.get('signal_identity')
+                    candidates = list(prior) if isinstance(prior, list) else ([prior] if prior else [])
+                    if identity not in candidates:
+                        candidates.append(identity)
+                    info.update({
+                        'bus_id': bus_id, 'unit': getattr(sig, 'unit', '') or '',
+                        'comment': f"{msg_def.name} (0x{msg_def.frame_id:X}) · {getattr(sig, 'unit', '') or ''}".strip(),
+                        'signal_identity': candidates[0] if len(candidates) == 1 else candidates,
+                    })
+            self.refresh_signal_list_ui()
+        except Exception as exc:
+            print(f"⚠️ 无法建立 Bus {bus_id} 的 DBC 信号目录: {exc}")
 
         if bus_id in self.bus_config_widgets:
             self.bus_config_widgets[bus_id].set_status('idle')
+
+    def _ensure_can_raw_message_cache(self, bus_id):
+        """Return a raw-frame cache scoped to the current file/DBC/mapping."""
+        snapshot = getattr(self, 'can_detection_snapshot', None)
+        if snapshot is None or bus_id not in self.can_bus_data:
+            return None
+        protocol = self.bus_protocols.get(bus_id)
+        if not protocol or not protocol.lower().endswith('.dbc'):
+            return None
+        entry = self.db_per_bus.setdefault(bus_id, {})
+        try:
+            dbc_identity = capture_can_file_identity(protocol)
+        except OSError:
+            # Filtered DBC objects can be supplied by the existing protocol
+            # workflow even after the source path is unavailable. Parsing can
+            # still use that object; only the optional raw-frame cache is off.
+            return None
+        db = entry.get('catalog_db')
+        if db is None:
+            # A filtered DBC can remain usable through the bus widget. Avoid
+            # loading a separate protocol object solely for an optional cache.
+            return None
+        if entry.get('catalog_file_identity') != dbc_identity:
+            # Reuse the established protocol-change path so catalog and cache
+            # invalidation stay in one place.
+            self.on_bus_protocol_changed(bus_id, protocol)
+            entry = self.db_per_bus.setdefault(bus_id, {})
+            db = entry.get('catalog_db')
+        raw_channel = int(snapshot.mapping.bus_to_raw[bus_id])
+        mapping_identity = tuple(sorted(snapshot.mapping.bus_to_raw.items()))
+        context_key = (snapshot.file_identity, mapping_identity, bus_id, raw_channel, dbc_identity)
+        caches = getattr(self, '_can_raw_message_cache', None)
+        if caches is None:
+            self._can_raw_message_cache = caches = {}
+        cache = caches.get(bus_id)
+        if cache is None or cache.context_key != context_key:
+            frame_keys = {
+                (int(message.frame_id), bool(getattr(message, 'is_extended_frame', False)))
+                for message in db.messages
+            }
+            cache = CanRawMessageCache(snapshot.file_identity, raw_channel, frame_keys, context_key)
+            caches[bus_id] = cache
+        return cache
+
+    def _raw_cache_collectors(self):
+        """Group incomplete DBC raw caches by their source channel."""
+        grouped = defaultdict(list)
+        snapshot = getattr(self, 'can_detection_snapshot', None)
+        if snapshot is None:
+            return {}
+        for bus_id in tuple(self.bus_protocols):
+            if bus_id not in snapshot.mapping.bus_to_raw:
+                continue
+            cache = self._ensure_can_raw_message_cache(bus_id)
+            if cache is not None and not cache.complete:
+                grouped[cache.raw_channel].append(cache)
+        return {channel: tuple(caches) for channel, caches in grouped.items()}
+
+    def prepare_selected_can_signals(self, selected_keys):
+        """Start only missing selected CAN samples, grouped by bus."""
+        if getattr(self, '_parsing_bus_ids', None) or getattr(self, 'parse_workers', None):
+            return True
+        by_bus = defaultdict(set)
+        for key in selected_keys:
+            info = self.signals.get(key, {})
+            bus_id = info.get('bus_id')
+            if bus_id is None or not key.startswith('CAN_') or key in self.can_parsed_data:
+                continue
+            by_bus[bus_id].add(key[len(f"CAN_{self.can_bus_data.get(bus_id, {}).get('name', f'Bus {bus_id}')}_"):])
+        prepared = []
+        already_running = False
+        for bus_id, names in by_bus.items():
+            if bus_id in self._parsing_bus_ids or bus_id in self.parse_workers:
+                already_running = True
+                continue
+            try:
+                entry = self.db_per_bus.setdefault(bus_id, {})
+                protocol = self.bus_protocols.get(bus_id)
+                if protocol:
+                    try:
+                        current_dbc_identity = capture_can_file_identity(protocol)
+                    except OSError as exc:
+                        raise ValueError(f"无法验证 Bus {bus_id} 的 DBC 文件: {exc}") from exc
+                    if (
+                        entry.get('catalog_db') is None
+                        or entry.get('catalog_file_identity') != current_dbc_identity
+                    ):
+                        self.on_bus_protocol_changed(bus_id, protocol)
+                        entry = self.db_per_bus.setdefault(bus_id, {})
+                db = entry.get('catalog_db')
+                if db is None:
+                    if not protocol:
+                        continue
+                    db = cantools.database.load_file(protocol)
+                    entry['catalog_db'] = db
+                    entry['catalog_file_identity'] = capture_can_file_identity(protocol)
+                selected = {}
+                for msg in db.messages:
+                    matched = {sig.name for sig in msg.signals if sig.name in names}
+                    if matched:
+                        frame_key = (
+                            int(msg.frame_id),
+                            bool(getattr(msg, 'is_extended_frame', False)),
+                        )
+                        selected.setdefault(frame_key, set()).update(matched)
+                if not selected:
+                    raise ValueError(
+                        f"所选信号在 Bus {bus_id} 的当前 DBC 中不存在，请重新选择信号。"
+                    )
+                # The filtering helper belongs to the bus configuration
+                # widget; keep using that single implementation for both
+                # interactive DBC filtering and demand parsing.
+                filtered_db, _ = BusConfigWidget._build_filtered_database(db, selected)
+                widget = self.bus_config_widgets.get(bus_id)
+                if widget is not None:
+                    widget._cached_filtered_db = filtered_db
+                prepared.append(bus_id)
+            except Exception as exc:
+                self.can_bus_data.setdefault(bus_id, {})['parse_state'] = 'failed'
+                self.can_bus_data[bus_id]['parse_error'] = str(exc)
+                raise RuntimeError(f"无法准备 Bus {bus_id} 的选中信号解析: {exc}") from exc
+        if prepared:
+            self.start_parse_batch_with_progress(prepared)
+            return True
+        return already_running
 
     def _validated_can_detection_bus(self, bus_id):
         detection_worker = getattr(self, '_can_bus_detection_worker', None)
@@ -3875,7 +4434,7 @@ class MDFPlotter(QWidget):
             raise ValueError(f"Bus {bus_id} 的当前msg_count与探测快照不一致")
         return bus_snapshot
 
-    def parse_bus(self, bus_id, auto_parse=False):
+    def parse_bus(self, bus_id, auto_parse=False, _batch_workers=None):
         pending_restore = getattr(self, '_pending_signal_restore', None)
         if pending_restore is not None:
             pending_restore.setdefault('expected_buses', set()).add(bus_id)
@@ -3889,7 +4448,7 @@ class MDFPlotter(QWidget):
                 self.can_bus_data[bus_id]['parse_state'] = 'failed'
                 self.can_bus_data[bus_id]['parse_error'] = '未配置协议文件'
             if hasattr(self, '_complete_pending_signal_restore'):
-                self._complete_pending_signal_restore(bus_id)
+                self._complete_pending_signal_restore(bus_id, plot=False)
             if not auto_parse:
                 QMessageBox.warning(self, "解析失败", f"Bus {bus_id} 未配置协议文件")
             return
@@ -3902,7 +4461,7 @@ class MDFPlotter(QWidget):
                 self.can_bus_data[bus_id]['parse_state'] = 'failed'
                 self.can_bus_data[bus_id]['parse_error'] = str(exc)
             if hasattr(self, '_complete_pending_signal_restore'):
-                self._complete_pending_signal_restore(bus_id)
+                self._complete_pending_signal_restore(bus_id, plot=False)
             message = f"无法开始解析：{exc}。请重新探测当前CAN日志。"
             if bus_id in self.bus_config_widgets:
                 self.bus_config_widgets[bus_id].set_status('error')
@@ -3974,14 +4533,29 @@ class MDFPlotter(QWidget):
             )
             worker._task_generation = getattr(self, '_can_task_generation', 0)
             worker._file_identity = self.can_detection_snapshot.file_identity
+            worker._bus_config_generation = getattr(self, '_bus_config_generations', {}).get(bus_id, 0)
+            worker._dbc_file_identity = self.db_per_bus[bus_id].get('catalog_file_identity')
+            worker.raw_message_cache = self._ensure_can_raw_message_cache(bus_id)
+            # Demand parsing is routed through the batch entry, even for one
+            # bus. Legacy independent ParseWorker calls remain uncached so
+            # concurrent per-bus scans cannot append the same raw frames twice.
+            worker.raw_cache_collectors = (
+                self._raw_cache_collectors() if _batch_workers is not None else {}
+            )
+            worker.raw_cache_frame_keys = worker.raw_message_cache.frame_keys if worker.raw_message_cache else frozenset()
             worker.progress_updated.connect(self.on_parse_progress)
             worker.parse_finished.connect(self.on_parse_finished)
             worker.parse_error.connect(self.on_parse_error)
             worker.parse_cancelled.connect(self.on_parse_cancelled)
-            worker.finished.connect(self._on_parse_worker_thread_finished)
+            if _batch_workers is None:
+                worker.finished.connect(self._on_parse_worker_thread_finished)
             self.parse_workers[bus_id] = worker
-            worker.start()
-            print(f"🚀 总线 {bus_id} 解析任务已启动")
+            if _batch_workers is None:
+                worker.start()
+                print(f"🚀 总线 {bus_id} 解析任务已启动")
+            else:
+                _batch_workers.append(worker)
+                print(f"🚀 总线 {bus_id} 已加入批量解析任务")
 
         except Exception as e:
             self._parsing_bus_ids.discard(bus_id)
@@ -3994,7 +4568,7 @@ class MDFPlotter(QWidget):
                 self.can_bus_data[bus_id]['parse_state'] = 'failed'
                 self.can_bus_data[bus_id]['parse_error'] = str(e)
             if hasattr(self, '_complete_pending_signal_restore'):
-                self._complete_pending_signal_restore(bus_id)
+                self._complete_pending_signal_restore(bus_id, plot=False)
             if not auto_parse:
                 QMessageBox.warning(self, "解析失败", f"解析 Bus {bus_id} 时出错: {e}")
             import traceback
@@ -4003,12 +4577,73 @@ class MDFPlotter(QWidget):
     def start_parse_with_progress(self, bus_id):
         self.parse_bus(bus_id, auto_parse=True)
 
+    def start_parse_batch_with_progress(self, bus_ids):
+        """Prepare configured buses with existing setup, then share one reader."""
+        collectors = self._raw_cache_collectors()
+        prepared_workers = []
+        for bus_id in sorted(set(bus_ids)):
+            self.parse_bus(
+                bus_id, auto_parse=True, _batch_workers=prepared_workers
+            )
+        if not prepared_workers:
+            return None
+        uncached = []
+        cached = []
+        for parser in prepared_workers:
+            parser.raw_cache_collectors = collectors
+            if parser.raw_message_cache is not None and parser.raw_message_cache.complete:
+                cached.append(parser)
+            else:
+                uncached.append(parser)
+        for parser in cached:
+            parser.finished.connect(self._on_parse_worker_thread_finished)
+            parser.start()
+        prepared_workers = uncached
+        if not prepared_workers:
+            return cached[0] if len(cached) == 1 else None
+        if len(prepared_workers) == 1:
+            prepared_workers[0].finished.connect(
+                self._on_parse_worker_thread_finished
+            )
+            prepared_workers[0].start()
+            print("单路解析保持原 ParseWorker 路径")
+            return prepared_workers[0]
+
+        batch_worker = MultiBusParseWorker(prepared_workers)
+        batch_worker._task_generation = getattr(self, '_can_task_generation', 0)
+        batch_worker._file_identity = self.can_detection_snapshot.file_identity
+        for parser in prepared_workers:
+            self.parse_workers[parser.bus_id] = batch_worker
+        batch_worker.finished.connect(self._on_multi_parse_worker_thread_finished)
+        batch_worker.start()
+        print(
+            "🚀 批量解析任务已启动，共享单次 BLF 扫描，目标 Bus: "
+            f"{sorted(parser.bus_id for parser in prepared_workers)}"
+        )
+        return batch_worker
+
+    def _on_multi_parse_worker_thread_finished(self):
+        worker = self.sender()
+        if worker is None:
+            return
+        for bus_id, current in tuple(self.parse_workers.items()):
+            if current is worker:
+                self.parse_workers.pop(bus_id, None)
+        for parser in getattr(worker, 'parsers', {}).values():
+            parser.deleteLater()
+        worker.deleteLater()
+        self._retry_pending_can_plot()
+
     def cancel_parse_bus(self, bus_id):
         """Request cooperative stop and immediately reflect the stopped state."""
+        self._plot_after_can_parse = False
         self._cancelled_parse_buses.add(bus_id)
         worker = self.parse_workers.get(bus_id)
         if worker is not None and worker.isRunning():
-            worker.stop()
+            if isinstance(worker, MultiBusParseWorker):
+                worker.cancel_bus(bus_id)
+            else:
+                worker.stop()
 
         if bus_id in self.can_bus_data:
             self.can_bus_data[bus_id]['parse_state'] = 'stopped'
@@ -4023,6 +4658,8 @@ class MDFPlotter(QWidget):
             self.on_parse_cancelled(bus_id)
 
     def on_parse_cancelled(self, bus_id):
+        if not getattr(self, '_is_current_parse_callback', lambda _bus: True)(bus_id):
+            return
         self._parsing_bus_ids.discard(bus_id)
         worker = self.parse_workers.get(bus_id)
         if worker is not None and not worker.isRunning():
@@ -4037,7 +4674,7 @@ class MDFPlotter(QWidget):
         if dialog is not None:
             dialog.set_cancelled()
         if hasattr(self, '_complete_pending_signal_restore'):
-            self._complete_pending_signal_restore(bus_id)
+            self._complete_pending_signal_restore(bus_id, plot=False)
 
     def _on_parse_worker_thread_finished(self):
         worker = self.sender()
@@ -4047,8 +4684,47 @@ class MDFPlotter(QWidget):
         if bus_id is not None and self.parse_workers.get(bus_id) is worker:
             self.parse_workers.pop(bus_id, None)
         worker.deleteLater()
+        self._retry_pending_can_plot()
+
+    def _retry_pending_can_plot(self):
+        if getattr(self, '_plot_after_can_parse', False) and not self._parsing_bus_ids:
+            self._skip_can_demand_once = False
+            QTimer.singleShot(0, self.plot_selected_signals)
+
+    def _is_current_parse_callback(self, bus_id):
+        sender_getter = getattr(self, 'sender', None)
+        sender = sender_getter() if callable(sender_getter) else None
+        if sender is None:
+            return True  # Supports direct slot calls in tests and legacy callers.
+        current = getattr(self, 'parse_workers', {}).get(bus_id)
+        owner = sender
+        if current is not sender:
+            parsers = getattr(current, 'parsers', {}) if current is not None else {}
+            if parsers.get(bus_id) is not sender:
+                return False
+        task_generation = getattr(owner, '_task_generation', getattr(self, '_can_task_generation', 0))
+        file_identity = getattr(owner, '_file_identity', getattr(owner, 'file_identity', None))
+        config_generation = getattr(owner, '_bus_config_generation', getattr(self, '_bus_config_generations', {}).get(bus_id, 0))
+        return (
+            task_generation == getattr(self, '_can_task_generation', 0)
+            and file_identity == getattr(getattr(self, 'can_detection_snapshot', None), 'file_identity', None)
+            and config_generation == getattr(self, '_bus_config_generations', {}).get(bus_id, 0)
+            and self._parse_callback_dbc_is_current(bus_id, owner)
+        )
+
+    def _parse_callback_dbc_is_current(self, bus_id, owner):
+        expected = getattr(owner, '_dbc_file_identity', None)
+        if expected is None:
+            return True
+        protocol = getattr(self, 'bus_protocols', {}).get(bus_id)
+        try:
+            return protocol is not None and capture_can_file_identity(protocol) == expected
+        except OSError:
+            return False
 
     def on_parse_progress(self, bus_id, progress, status_text):
+        if not getattr(self, '_is_current_parse_callback', lambda _bus: True)(bus_id):
+            return
         if bus_id in self.progress_dialogs:
             dialog = self.progress_dialogs[bus_id]
             if dialog and not dialog.is_cancelled():
@@ -4057,19 +4733,15 @@ class MDFPlotter(QWidget):
                     dialog.set_detail(f"Bus {bus_id}: 正在解析...")
 
     def on_parse_finished(self, bus_id, stats):
+        if not getattr(self, '_is_current_parse_callback', lambda _bus: True)(bus_id):
+            return
         if bus_id in getattr(self, '_cancelled_parse_buses', ()):
             self.on_parse_cancelled(bus_id)
-            return
-        worker = self.parse_workers.get(bus_id)
-        if worker is not None and (
-            getattr(worker, '_task_generation', getattr(self, '_can_task_generation', 0)) != getattr(self, '_can_task_generation', 0)
-            or getattr(worker, '_file_identity', None) != getattr(getattr(self, 'can_detection_snapshot', None), 'file_identity', None)
-        ):
             return
         self._parsing_bus_ids.discard(bus_id)
 
         for key, info in tuple(getattr(self, 'signals', {}).items()):
-            if info.get('pending_selection_placeholder'):
+            if info.get('bus_id') == bus_id and info.get('pending_selection_placeholder'):
                 self.signals.pop(key, None)
 
         pool = stats.pop('pool', {})
@@ -4108,7 +4780,12 @@ class MDFPlotter(QWidget):
             if hasattr(self, 'refresh_signal_list_ui'):
                 self.refresh_signal_list_ui()
             if hasattr(self, '_complete_pending_signal_restore'):
-                self._complete_pending_signal_restore(bus_id)
+                self._complete_pending_signal_restore(bus_id, plot=False)
+            if getattr(self, '_plot_after_can_parse', False) and not self._parsing_bus_ids:
+                self._plot_after_can_parse = False
+                self._skip_can_demand_once = True
+                if hasattr(self, '_set_plot_empty_state'):
+                    self._set_plot_empty_state(reason)
             return
 
         stats['result_state'] = 'success'
@@ -4162,19 +4839,19 @@ class MDFPlotter(QWidget):
             )
 
         if hasattr(self, '_complete_pending_signal_restore'):
-            self._complete_pending_signal_restore(bus_id)
+            self._complete_pending_signal_restore(bus_id, plot=False)
 
         print(f"✅ Bus {bus_id} 解析完成: {stats}")
+        if getattr(self, '_plot_after_can_parse', False) and not self._parsing_bus_ids:
+            self._plot_after_can_parse = False
+            self._skip_can_demand_once = True
+            QTimer.singleShot(0, self.plot_selected_signals)
 
     def on_parse_error(self, bus_id, error_msg):
+        if not getattr(self, '_is_current_parse_callback', lambda _bus: True)(bus_id):
+            return
         if bus_id in getattr(self, '_cancelled_parse_buses', ()):
             self.on_parse_cancelled(bus_id)
-            return
-        worker = self.parse_workers.get(bus_id)
-        if worker is not None and (
-            getattr(worker, '_task_generation', getattr(self, '_can_task_generation', 0)) != getattr(self, '_can_task_generation', 0)
-            or getattr(worker, '_file_identity', None) != getattr(getattr(self, 'can_detection_snapshot', None), 'file_identity', None)
-        ):
             return
         self._parsing_bus_ids.discard(bus_id)
 
@@ -4189,11 +4866,17 @@ class MDFPlotter(QWidget):
             self.progress_dialogs[bus_id].set_detail(f"错误: {error_msg}")
 
         if hasattr(self, '_complete_pending_signal_restore'):
-            self._complete_pending_signal_restore(bus_id)
+            self._complete_pending_signal_restore(bus_id, plot=False)
+
+        if getattr(self, '_plot_after_can_parse', False) and not self._parsing_bus_ids:
+            self._plot_after_can_parse = False
+            self._skip_can_demand_once = True
+            if hasattr(self, '_set_plot_empty_state'):
+                self._set_plot_empty_state(f"CAN 信号解析失败：{error_msg}")
 
         print(f"❌ Bus {bus_id} 解析失败: {error_msg}")
 
-    def _complete_pending_signal_restore(self, bus_id):
+    def _complete_pending_signal_restore(self, bus_id, *, plot=True):
         pending = getattr(self, '_pending_signal_restore', None)
         if not pending:
             return
@@ -4212,7 +4895,7 @@ class MDFPlotter(QWidget):
             if index >= 0:
                 combo.setCurrentIndex(index)
         self._apply_can_selection(
-            pending.get('selected', ()), pending.get('identities', {})
+            pending.get('selected', ()), pending.get('identities', {}), plot=plot
         )
         self._pending_signal_restore = None
         if report is not None and report.failures:
@@ -4260,7 +4943,14 @@ class MDFPlotter(QWidget):
                 'samples': v_unique,
                 'unit': pack.get('unit', ''),
                 'bus_id': bus_id,
-                'comment': pack.get('comment', '')
+                'comment': pack.get('comment', ''),
+                'file_identity': getattr(
+                    getattr(self, 'can_detection_snapshot', None),
+                    'file_identity', None,
+                ),
+                'raw_channel': getattr(self, 'can_bus_data', {}).get(bus_id, {}).get('raw_channel'),
+                'protocol_path': getattr(self, 'bus_protocols', {}).get(bus_id),
+                'protocol_identity': getattr(self, 'db_per_bus', {}).get(bus_id, {}).get('catalog_file_identity'),
             }
 
             self.signals[unique_key] = {
@@ -4437,6 +5127,8 @@ class MDFPlotter(QWidget):
 
         self.clear_signal_list()
 
+        if hasattr(self, "clear_signal_curve_visibility"):
+            self.clear_signal_curve_visibility()
         self.signals.clear()
         self.can_parsed_data.clear()
         self.bus_signal_map.clear()
@@ -4659,7 +5351,7 @@ class MDFPlotter(QWidget):
                 return
 
             if file_extension in ('.blf', '.asc', '.trc') and not self.can_parsed_data:
-                hint_label = QLabel("💡 提示: 请在下方CAN总线配置中加载协议文件并点击\"解析\"按钮")
+                hint_label = QLabel("💡 提示: 在下方 CAN 总线配置中加载 DBC，选择信号后点击“绘图”")
                 hint_label.setStyleSheet(
                     "color: #2980b9; padding: 5px; font-size: 11px; background-color: #d6eaf8; border-radius: 3px;")
                 self.signal_layout.insertWidget(0, hint_label)
@@ -4771,10 +5463,40 @@ class MDFPlotter(QWidget):
             axis.setStyle(tickFont=tick_font)
         axis.setWidth(None)
 
+    def _close_overlay_y_axis_managers(self, *, preserve_state=True):
+        """Close managers before their PlotWidgets/scenes are destroyed."""
+        found_manager = False
+        for plot_widget in tuple(getattr(self, "plot_widgets", ())):
+            manager = getattr(plot_widget, "multi_y_axis_manager", None)
+            if manager is None:
+                continue
+            found_manager = True
+            if preserve_state:
+                self._overlay_axis_scroll_position = manager.scroll_position
+                self._overlay_y_axis_state = manager.close(preserve_state=True)
+                if manager.current_signal_key is not None:
+                    self._overlay_current_signal_key = manager.current_signal_key
+            else:
+                manager.close(preserve_state=False)
+            plot_widget.multi_y_axis_manager = None
+        if not preserve_state:
+            self._overlay_y_axis_state = {}
+            self._overlay_current_signal_key = None
+            self._overlay_axis_scroll_position = 0
+        return found_manager
+
+    @staticmethod
+    def _delete_plot_widget(plot_widget):
+        """Delete the plot wrapper too when overlay axes use a scrollbar."""
+        container = getattr(plot_widget, "axis_scroll_container", None)
+        target = container or plot_widget
+        target.setParent(None)
+        target.deleteLater()
+
     def plot_selected_signals(self):
+        self._close_overlay_y_axis_managers(preserve_state=True)
         for widget in self.plot_widgets:
-            widget.setParent(None)
-            widget.deleteLater()
+            self._delete_plot_widget(widget)
         self.plot_widgets.clear()
         self.master_viewbox = None
         for index in reversed(range(self.plot_layout.count())):
@@ -4829,7 +5551,28 @@ class MDFPlotter(QWidget):
             try:
                 plot_widget = pg.PlotWidget(viewBox=LimitedViewBox())
                 self.plot_widgets.append(plot_widget)
-                self.plot_layout.addWidget(plot_widget, 1)
+                use_axis_scrollbar = (
+                    display_mode == "overlay" and len(signal_group) > 1
+                )
+                axis_scroll_bar = None
+                if use_axis_scrollbar:
+                    container = QWidget(self.plot_container)
+                    container_layout = QVBoxLayout(container)
+                    container_layout.setContentsMargins(0, 0, 0, 0)
+                    container_layout.setSpacing(0)
+                    container_layout.addWidget(plot_widget, 1)
+                    axis_scroll_bar = QScrollBar(Qt.Orientation.Horizontal, container)
+                    axis_scroll_bar.setObjectName("multiYAxisScrollBar")
+                    axis_scroll_bar.setFixedHeight(14)
+                    axis_scroll_bar.setVisible(False)
+                    container_layout.addWidget(
+                        axis_scroll_bar, 0, Qt.AlignmentFlag.AlignLeft
+                    )
+                    plot_widget.axis_scroll_container = container
+                    plot_widget.y_axis_scroll_bar = axis_scroll_bar
+                    self.plot_layout.addWidget(container, 1)
+                else:
+                    self.plot_layout.addWidget(plot_widget, 1)
 
                 vb = plot_widget.getPlotItem().getViewBox()
                 plot_widget.getPlotItem().enableAutoRange(x=False)
@@ -4838,6 +5581,23 @@ class MDFPlotter(QWidget):
 
                 left_axis = plot_widget.getPlotItem().getAxis('left')
                 self._configure_plot_y_axis(left_axis)
+                overlay_manager = None
+                if display_mode == "overlay" and len(signal_group) > 1:
+                    overlay_manager = MultiYAxisManager(
+                        vb,
+                        plot_widget.scene(),
+                        initial_state=getattr(self, "_overlay_y_axis_state", {}),
+                        plot_item=plot_widget.getPlotItem(),
+                        plot_widget=plot_widget,
+                        scroll_bar=axis_scroll_bar,
+                        initial_scroll_position=getattr(
+                            self, "_overlay_axis_scroll_position", 0
+                        ),
+                    )
+                    plot_widget.multi_y_axis_manager = overlay_manager
+                    # Until the scrollable multi-axis strip is implemented, the
+                    # reference ViewBox's single Y axis would show a false scale.
+                    plot_widget.getPlotItem().hideAxis("left")
 
                 # Each display group owns one plot; overlay groups add one curve
                 # per selected signal to that shared plot and its ViewBox.
@@ -4852,6 +5612,7 @@ class MDFPlotter(QWidget):
                     )))
                 y_min_data = float("inf")
                 y_max_data = float("-inf")
+                initial_signal_y_ranges = {}
                 for curve_index, (item_key, item_info, item_signal) in enumerate(signal_group):
                     is_text_signal = bool(
                         getattr(item_signal, "is_text_signal", False)
@@ -4870,23 +5631,75 @@ class MDFPlotter(QWidget):
                     samples = np.asarray(item_signal.samples)
                     valid_mask = ~np.isnan(samples)
                     if valid_mask.any():
-                        y_min_data = min(y_min_data, float(np.min(samples[valid_mask])))
-                        y_max_data = max(y_max_data, float(np.max(samples[valid_mask])))
+                        signal_y_min = float(np.min(samples[valid_mask]))
+                        signal_y_max = float(np.max(samples[valid_mask]))
+                    else:
+                        signal_y_min, signal_y_max = 0.0, 1.0
+                    if valid_mask.any():
+                        y_min_data = min(y_min_data, signal_y_min)
+                        y_max_data = max(y_max_data, signal_y_max)
+
+                    signal_y_range = signal_y_max - signal_y_min
+                    signal_padding = (
+                        1.0 if signal_y_min == 0 else abs(signal_y_min) * 0.1
+                    ) if signal_y_range == 0 else signal_y_range * 0.4
+                    if signal_padding == 0:
+                        signal_padding = 1.0
+                    if len(signal_group) == 1 and is_text_signal:
+                        mapping = getattr(item_signal, "text_mapping", None) or ()
+                        if mapping:
+                            signal_y_min, signal_y_max = -0.5, len(mapping) - 0.5
+                            signal_padding = 0.1
+                    initial_signal_y_range = (
+                        signal_y_min - signal_padding,
+                        signal_y_max + signal_padding,
+                    )
+                    initial_signal_y_ranges[item_key] = initial_signal_y_range
 
                     color = (
                         self._signal_color(item_key)
                         if hasattr(self, "_signal_color")
                         else pg.intColor(curve_index, hues=max(1, len(signal_group)))
                     )
-                    curve = plot_widget.plot(
-                        item_signal.timestamps,
-                        item_signal.samples,
-                        pen=pg.mkPen(color, width=1.4),
-                        name=item_info.get("display_name", item_info.get("name", "信号")),
+                    full_name = item_info.get(
+                        "display_name", item_info.get("name", "信号")
                     )
-                    if legend is not None and legend.items:
+                    signal_axis_item = None
+                    if overlay_manager is not None:
+                        signal_axis_item = pg.AxisItem(orientation="left")
+                        self._configure_plot_y_axis(signal_axis_item)
+                    signal_view_box = (
+                        overlay_manager.register_signal(
+                            item_key, initial_signal_y_range,
+                            axis_item=signal_axis_item, axis_color=color,
+                        )
+                        if overlay_manager is not None
+                        else vb
+                    )
+                    if overlay_manager is None:
+                        curve = plot_widget.plot(
+                            item_signal.timestamps,
+                            item_signal.samples,
+                            pen=pg.mkPen(color, width=1.4),
+                            name=full_name,
+                        )
+                    else:
+                        curve = pg.PlotDataItem(
+                            item_signal.timestamps,
+                            item_signal.samples,
+                            pen=pg.mkPen(color, width=1.4),
+                            name=full_name,
+                        )
+                        signal_view_box.addItem(curve)
+                    curve_visible = (
+                        self.is_signal_curve_visible(item_key)
+                        if hasattr(self, "is_signal_curve_visible") else True
+                    )
+                    curve.setVisible(curve_visible)
+                    if legend is not None and curve_visible:
+                        legend.addItem(curve, full_name)
+                    if legend is not None and legend.items and curve_visible:
                         legend_label = legend.items[-1][1]
-                        full_name = item_info.get("display_name", item_info.get("name", "信号"))
                         font_metrics = QFontMetrics(legend_label.item.font())
                         legend_label.setText(font_metrics.elidedText(
                             full_name, Qt.TextElideMode.ElideRight, 140
@@ -4900,13 +5713,15 @@ class MDFPlotter(QWidget):
                     spot = pg.ScatterPlotItem(
                         size=8, pen=pg.mkPen(None), brush=pg.mkBrush(color)
                     )
-                    plot_widget.addItem(spot)
+                    signal_view_box.addItem(spot)
                     spot.setVisible(False)
                     records.append({
                         "signal_key": item_key,
                         "signal_info": item_info,
                         "signal_data": item_signal,
                         "data_curve": curve,
+                        "curve_visible": curve_visible,
+                        "view_box": signal_view_box,
                         "spot_item": spot,
                         "is_text_signal": is_text_signal,
                     })
@@ -4930,10 +5745,33 @@ class MDFPlotter(QWidget):
                 plot_widget.setYRange(
                     y_min_data - y_padding, y_max_data + y_padding, padding=0
                 )
+                if overlay_manager is not None:
+                    current_signal_key = getattr(
+                        self, "_overlay_current_signal_key", None
+                    )
+                    if current_signal_key not in overlay_manager.signal_keys:
+                        current_signal_key = records[0]["signal_key"]
+                    overlay_manager.set_current_signal(current_signal_key)
+                    overlay_manager.install_axis_layout()
+                    self._overlay_current_signal_key = current_signal_key
+                    plot_widget.initial_signal_y_ranges = {
+                        record["signal_key"]: overlay_manager.y_range(
+                            record["signal_key"]
+                        )
+                        for record in records
+                    }
+                else:
+                    plot_widget.initial_signal_y_ranges = initial_signal_y_ranges
 
                 title = f"信号: {signal_info.get('display_name', signal_info.get('name', ''))}"
                 if len(signal_group) > 1:
-                    title = f"叠加显示 · {len(signal_group)} 个信号"
+                    visible_count = sum(
+                        1 for record in records if record.get("curve_visible", True)
+                    )
+                    title = f"叠加显示 · {visible_count} 个信号"
+                    hidden_count = len(records) - visible_count
+                    if hidden_count:
+                        title += f"（已隐藏 {hidden_count}）"
                 bus_id = signal_info.get("bus_id")
                 if bus_id is not None and len(signal_group) == 1:
                     title += f" [Bus {bus_id}]"
@@ -4972,7 +5810,7 @@ class MDFPlotter(QWidget):
                         )
                         label.setFont(pg.QtGui.QFont("Arial", 8))
                         label.setVisible(False)
-                        plot_widget.addItem(label, ignoreBounds=True)
+                        record["view_box"].addItem(label, ignoreBounds=True)
                         cursor_labels[cursor_name].append(label)
                 text_item = cursor_labels["single"][0]
 
@@ -5019,9 +5857,17 @@ class MDFPlotter(QWidget):
                 vb.sigRangeChanged.connect(make_stats_callback(plot_widget))
 
                 plot_widget.setMinimumHeight(150)
+                if (
+                    display_mode == "independent"
+                    and hasattr(self, "is_signal_curve_visible")
+                    and not self.is_signal_curve_visible(signal_key)
+                ):
+                    # A hidden signal is still selected, but must not produce an
+                    # empty plot row when the user redraws the selection.
+                    plot_widget.setVisible(False)
 
                 plot_widget.setLabel('bottom', '时间', units='s')
-                plot_widget.showGrid(x=True, y=True)
+                plot_widget.showGrid(x=True, y=overlay_manager is None)
                 plot_widget.getPlotItem().layout.setContentsMargins(2, 2, 2, 2)
 
                 if i == 0:
@@ -5193,8 +6039,33 @@ class MDFPlotter(QWidget):
             if not hasattr(pw, 'signal_data'):
                 continue
             view_range = pw.getViewBox().viewRange()[0]
+            y_axis_manager = getattr(pw, "multi_y_axis_manager", None)
+            if y_axis_manager is not None:
+                for record in getattr(pw, "signal_records", ()):
+                    if not record.get("curve_visible", True):
+                        continue
+                    signal = record["signal_data"]
+                    if record["is_text_signal"] and len(pw.signal_records) == 1:
+                        continue
+                    start = int(np.searchsorted(signal.timestamps, view_range[0]))
+                    stop = int(np.searchsorted(signal.timestamps, view_range[1]))
+                    values = np.asarray(signal.samples[start:stop])
+                    if not len(values):
+                        continue
+                    valid = values[~np.isnan(values)]
+                    if not len(valid):
+                        continue
+                    ymin, ymax = np.min(valid), np.max(valid)
+                    yrange = ymax - ymin
+                    padding = yrange * 0.1 if yrange > 0 else 1.0
+                    y_axis_manager.set_y_range(
+                        record["signal_key"], (ymin - padding, ymax + padding)
+                    )
+                continue
             visible_values = []
             for record in getattr(pw, "signal_records", ()):
+                if not record.get("curve_visible", True):
+                    continue
                 signal = record["signal_data"]
                 if record["is_text_signal"] and len(getattr(pw, "signal_records", ())) == 1:
                     continue
@@ -5280,10 +6151,17 @@ class MDFPlotter(QWidget):
                 if record_index < len(single_labels):
                     label = single_labels[record_index]
                     label.setText(f"{cursor_x:.6f}, {shown}")
-                    label.setVisible(self.cursor_mode == "single")
+                    curve_visible = record.get("curve_visible", True)
+                    record["spot_item"].setVisible(
+                        self.cursor_mode == "single" and curve_visible
+                    )
+                    label.setVisible(
+                        self.cursor_mode == "single" and curve_visible
+                    )
                     self._position_cursor_label(
                         plot_widget, label, cursor_x,
                         float(y_val) if not np.isnan(y_val) else None,
+                        view_box=record.get("view_box"),
                     )
 
             plot_widget.vLine.setPos(cursor_x)
@@ -5497,203 +6375,338 @@ class MDFPlotter(QWidget):
         self.web_view.page().runJavaScript(js_code)
 
     def save_data_cutout(self):
+        if getattr(self, '_cutout_worker', None) is not None and self._cutout_worker.isRunning():
+            QMessageBox.information(self, "数据截取", "已有截取任务正在运行，请等待完成或取消。")
+            return
         if self.master_viewbox is None:
             QMessageBox.warning(self, "数据截取", "请先加载文件并绘制信号。")
             return
 
-        file_extension = os.path.splitext(self.mdf_path)[1].lower()
+        try:
+            view_range = self.master_viewbox.viewRange()[0]
+            window = CutoutWindow(view_range[0], view_range[1])
+        except Exception:
+            QMessageBox.warning(self, "数据截取", "无法获取当前视图的有效时间范围。")
+            return
 
         try:
-            current_x_range = self.master_viewbox.viewRange()[0]
-            start_time = current_x_range[0]
-            stop_time = current_x_range[1]
-        except Exception:
-            QMessageBox.warning(self, "数据截取", "无法获取有效的时间范围。")
+            kind = source_kind(self.mdf_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "数据截取", str(exc))
             return
 
-        if stop_time <= start_time:
-            QMessageBox.warning(self, "数据截取", "时间范围无效。")
+        context = self._build_cutout_context(kind, window)
+        settings = getattr(self, "_gui_settings", None)
+        dialog = CutoutDialog(
+            context,
+            initial_dir=os.path.dirname(self.mdf_path) or None,
+            remembered_mode=load_last_mode(settings, kind.value),
+            settings=settings,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        option = dialog.selected_option()
+        if option is None:
             return
 
-        base_name = os.path.splitext(os.path.basename(self.mdf_path))[0]
-
-        if file_extension in ('.blf', '.asc', '.trc'):
-            bus_filter = None
-            if self.can_bus_data:
-                bus_list = sorted(self.can_bus_data.keys())
-                if len(bus_list) > 1:
-                    items = ["所有总线"] + [f"Bus {b}" for b in bus_list]
-                    item, ok = QInputDialog.getItem(
-                        self, "选择总线", "选择要截取的总线:", items, 0, False
-                    )
-                    if ok and item != "所有总线":
-                        bus_filter = [int(item.split()[1])]
-
-            default_ext = '.blf' if file_extension == '.blf' else '.csv'
-            filter_str = "BLF Files (*.blf);;All Files (*)" if file_extension == '.blf' else "CSV Files (*.csv)"
-            default_file_name = f"{base_name}_cut_{start_time:.2f}s-{stop_time:.2f}s{default_ext}"
-
-            file_name, _ = QFileDialog.getSaveFileName(self, "保存截取的数据", default_file_name, filter_str)
-            if not file_name:
-                return
-
-            try:
-                if file_name.endswith('.blf'):
-                    self.cut_blf_by_time(self.mdf_path, file_name, start_time, stop_time, bus_filter)
-                    QMessageBox.information(self, "截取成功", f"BLF已截取保存到:\n{file_name}")
-                else:
-                    self._export_can_to_csv(file_name, start_time, stop_time, bus_filter)
-                    QMessageBox.information(self, "导出成功", f"数据已导出到:\n{file_name}")
-            except Exception as e:
-                QMessageBox.critical(self, "截取失败", str(e))
+        try:
+            job = self._build_cutout_job(context, option, dialog.output_path())
+        except Exception as exc:
+            QMessageBox.critical(self, "数据截取失败", str(exc))
             return
 
-        elif file_extension in ('.mdf', '.mf4'):
-            default_ext = '.mf4'
-            filter_str = "MDF/MF4 Files (*.mdf *.mf4)"
-            default_file_name = f"{base_name}_cut_{start_time:.2f}s-{stop_time:.2f}s{default_ext}"
+        worker = CutoutWorker(job, self)
+        progress_dialog = CutoutProgressDialog(self)
+        worker.progress.connect(progress_dialog.set_progress)
+        worker.completed.connect(self._finish_cutout)
+        worker.failed.connect(self._fail_cutout)
+        worker.cancelled.connect(self._cancel_cutout)
+        worker.finished.connect(lambda: self._cleanup_cutout(worker, progress_dialog))
+        progress_dialog.cancel_requested.connect(self._request_cutout_cancel)
+        self._cutout_worker = worker
+        self._cutout_progress = progress_dialog
+        self._cutout_option = option
+        worker.start()
+        progress_dialog.show()
 
-            file_name, _ = QFileDialog.getSaveFileName(self, "保存截取的数据 (MDF/MF4)", default_file_name, filter_str)
-            if not file_name:
-                return
+    def _finish_cutout(self, result):
+        if self._cutout_progress is not None:
+            self._cutout_progress.close()
+        if not getattr(self, '_close_after_cutout', False):
+            self._show_cutout_result(result, getattr(self, '_cutout_option', None))
 
+    def _fail_cutout(self, message):
+        if self._cutout_progress is not None:
+            self._cutout_progress.close()
+        if not getattr(self, '_close_after_cutout', False):
+            QMessageBox.critical(self, "数据截取失败", message)
+
+    def _cancel_cutout(self):
+        if self._cutout_progress is not None:
+            self._cutout_progress.close()
+
+    def _request_cutout_cancel(self):
+        worker = getattr(self, '_cutout_worker', None)
+        if worker is not None:
+            worker.cancel()
+
+    def _cleanup_cutout(self, worker, dialog):
+        if worker is not getattr(self, '_cutout_worker', None):
+            dialog.close()
+            dialog.deleteLater()
+            worker.deleteLater()
+            return
+        self._cutout_worker = None
+        self._cutout_progress = None
+        self._cutout_option = None
+        dialog.close()
+        dialog.deleteLater()
+        worker.deleteLater()
+        if getattr(self, '_close_after_cutout', False):
+            self._close_after_cutout = False
+            self.close()
+
+    # ------------------------------------------------------------- 数据截取内部
+    @staticmethod
+    def _valid_signal_arrays(data):
+        if data is None:
+            return None
+        timestamps = data.get('timestamps')
+        samples = data.get('samples')
+        if timestamps is None or samples is None:
+            return None
+        if len(timestamps) == 0 or len(timestamps) != len(samples):
+            return None
+        return data
+
+    def _cutout_parsed_signal(self, key):
+        return self._valid_signal_arrays(self.can_parsed_data.get(key))
+
+    def _cutout_math_signal(self, key):
+        return self._valid_signal_arrays(self.custom_math_data.get(key))
+
+    @staticmethod
+    def _is_mdf_file_signal(info):
+        group = info.get('group')
+        channel = info.get('channel')
+        return (
+            isinstance(group, int) and not isinstance(group, bool) and group >= 0
+            and isinstance(channel, int) and not isinstance(channel, bool) and channel >= 0
+        )
+
+    def _cutout_csv_columns(self):
+        frame = self.mdf_file
+        if isinstance(frame, pd.DataFrame):
+            return {str(column) for column in frame.columns}
+        return set()
+
+    def _cutout_selected_csv_available(self, selected):
+        columns = self._cutout_csv_columns()
+        return sum(
+            1 for key in selected
+            if key in columns or self._cutout_math_signal(key) is not None
+        )
+
+    def _build_cutout_context(self, kind, window):
+        selected = list(self.get_selected_signals())
+        if kind in (SourceKind.BLF, SourceKind.CAN_LOG):
+            parsed = [
+                key for key in self.can_parsed_data
+                if self._cutout_parsed_signal(key) is not None
+            ]
+            available = sum(
+                1 for key in selected if self._cutout_parsed_signal(key) is not None
+            )
+            return CutoutContext(
+                self.mdf_path, kind, window, len(selected), available, 0, len(parsed)
+            )
+        if kind is SourceKind.MDF:
+            file_keys = [
+                key for key, info in self.signals.items()
+                if self._is_mdf_file_signal(info)
+            ]
+            available = sum(
+                1 for key in selected
+                if self._is_mdf_file_signal(self.signals.get(key, {}))
+            )
+            return CutoutContext(
+                self.mdf_path, kind, window, len(selected), available, len(file_keys), 0
+            )
+        return CutoutContext(
+            self.mdf_path, kind, window, len(selected),
+            self._cutout_selected_csv_available(selected), len(self._cutout_csv_columns()), 0,
+        )
+
+    def _cutout_mdf_selection(self):
+        channels, skipped = [], []
+        for key in self.get_selected_signals():
+            info = self.signals.get(key, {})
+            name = info.get('display_name', key)
+            if self._is_mdf_file_signal(info):
+                channels.append((str(info.get('name', key)), int(info['group']), int(info['channel'])))
+            elif key in self.custom_math_data:
+                skipped.append(f"{name}（公式计算通道，不写入 MDF）")
+            else:
+                skipped.append(f"{name}（没有可用的数据）")
+        if not channels:
+            raise ValueError("已选信号不属于该文件，没有可导出的通道。")
+        return tuple(channels), tuple(skipped)
+
+    def _cutout_mdf_series(self, scope):
+        if scope is OutputScope.ALL:
+            candidates = list(self.can_parsed_data)
+        else:
+            candidates = list(self.get_selected_signals())
+        series, skipped = [], []
+        for key in candidates:
+            info = self.signals.get(key, {})
+            data = self._cutout_parsed_signal(key)
+            if data is None:
+                if scope is OutputScope.SELECTED:
+                    name = info.get('display_name', key)
+                    if key in self.custom_math_data:
+                        skipped.append(f"{name}（公式计算通道，不写入 MDF）")
+                    else:
+                        skipped.append(f"{name}（没有可用的解析数据）")
+                continue
+            series.append(SignalSeries(
+                name=clean_signal_name(info.get('display_name', key), info.get('name', key)),
+                unit=str(data.get('unit') or ''),
+                comment=str(info.get('comment') or data.get('comment') or ''),
+                timestamps=data['timestamps'],
+                samples=data['samples'],
+            ))
+        if not series:
+            raise ValueError("没有可写入 MDF 的解析信号数据。")
+        return tuple(series), tuple(skipped)
+
+    def _cutout_csv_selection(self):
+        columns, calculated, skipped = [], [], []
+        frame_columns = self._cutout_csv_columns()
+        for key in self.get_selected_signals():
+            info = self.signals.get(key, {})
+            if key in frame_columns:
+                columns.append(key)
+                continue
+            data = self._cutout_math_signal(key)
+            if data is None:
+                skipped.append(f"{info.get('display_name', key)}（没有可用数据）")
+                continue
+            calculated.append(SignalSeries(
+                name=str(info.get('display_name', key)),
+                unit=str(data.get('unit') or ''),
+                comment=str(info.get('comment') or ''),
+                timestamps=data['timestamps'],
+                samples=data['samples'],
+            ))
+        if not columns and not calculated:
+            raise ValueError("已选信号没有可导出的数据。")
+        return tuple(columns), tuple(calculated), tuple(skipped)
+
+    def _cutout_total_messages(self):
+        total = 0
+        for data in getattr(self, 'can_bus_data', {}).values():
             try:
-                if not isinstance(self.mdf_file, asammdf.MDF):
-                    raise Exception("内部错误：文件对象不是MDF/MF4格式。")
+                total += int(data.get('msg_count') or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return total
 
-                mdf_cut = self.mdf_file.cut(start=start_time, stop=stop_time, time_from_zero=False)
-                mdf_cut.save(file_name, overwrite=True)
-                mdf_cut.close()
+    def _build_cutout_job(self, context, option, output_path):
+        job_kwargs = dict(
+            source_path=self.mdf_path,
+            kind=context.kind,
+            window=context.window,
+            output_path=str(output_path),
+            format=option.format,
+            scope=option.scope,
+        )
+        notes = ()
+        if option.format is OutputFormat.BLF:
+            job_kwargs['mapping'] = getattr(self, 'can_bus_mapping', None)
+            job_kwargs['total_messages'] = self._cutout_total_messages()
+        elif option.format is OutputFormat.MDF and context.kind is SourceKind.MDF:
+            channels = None
+            if option.scope is OutputScope.SELECTED:
+                channels, notes = self._cutout_mdf_selection()
+            job_kwargs['channels'] = channels
+        elif option.format is OutputFormat.MDF:
+            series, notes = self._cutout_mdf_series(option.scope)
+            job_kwargs['series'] = series
+        else:
+            frame = self.mdf_file
+            if not isinstance(frame, pd.DataFrame):
+                raise ValueError("内部错误：当前文件对象不是表格数据。")
+            if option.scope is OutputScope.ALL:
+                columns, calculated = None, ()
+            else:
+                columns, calculated, notes = self._cutout_csv_selection()
+            job_kwargs.update(frame=frame, columns=columns, calculated=calculated)
+        job_kwargs['notes'] = tuple(notes)
+        return CutoutJob(**job_kwargs)
 
-                QMessageBox.information(self, "数据截取成功", f"MDF/MF4 数据已截取保存到:\n{file_name}")
-            except Exception as e:
-                QMessageBox.critical(self, "数据截取失败", f"另存为MDF/MF4时出错: {e}")
+    def _execute_cutout(self, context, option, output_path):
+        """Synchronous path kept for tests and for callers without a GUI loop."""
+        job = self._build_cutout_job(context, option, output_path)
+        return execute_cutout_job(job)
 
-        elif file_extension in ('.csv', '.vbo'):
-            default_ext = '.csv'
-            filter_str = "CSV Files (*.csv)"
-            default_file_name = f"{base_name}_cut_{start_time:.2f}s-{stop_time:.2f}s{default_ext}"
-
-            file_name, _ = QFileDialog.getSaveFileName(self, "保存截取的数据 (CSV)", default_file_name, filter_str)
-            if not file_name:
-                return
-
-            try:
-                selected_keys = self.get_selected_signals()
-                if not selected_keys:
-                    QMessageBox.warning(self, "数据截取",
-                                        "由于当前数据格式非原生MDF，请先在左侧至少勾选一个信号用于截取导出。")
-                    return
-
-                data_dict = {}
-                global_t = None
-                for key in selected_keys:
-                    sig = self._get_signal(self.signals[key])
-                    if sig is not None:
-                        mask = (sig.timestamps >= start_time) & (sig.timestamps <= stop_time)
-                        if global_t is None:
-                            global_t = sig.timestamps[mask]
-                        data_dict[self.signals[key]['display_name']] = np.interp(global_t, sig.timestamps, sig.samples)
-
-                if global_t is None or len(global_t) == 0:
-                    QMessageBox.warning(self, "数据截取", "选定时间段内无可切片的数据。")
-                    return
-
-                df_cut = pd.DataFrame(data_dict, index=global_t)
-                df_cut.index.name = 'timestamp'
-                df_cut.to_csv(file_name, encoding='utf-8')
-                QMessageBox.information(self, "数据截取成功", f"数据已成功截取并重采样保存到:\n{file_name}")
-            except Exception as e:
-                QMessageBox.critical(self, "数据截取失败", f"另存为CSV时出错: {e}")
+    def _show_cutout_result(self, result, option):
+        lines = [f"输出文件：{result.output_path}"]
+        if result.message_count:
+            lines.append(
+                f"内容：{len(result.bus_counts)} 个总线，{result.message_count:,} 条原始报文"
+            )
+            if 1 < len(result.bus_counts) <= 8:
+                detail = "，".join(
+                    f"Bus {bus_id}: {count:,} 条" for bus_id, count in result.bus_counts
+                )
+                lines.append(f"　　　　{detail}")
+        elif option.format is OutputFormat.MDF:
+            detail = f"内容：{result.channel_count:,} 个信号通道"
+            if result.sample_count:
+                detail += f"，{result.sample_count:,} 个采样点"
+            lines.append(detail)
+        else:
+            lines.append(f"内容：{result.row_count:,} 行 × {result.channel_count} 列")
+        lines.append(f"耗时：{result.elapsed:.2f} s")
+        if result.skipped:
+            lines.append("")
+            lines.append(f"注意：{len(result.skipped)} 个信号未写入：")
+            lines.extend(f"· {item}" for item in result.skipped[:6])
+            if len(result.skipped) > 6:
+                lines.append("· …")
+        QMessageBox.information(self, "数据截取完成", "\n".join(lines))
 
     def cut_blf_by_time(self, input_path, output_path, start_time, stop_time, bus_filter=None):
+        """Write one relative-time window of a BLF into a new BLF.
+
+        The window is measured from the first message of the file.  Parsing and
+        plotting use that same file time base for every bus, so the cut must use
+        a single global t0 as well; using a per-channel t0 would put every other
+        bus at relative time 0 and change which messages end up in the output.
+        """
+        from .data_cutout import CutoutWindow, cut_blf_raw
+
         try:
-            t0_per_bus = {}
-            with can.BLFReader(input_path) as reader:
-                for msg in reader:
-                    raw_channel = message_raw_channel(msg)
-                    if raw_channel not in t0_per_bus:
-                        t0_per_bus[raw_channel] = msg.timestamp
-                    if len(t0_per_bus) > 0:
-                        break
+            window = CutoutWindow(start_time, stop_time)
+            result = cut_blf_raw(
+                input_path,
+                output_path,
+                window,
+                mapping=getattr(self, 'can_bus_mapping', None),
+                bus_filter=bus_filter,
+                reader_factory=can.BLFReader,
+                writer_factory=can.BLFWriter,
+            )
+        except Exception as exc:
+            print(f"BLF截取失败: {exc}")
+            raise Exception(f"BLF截取失败: {exc}")
 
-            if not t0_per_bus:
-                raise Exception("无法读取BLF文件起始时间")
-
-            count = 0
-            total_count = 0
-            bus_stats = defaultdict(int)
-
-            try:
-                from can import BLFWriter
-                with BLFWriter(output_path) as writer:
-                    with can.BLFReader(input_path) as reader:
-                        for msg in reader:
-                            total_count += 1
-                            raw_channel = message_raw_channel(msg)
-                            mapping = getattr(self, 'can_bus_mapping', None)
-                            bus_id = mapping.raw_to_bus.get(raw_channel, raw_channel) if mapping else raw_channel
-                            t0 = t0_per_bus.get(raw_channel, t0_per_bus.get(0, msg.timestamp))
-                            rel_t = msg.timestamp - t0
-
-                            if bus_filter is not None and bus_id not in bus_filter:
-                                continue
-
-                            if start_time <= rel_t <= stop_time:
-                                if hasattr(writer, 'write'):
-                                    writer.write(msg)
-                                elif hasattr(writer, 'on_message_received'):
-                                    writer.on_message_received(msg)
-                                else:
-                                    writer.write(msg)
-                                count += 1
-                                bus_stats[bus_id] += 1
-
-                        if count == 0:
-                            raise Exception(f"指定时间范围内没有找到任何报文 (总报文数: {total_count})")
-
-                        print(f"BLF截取完成: 共截取 {count} 条报文")
-                        for bus_id, cnt in bus_stats.items():
-                            print(f"  总线 {bus_id}: {cnt} 条")
-                return True
-
-            except Exception as e:
-                print(f"BLF截取失败: {e}")
-                raise
-
-        except Exception as e:
-            raise Exception(f"BLF截取失败: {e}")
-
-    def _export_can_to_csv(self, output_path, start_time, stop_time, bus_filter=None):
-        try:
-            if not self.can_parsed_data:
-                raise Exception("没有可用的CAN解析数据，请先配置并解析总线")
-
-            data_dict = {'timestamp': []}
-            for key, data in self.can_parsed_data.items():
-                bus_id = data.get('bus_id')
-                if bus_filter is not None and bus_id not in bus_filter:
-                    continue
-
-                mask = (data['timestamps'] >= start_time) & (data['timestamps'] <= stop_time)
-                timestamps = data['timestamps'][mask]
-                samples = data['samples'][mask]
-
-                if len(timestamps) == 0:
-                    continue
-
-                if len(data_dict['timestamp']) == 0:
-                    data_dict['timestamp'] = timestamps
-
-                signal_name = self.signals.get(key, {}).get('display_name', key)
-                data_dict[signal_name] = np.interp(data_dict['timestamp'], timestamps, samples)
-
-            df = pd.DataFrame(data_dict)
-            df.to_csv(output_path, index=False, encoding='utf-8')
-            print(f"CSV导出完成: {len(data_dict['timestamp'])} 行数据")
-
-        except Exception as e:
-            raise Exception(f"导出CSV失败: {e}")
+        print(f"BLF截取完成: 共截取 {result.message_count} 条报文")
+        for bus_id, count in result.bus_counts:
+            print(f"  总线 {bus_id}: {count} 条")
+        return True
 
     def export_selected_signals_to_csv(self):
         selected_signals = self.get_selected_signals()
@@ -6029,10 +7042,10 @@ class MDFPlotter(QWidget):
 
         # 清理绘图资源
         if hasattr(self, 'plot_widgets'):
+            self._close_overlay_y_axis_managers(preserve_state=False)
             for widget in self.plot_widgets:
                 try:
-                    widget.setParent(None)
-                    widget.deleteLater()
+                    self._delete_plot_widget(widget)
                 except Exception:
                     pass
             self.plot_widgets.clear()
@@ -6061,6 +7074,8 @@ class MDFPlotter(QWidget):
             self.signal_widgets.clear()
 
         # 清理信号数据
+        if hasattr(self, "clear_signal_curve_visibility"):
+            self.clear_signal_curve_visibility()
         self.signals.clear()
         self.can_parsed_data.clear()
         self.bus_signal_map.clear()

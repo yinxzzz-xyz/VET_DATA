@@ -91,6 +91,60 @@ class ParseWorkerReliabilityTests(unittest.TestCase):
         self.assertEqual(len(finished), 1)
         return finished[0][1], progress, reader
 
+    def test_incremental_context_matches_single_worker_with_interleaved_channels(self):
+        database = load_dbc(
+            "BO_ 256 Speed: 1 Vector__XXX\n"
+            " SG_ value : 0|8@1+ (1,0) [0|255] \"km/h\" Vector__XXX\n"
+        )
+        messages = [
+            frame(0x100, b"\x01", channel=0, timestamp=4.0),
+            frame(0x100, b"\x11", channel=1, timestamp=5.0),
+            frame(0x100, b"\x22", channel=0, timestamp=6.0),
+            frame(0x100, b"\x33", channel=1, timestamp=7.0),
+        ]
+        identity = CanFileIdentity(normalized_can_path("input.blf"), 100, 200)
+
+        legacy_worker = baseline.ParseWorker(
+            1, 1, 2, "input.blf", identity, database
+        )
+        legacy_result = []
+        legacy_worker.parse_finished.connect(
+            lambda _bus, stats: legacy_result.append(stats)
+        )
+        legacy_reader = FakeReader(messages)
+        with patch.object(
+            baseline.can, "BLFReader", return_value=legacy_reader
+        ), patch.object(
+            baseline, "capture_can_file_identity", return_value=identity
+        ), contextlib.redirect_stdout(io.StringIO()):
+            legacy_worker.run()
+
+        context_worker = baseline.ParseWorker(
+            1, 1, 2, "input.blf", identity, database
+        )
+        context = baseline.ParseContext(context_worker)
+        context.start()
+        file_t0 = messages[0].timestamp
+        for message in messages:
+            if baseline.message_raw_channel(message) == 1:
+                context.feed(message, file_t0)
+        context_result = context.finish()
+
+        self.assertEqual(len(legacy_result), 1)
+        stable_keys = (
+            "messages_processed", "scanned_frames", "dbc_matched_frames",
+            "dbc_undefined_frames", "decoded_frames", "empty_decoded_frames",
+            "truncated_frames", "decode_failed_frames", "signals_decoded",
+            "generated_signal_count", "dbc_message_count", "dbc_signal_count",
+            "matched_msg_ids", "matched_frames", "unmatched_msg_ids",
+            "container_frame_counts", "generated_sample_count",
+        )
+        for key in stable_keys:
+            self.assertEqual(legacy_result[0][key], context_result[key], key)
+        self.assertEqual(legacy_result[0]["pool"], context_result["pool"])
+        self.assertEqual(context_result["pool"]["value"]["t"], [1.0, 3.0])
+        self.assertEqual(context_result["pool"]["value"]["v"], [17.0, 51.0])
+
     def test_cancel_stops_reader_without_emitting_partial_parse_results(self):
         database = load_dbc(
             "BO_ 256 Cancelled: 1 Vector__XXX\n"
@@ -296,6 +350,26 @@ class FilteredDatabaseReliabilityTests(unittest.TestCase):
         message = filtered.get_message_by_frame_id(0x123, force_extended_id=True)
         self.assertTrue(message.is_extended_frame)
         self.assertEqual(message.decode(b"\x33"), {"value": 51})
+
+    def test_demand_filter_distinguishes_standard_and_extended_same_id(self):
+        database = self.database(
+            Message(
+                frame_id=0x123, name="Standard", length=1,
+                signals=[Signal("standard_value", 0, 8)],
+                is_extended_frame=False,
+            ),
+            Message(
+                frame_id=0x123, name="Extended", length=1,
+                signals=[Signal("extended_value", 0, 8)],
+                is_extended_frame=True,
+            ),
+        )
+        filtered, _ = baseline.BusConfigWidget._build_filtered_database(
+            database, {(0x123, True): {"extended_value"}}
+        )
+        self.assertEqual(len(filtered.messages), 1)
+        self.assertTrue(filtered.messages[0].is_extended_frame)
+        self.assertEqual(filtered.messages[0].decode(b"\x2A"), {"extended_value": 42})
 
     def test_empty_selection_keeps_existing_database_behavior(self):
         original = self.database(Message(

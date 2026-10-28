@@ -6,6 +6,7 @@ import numpy as np
 from PyQt6.QtCore import QEvent, QPointF, QSignalBlocker, QSize, QTimer, Qt
 from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QWidget
 
+from .legacy import baseline
 from .signal_panel import INTERVAL_ROLE, KEY_ROLE, MEASUREMENT_ROLE
 
 
@@ -15,6 +16,7 @@ class PlotPanelMixin:
 
     def _setup_plot_panel(self):
         self.plot_min_height = 150
+        self._plot_height_explicit = False
         self.curve_display_mode = self.plot_mode_combo.currentData() or "independent"
         self.cursor_enabled = False
         self._shared_axis_syncing = False
@@ -29,15 +31,13 @@ class PlotPanelMixin:
         self.height_spin.setRange(80, 900); self.height_spin.setSingleStep(10)
         self.height_spin.setValue(self.plot_min_height); self.height_spin.setSuffix(" px")
         row.addWidget(self.height_spin); row.addStretch()
-        self.measurement_bar = QLabel("A: —    B: —    Δt: —")
-        self.measurement_bar.setObjectName("measurementSummary")
-        row.addWidget(self.measurement_bar)
-        self.measurement_bar.setVisible(False)
         self.box_zoom_button = QPushButton("框选放大")
         self.box_zoom_button.setCheckable(True)
         self.box_zoom_button.setProperty("uiRole", "stateToggle")
         self.box_zoom_button.setToolTip("拖动框选时间范围；只缩放横轴，纵轴保持当前范围")
+        self.box_zoom_button.setMinimumSize(92, 32)
         self.reset_zoom_button = QPushButton("复位视图")
+        self.reset_zoom_button.setMinimumSize(92, 32)
         row.addWidget(self.box_zoom_button)
         row.addWidget(self.reset_zoom_button)
         self.curve_ribbon_layout.insertWidget(
@@ -48,6 +48,12 @@ class PlotPanelMixin:
         self.reset_zoom_button.clicked.connect(self.reset_plot_view)
         self.plot_mode_combo.currentIndexChanged.connect(
             lambda _index: self.set_curve_display_mode(self.plot_mode_combo.currentData())
+        )
+        self.signal_list_widget.currentItemChanged.connect(
+            self._current_overlay_signal_changed
+        )
+        self.selected_signal_list_widget.currentItemChanged.connect(
+            self._current_overlay_signal_changed
         )
         self.single_cursor_button.toggled.connect(
             lambda checked: self._cursor_mode_button_toggled("single", checked)
@@ -60,11 +66,78 @@ class PlotPanelMixin:
         self.plot_empty_label.setProperty("uiEmptyState", True)
         self.plot_layout.addWidget(self.plot_empty_label)
 
+    def _current_overlay_signal_changed(self, item, _previous=None):
+        if item is None:
+            return
+        signal_key = item.data(KEY_ROLE)
+        for plot in tuple(getattr(self, "plot_widgets", ())):
+            manager = getattr(plot, "multi_y_axis_manager", None)
+            if manager is None or signal_key not in manager.signal_keys:
+                continue
+            manager.set_current_signal(signal_key)
+            self._overlay_current_signal_key = signal_key
+            return
+
     def _set_plot_empty_state(self, message):
         self.plot_empty_label.setText(message or "")
         self.plot_empty_label.setVisible(bool(message))
 
     def plot_selected_signals(self):
+        snapshot = getattr(self, "can_detection_snapshot", None)
+        if snapshot is not None:
+            try:
+                if baseline.capture_can_file_identity(self.mdf_path) != snapshot.file_identity:
+                    self.can_parsed_data.clear()
+                    self._plot_after_can_parse = False
+                    self._set_plot_empty_state("BLF 文件已变化，请重新导入后再绘图。")
+                    return
+            except OSError:
+                self.can_parsed_data.clear()
+                self._plot_after_can_parse = False
+                self._set_plot_empty_state("无法读取当前 BLF 文件，请重新导入后再绘图。")
+                return
+        selected_keys = self.get_selected_signals()
+        if snapshot is not None:
+            for key in selected_keys:
+                data = self.can_parsed_data.get(key)
+                if data is None:
+                    continue
+                bus_id = data.get("bus_id", self.signals.get(key, {}).get("bus_id"))
+                protocol = self.bus_protocols.get(bus_id)
+                try:
+                    protocol_identity = (
+                        baseline.capture_can_file_identity(protocol)
+                        if protocol else None
+                    )
+                except OSError:
+                    protocol_identity = None
+                if (
+                    data.get("file_identity") != snapshot.file_identity
+                    or data.get("protocol_path") != protocol
+                    or data.get("protocol_identity") != protocol_identity
+                    or data.get("raw_channel") != self.can_bus_data.get(bus_id, {}).get("raw_channel")
+                ):
+                    self.can_parsed_data.pop(key, None)
+        skip_demand = getattr(self, "_skip_can_demand_once", False)
+        self._skip_can_demand_once = False
+        selected_can_missing = not skip_demand and any(
+            key.startswith("CAN_")
+            and self.signals.get(key, {}).get("bus_id") is not None
+            and key not in self.can_parsed_data
+            for key in selected_keys
+        )
+        if selected_can_missing:
+            self._plot_after_can_parse = True
+            try:
+                started = self.prepare_selected_can_signals(selected_keys)
+            except Exception as exc:
+                self._plot_after_can_parse = False
+                self._set_plot_empty_state(f"无法启动 CAN 按需解析：{exc}")
+                return
+            if started:
+                self._set_plot_empty_state("正在按需解析所选 CAN 信号…")
+                return
+            self._plot_after_can_parse = False
         self._clear_cursor_drag_state()
         self._set_plot_empty_state(None)
         super().plot_selected_signals()
@@ -99,7 +172,7 @@ class PlotPanelMixin:
             QTimer.singleShot(0, self._align_shared_time_axis_geometry)
         for plot in self.plot_widgets:
             plot.getPlotItem().hideAxis("bottom")
-            plot.setMinimumHeight(self.plot_min_height)
+            self._apply_plot_height(plot)
             plot.getViewBox().setMouseEnabled(
                 x=True, y=not self.box_zoom_button.isChecked()
             )
@@ -110,15 +183,11 @@ class PlotPanelMixin:
             )
             plot.viewport().installEventFilter(self)
             plot.getViewBox().sigRangeChanged.connect(
-                lambda *_args: QTimer.singleShot(
-                    0, self._align_shared_time_axis_geometry
-                )
+                self._schedule_shared_time_axis_alignment
             )
             left_axis = plot.getPlotItem().getAxis("left")
             left_axis.geometryChanged.connect(
-                lambda *_args: QTimer.singleShot(
-                    0, self._align_shared_time_axis_geometry
-                )
+                self._schedule_shared_time_axis_alignment
             )
             single_visible = self.cursor_mode == "single"
             plot.vLine.setVisible(single_visible)
@@ -128,6 +197,7 @@ class PlotPanelMixin:
             for spot in getattr(plot, "cursor_spots", (plot.spot_item,)):
                 spot.setVisible(single_visible)
             self._register_plot_stats_responsiveness(plot)
+        self._refresh_plot_scroll_content()
         self._initialize_cursor_positions()
         self._apply_cursor_visibility()
         self._update_measurement_display()
@@ -138,6 +208,10 @@ class PlotPanelMixin:
             self._mouse_in_plot = True
             if self._view_mode == "selected":
                 self._list_update_timer.start()
+
+    def _schedule_shared_time_axis_alignment(self, *_args):
+        """Queue alignment through a QObject-bound slot tied to this window."""
+        QTimer.singleShot(0, self._align_shared_time_axis_geometry)
 
     def _shared_time_axis_range_changed(self, _view, ranges):
         self._set_shared_time_axis_range(ranges)
@@ -293,21 +367,50 @@ class PlotPanelMixin:
         dual_visible = self.cursor_mode == "dual"
         for plot in tuple(getattr(self, "plot_widgets", ())):
             try:
-                plot.vLine.setVisible(single_visible)
-                for label in getattr(plot, "cursor_labels", {}).get("single", ()):
-                    label.setVisible(single_visible)
-                plot.text_item.setVisible(single_visible)
-                for spot in getattr(plot, "cursor_spots", (plot.spot_item,)):
-                    spot.setVisible(single_visible)
+                records = tuple(getattr(plot, "signal_records", ()))
+                has_visible_curve = any(
+                    record.get("curve_visible", True) for record in records
+                )
+                plot.vLine.setVisible(single_visible and has_visible_curve)
+                for index, label in enumerate(
+                    getattr(plot, "cursor_labels", {}).get("single", ())
+                ):
+                    visible = (
+                        index < len(records)
+                        and records[index].get("curve_visible", True)
+                    )
+                    label.setVisible(single_visible and visible)
+                first_curve_visible = bool(
+                    records and records[0].get("curve_visible", True)
+                )
+                plot.text_item.setVisible(single_visible and first_curve_visible)
+                for index, spot in enumerate(
+                    getattr(plot, "cursor_spots", (plot.spot_item,))
+                ):
+                    visible = (
+                        index < len(records)
+                        and records[index].get("curve_visible", True)
+                    )
+                    spot.setVisible(single_visible and visible)
                 if single_visible and self._single_cursor_time is not None:
                     plot.vLine.setPos(self._single_cursor_time)
                 for name, line in getattr(plot, "measurement_lines", {}).items():
                     time_value = self._cursor_a_time if name == "A" else self._cursor_b_time
-                    line.setVisible(dual_visible and time_value is not None)
+                    line.setVisible(
+                        dual_visible and time_value is not None and has_visible_curve
+                    )
                     if dual_visible and time_value is not None:
                         line.setPos(time_value)
-                    for label in getattr(plot, "cursor_labels", {}).get(name, ()):
-                        label.setVisible(dual_visible and time_value is not None)
+                    for index, label in enumerate(
+                        getattr(plot, "cursor_labels", {}).get(name, ())
+                    ):
+                        curve_visible = (
+                            index < len(records)
+                            and records[index].get("curve_visible", True)
+                        )
+                        label.setVisible(
+                            dual_visible and time_value is not None and curve_visible
+                        )
             except RuntimeError:
                 continue
 
@@ -436,6 +539,13 @@ class PlotPanelMixin:
                     view_box.enableAutoRange(x=True, y=True)
                     view_box.autoRange(padding=0.02)
                     view_box.enableAutoRange(x=False, y=False)
+                manager = getattr(plot, "multi_y_axis_manager", None)
+                if manager is not None:
+                    for signal_key, y_range in getattr(
+                        plot, "initial_signal_y_ranges", {}
+                    ).items():
+                        if signal_key in manager.signal_keys:
+                            manager.set_y_range(signal_key, y_range)
             except RuntimeError:
                 continue
 
@@ -480,16 +590,23 @@ class PlotPanelMixin:
             return None
 
     @staticmethod
-    def _position_cursor_label(plot, label, cursor_time, sample_y):
-        view_box = plot.getViewBox()
+    def _position_cursor_label(plot, label, cursor_time, sample_y, view_box=None):
+        view_box = view_box or plot.getViewBox()
         if sample_y is None or not np.isfinite(sample_y):
             sample_y = sum(view_box.viewRange()[1]) * 0.5
         anchor = plot.mapFromScene(
             view_box.mapViewToScene(QPointF(float(cursor_time), float(sample_y)))
         )
-        scene_pos = plot.mapToScene(QPointF(anchor.x() + 8, anchor.y() - 10).toPoint())
-        label.setPos(view_box.mapSceneToView(scene_pos))
         bounds = plot.mapFromScene(view_box.sceneBoundingRect()).boundingRect()
+        # Preserve the established strategy: in the rightmost 30% of the plot,
+        # put the readout on the left so it cannot cover the cursor/curve.
+        place_left = anchor.x() > bounds.left() + bounds.width() * 0.7
+        label.setAnchor((1, 0.5) if place_left else (0, 0.5))
+        offset = -8 if place_left else 8
+        scene_pos = plot.mapToScene(
+            QPointF(anchor.x() + offset, anchor.y() - 10).toPoint()
+        )
+        label.setPos(view_box.mapSceneToView(scene_pos))
         label_rect = plot.mapFromScene(label.sceneBoundingRect()).boundingRect()
         dx = max(bounds.left() + 2 - label_rect.left(), 0)
         dy = max(bounds.top() + 2 - label_rect.top(), 0)
@@ -499,7 +616,9 @@ class PlotPanelMixin:
             dy = bounds.bottom() - 2 - label_rect.bottom()
         if dx or dy:
             anchor_pos = plot.mapFromScene(label.scenePos())
-            adjusted = plot.mapToScene(QPointF(anchor_pos.x() + dx, anchor_pos.y() + dy).toPoint())
+            adjusted = plot.mapToScene(
+                QPointF(anchor_pos.x() + dx, anchor_pos.y() + dy).toPoint()
+            )
             label.setPos(view_box.mapSceneToView(adjusted))
 
     @staticmethod
@@ -507,13 +626,19 @@ class PlotPanelMixin:
         if cursor_name == "single":
             return
         labels = getattr(plot, "cursor_labels", {})
-        for a_label, b_label in zip(labels.get("A", ()), labels.get("B", ())):
+        records = getattr(plot, "signal_records", ())
+        for index, (a_label, b_label) in enumerate(zip(
+            labels.get("A", ()), labels.get("B", ())
+        )):
             if not (a_label.isVisible() and b_label.isVisible()):
                 continue
             a_rect = a_label.sceneBoundingRect()
             b_rect = b_label.sceneBoundingRect()
             if a_rect.intersects(b_rect):
-                view_box = plot.getViewBox()
+                view_box = (
+                    records[index].get("view_box")
+                    if index < len(records) else plot.getViewBox()
+                )
                 anchor = plot.mapFromScene(b_label.scenePos())
                 bounds = plot.mapFromScene(view_box.sceneBoundingRect()).boundingRect()
                 target_y = anchor.y() + a_rect.height() + 4
@@ -531,14 +656,22 @@ class PlotPanelMixin:
         a_label = f"{a_time:.6f} s" if a_time is not None else "—"
         b_label = f"{b_time:.6f} s" if b_time is not None else "—"
         delta_label = f"{abs(b_time - a_time):.6f} s" if a_time is not None and b_time is not None else "—"
-        self.measurement_bar.setText(f"A: {a_label}    B: {b_label}    Δt: {delta_label}")
+        self.measurement_bar.setText(
+            f"A: {a_label}    B: {b_label}\nΔt: {delta_label}"
+        )
         self.measurement_bar.setVisible(dual_enabled)
         for plot in tuple(getattr(self, "plot_widgets", ())):
             lines = getattr(plot, "measurement_lines", {})
+            has_visible_curve = any(
+                record.get("curve_visible", True)
+                for record in getattr(plot, "signal_records", ())
+            )
             for name, cursor_time in (("A", a_time), ("B", b_time)):
                 line = lines.get(name)
                 if line is not None:
-                    line.setVisible(dual_enabled and cursor_time is not None)
+                    line.setVisible(
+                        dual_enabled and cursor_time is not None and has_visible_curve
+                    )
                     if cursor_time is not None:
                         line.setPos(cursor_time)
                 labels = getattr(plot, "cursor_labels", {}).get(name, ())
@@ -553,10 +686,13 @@ class PlotPanelMixin:
                         continue
                     shown = f"{value:.3f}" if isinstance(value, (int, float)) else str(value)
                     label.setText(f"{cursor_time:.6f}, {shown}")
-                    label.setVisible(dual_enabled)
+                    label.setVisible(
+                        dual_enabled and record.get("curve_visible", True)
+                    )
                     self._position_cursor_label(
                         plot, label, cursor_time,
                         self._measurement_sample_y(record, cursor_time),
+                        view_box=record.get("view_box"),
                     )
                 self._separate_cursor_labels(plot, name)
         for row in range(self.selected_signal_list_widget.count()):
@@ -591,10 +727,18 @@ class PlotPanelMixin:
         if signal is None or not len(signal.timestamps):
             return "区间统计：无有效数据"
         lower, upper = sorted((start_time, end_time))
-        lower = float(np.nextafter(lower, -np.inf))
-        upper = float(np.nextafter(upper, np.inf))
-        start = int(np.searchsorted(signal.timestamps, lower, side="left"))
-        stop = int(np.searchsorted(signal.timestamps, upper, side="right"))
+        timestamps = np.asarray(signal.timestamps)
+        # Match the cursor readout: interval statistics include the samples
+        # nearest to both cursor positions, even when a drag lands a fraction
+        # of a pixel beside an exact sample timestamp.
+        start = int(np.searchsorted(timestamps, lower, side="left"))
+        if start > 0 and abs(timestamps[start] - lower) > abs(lower - timestamps[start - 1]):
+            start -= 1
+        stop = int(np.searchsorted(timestamps, upper, side="left"))
+        if stop < len(timestamps) and abs(timestamps[stop] - upper) <= abs(upper - timestamps[stop - 1]):
+            stop += 1
+        if stop < start:
+            stop = start
         try:
             values = np.asarray(signal.samples[start:stop], dtype=float)
         except (TypeError, ValueError):
@@ -670,13 +814,50 @@ class PlotPanelMixin:
             self._current_cursor_time = self._single_cursor_time
             self._list_update_timer.start()
 
+    @staticmethod
+    def _plot_axis_scroll_reserve(plot):
+        scroll_bar = getattr(plot, "y_axis_scroll_bar", None)
+        return scroll_bar.height() if scroll_bar is not None else 0
+
+    def _apply_plot_height(self, plot):
+        """Apply the height control as a real height after the user changes it."""
+        if plot is None:
+            return
+        try:
+            if self._plot_height_explicit and hasattr(plot, "setFixedHeight"):
+                plot.setFixedHeight(self.plot_min_height)
+            else:
+                plot.setMinimumHeight(self.plot_min_height)
+                if hasattr(plot, "setMaximumHeight"):
+                    plot.setMaximumHeight(16_777_215)
+            container = getattr(plot, "axis_scroll_container", None)
+            if container is not None:
+                target = self.plot_min_height + self._plot_axis_scroll_reserve(plot)
+                if self._plot_height_explicit and hasattr(container, "setFixedHeight"):
+                    container.setFixedHeight(target)
+                else:
+                    container.setMinimumHeight(target)
+                    if hasattr(container, "setMaximumHeight"):
+                        container.setMaximumHeight(16_777_215)
+        except RuntimeError:
+            # A queued height signal can arrive while Qt is destroying plots.
+            return
+
+    def _refresh_plot_scroll_content(self):
+        container = getattr(self, "plot_container", None)
+        if container is None:
+            return
+        layout = getattr(self, "plot_layout", None)
+        if layout is not None:
+            layout.activate()
+        container.adjustSize()
+        scroll_area = getattr(self, "plot_scroll_area", None)
+        if scroll_area is not None:
+            scroll_area.widget().updateGeometry()
+
     def _plot_height_changed(self, value):
         self.plot_min_height = value
+        self._plot_height_explicit = True
         for plot in tuple(getattr(self, "plot_widgets", ())):
-            if plot is None:
-                continue
-            try:
-                plot.setMinimumHeight(value)
-            except RuntimeError:
-                # A queued height signal can arrive while Qt is destroying plots.
-                continue
+            self._apply_plot_height(plot)
+        self._refresh_plot_scroll_content()

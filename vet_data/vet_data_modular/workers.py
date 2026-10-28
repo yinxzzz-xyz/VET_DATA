@@ -5,6 +5,7 @@ mutation remain in the GUI thread.
 """
 
 from collections import defaultdict
+from array import array
 from dataclasses import dataclass
 from io import StringIO
 from numbers import Integral
@@ -120,6 +121,142 @@ def export_csv_snapshot(snapshot, cancel_event=None, progress_callback=None):
 
 
 MISSING_CAN_CHANNEL = 1
+
+
+class _CanRawFrameSeries:
+    """Compact storage for one (arbitration ID, extended) frame stream."""
+
+    __slots__ = ("timestamps", "dlcs", "payload_lengths", "flags", "payload")
+
+    def __init__(self):
+        self.timestamps = array("d")
+        self.dlcs = bytearray()
+        self.payload_lengths = bytearray()
+        self.flags = bytearray()
+        self.payload = bytearray()
+
+    def append(self, message):
+        payload = bytes(getattr(message, "data", b""))
+        flags = (
+            (1 if getattr(message, "is_fd", False) else 0)
+            | (2 if getattr(message, "bitrate_switch", False) else 0)
+            | (4 if getattr(message, "error_state_indicator", False) else 0)
+            | (8 if getattr(message, "is_remote_frame", False) else 0)
+            | (16 if getattr(message, "is_error_frame", False) else 0)
+        )
+        self.timestamps.append(float(message.timestamp))
+        self.dlcs.append(int(getattr(message, "dlc", len(payload))) & 0xFF)
+        self.payload_lengths.append(len(payload) & 0xFF)
+        self.flags.append(flags)
+        self.payload.extend(payload)
+
+    @property
+    def memory_bytes(self):
+        return (
+            len(self.timestamps) * self.timestamps.itemsize
+            + len(self.dlcs) + len(self.payload_lengths) + len(self.flags)
+            + len(self.payload)
+        )
+
+
+class CanRawMessageCache:
+    """Compact, file-bound cache of DBC-relevant raw CAN messages.
+
+    The cache stores only frames whose ID and extended-frame bit occur in a
+    bus's full DBC catalog.  It avoids Python objects per frame while allowing
+    later signal selections to replay only their target messages.
+    """
+
+    def __init__(self, file_identity, raw_channel, frame_keys, context_key):
+        self.file_identity = file_identity
+        self.raw_channel = int(raw_channel)
+        self.frame_keys = frozenset(
+            (int(frame_id), bool(is_extended))
+            for frame_id, is_extended in frame_keys
+        )
+        self.context_key = context_key
+        self.file_t0 = None
+        self.frames = {}
+        self.complete = False
+        self.frame_count = 0
+
+    def append(self, message, file_t0, raw_channel=None):
+        if self.complete:
+            return False
+        if raw_channel is None:
+            raw_channel = message_raw_channel(message)
+        if raw_channel != self.raw_channel:
+            return False
+        key = (
+            int(message.arbitration_id),
+            bool(getattr(message, "is_extended_id", False)),
+        )
+        if key not in self.frame_keys:
+            return False
+        if self.file_t0 is None:
+            self.file_t0 = float(file_t0)
+        series = self.frames.get(key)
+        if series is None:
+            series = _CanRawFrameSeries()
+            self.frames[key] = series
+        series.append(message)
+        self.frame_count += 1
+        return True
+
+    def finish_scan(self, file_t0=None):
+        if self.file_t0 is None and file_t0 is not None:
+            self.file_t0 = float(file_t0)
+        self.complete = True
+
+    def reset(self):
+        """Discard an interrupted scan so a retry cannot duplicate frames."""
+        self.file_t0 = None
+        self.frames.clear()
+        self.frame_count = 0
+        self.complete = False
+
+    def count_frame_keys(self, frame_keys):
+        return sum(
+            len(self.frames[key].timestamps) if key in self.frames else 0
+            for key in {(int(fid), bool(ext)) for fid, ext in frame_keys}
+        )
+
+    @property
+    def payload_bytes(self):
+        return sum(len(series.payload) for series in self.frames.values())
+
+    @property
+    def memory_bytes(self):
+        return sum(series.memory_bytes for series in self.frames.values())
+
+    def iter_messages(self, frame_keys):
+        if not self.complete:
+            raise RuntimeError("CAN原始报文缓存尚未完整")
+        for key in sorted({(int(fid), bool(ext)) for fid, ext in frame_keys}):
+            series = self.frames.get(key)
+            if series is None:
+                continue
+            payload_offset = 0
+            for index, timestamp in enumerate(series.timestamps):
+                payload_length = series.payload_lengths[index]
+                payload = bytes(
+                    series.payload[payload_offset:payload_offset + payload_length]
+                )
+                payload_offset += payload_length
+                flags = series.flags[index]
+                yield can.Message(
+                    timestamp=timestamp,
+                    arbitration_id=key[0],
+                    is_extended_id=key[1],
+                    data=payload,
+                    channel=self.raw_channel,
+                    dlc=series.dlcs[index],
+                    is_fd=bool(flags & 1),
+                    bitrate_switch=bool(flags & 2),
+                    error_state_indicator=bool(flags & 4),
+                    is_remote_frame=bool(flags & 8),
+                    is_error_frame=bool(flags & 16),
+                ), self.file_t0
 
 
 def normalize_can_channel(channel):
