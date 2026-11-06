@@ -9,6 +9,7 @@ whose name says ``*_and_events``. This is diagnostic tooling, not a test.
 """
 
 import argparse
+import inspect
 import json
 import os
 import statistics
@@ -22,9 +23,17 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "vet_data"))
 
 import numpy as np
 from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from vet_data_modular.window import MDFPlotter
+
+
+def settle(app, milliseconds=250):
+    """Drain queued paint, debounced statistics, and auto-scale work."""
+    app.processEvents()
+    QTest.qWait(milliseconds)
+    app.processEvents()
 
 
 def percentile(values, percent):
@@ -36,10 +45,12 @@ def percentile(values, percent):
     return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
 
-def measure(name, operation, repeats):
+def measure(name, operation, repeats, before=None):
     operation()  # one warm-up pass; exclude import/cache initialization
     samples = []
     for _ in range(repeats):
+        if before is not None:
+            before()
         started = time.perf_counter()
         operation()
         samples.append((time.perf_counter() - started) * 1000)
@@ -51,14 +62,20 @@ def measure(name, operation, repeats):
     }
 
 
-def run_case(app, signal_count, point_count, mode, repeats):
+def run_case(app, signal_count, point_count, mode, repeats, kind="numeric"):
     window = MDFPlotter()
     window.resize(1400, 900)
     window.show()
     app.processEvents()
 
-    # Generate equal-sized, float64 arrays before timing plot operations.
+    # Generate equal-sized arrays before timing plot operations. Text cases use
+    # the same resolver path as real enum signals: strings are normalized to
+    # numeric codes plus label metadata.
     timestamps = np.linspace(0.0, 1000.0, point_count, dtype=np.float64)
+    if kind == "text":
+        samples = np.where(np.arange(point_count) % 2, "ON", "OFF")
+    else:
+        samples = None
     signals = {}
     parsed = {}
     for index in range(signal_count):
@@ -69,8 +86,12 @@ def run_case(app, signal_count, point_count, mode, repeats):
         }
         parsed[key] = {
             "timestamps": timestamps,
-            "samples": np.sin(timestamps * (0.001 + index * 0.00001) + index),
-            "unit": "V",
+            "samples": (
+                samples
+                if kind == "text"
+                else np.sin(timestamps * (0.001 + index * 0.00001) + index)
+            ),
+            "unit": "" if kind == "text" else "V",
         }
     window.signals = signals
     window.can_parsed_data = parsed
@@ -82,6 +103,7 @@ def run_case(app, signal_count, point_count, mode, repeats):
 
     result = {
         "mode": mode,
+        "signal_kind": kind,
         "signals": signal_count,
         "points_per_signal": point_count,
         "total_points": signal_count * point_count,
@@ -97,7 +119,7 @@ def run_case(app, signal_count, point_count, mode, repeats):
     # Rebuild for timing, so setup from the previous measurement does not
     # contaminate cursor/range timings.
     window.plot_selected_signals()
-    app.processEvents()
+    settle(app)
     window.set_cursor_mode("single")
     app.processEvents()
     initial_plot = window.plot_widgets[0]
@@ -134,6 +156,16 @@ def run_case(app, signal_count, point_count, mode, repeats):
         window._update_measurement_display,
         repeats,
     ))
+    supports_deferred_stats = (
+        "include_interval_stats"
+        in inspect.signature(window._update_measurement_display).parameters
+    )
+    if supports_deferred_stats:
+        result["scenarios"].append(measure(
+            "dual_cursor_drag_path_no_event_flush",
+            lambda: window._update_measurement_display(include_interval_stats=False),
+            repeats,
+        ))
     window.set_cursor_mode("single")
     window._current_cursor_time = 503.125
     window._mouse_in_plot = True
@@ -165,6 +197,21 @@ def run_case(app, signal_count, point_count, mode, repeats):
         "x_zoom_range_and_events",
         lambda: change_range(flush_events=True),
         repeats,
+    ))
+
+    # Deterministic variants: drain debounced statistics and auto-scale before
+    # each sample, then measure only the range change (and optional events).
+    result["scenarios"].append(measure(
+        "x_zoom_settled_no_event_flush",
+        lambda: change_range(flush_events=False),
+        repeats,
+        before=lambda: settle(app),
+    ))
+    result["scenarios"].append(measure(
+        "x_zoom_settled_and_events",
+        lambda: change_range(flush_events=True),
+        repeats,
+        before=lambda: settle(app),
     ))
 
     def switch_current_signal():
@@ -232,6 +279,8 @@ def main():
     parser.add_argument("--points", nargs="+", type=int, default=[100_000])
     parser.add_argument("--modes", nargs="+", choices=["independent", "overlay"],
                         default=["independent", "overlay"])
+    parser.add_argument("--kinds", nargs="+", choices=["numeric", "text"],
+                        default=["numeric"])
     parser.add_argument("--repeats", type=int, default=5)
     args = parser.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
@@ -241,16 +290,20 @@ def main():
     for points in args.points:
         for count in args.signals:
             for mode in args.modes:
-                try:
-                    print(json.dumps(
-                        run_case(app, count, points, mode, args.repeats),
-                        ensure_ascii=False,
-                    ), flush=True)
-                except Exception as exc:
-                    print(json.dumps({
-                        "mode": mode, "signals": count,
-                        "points_per_signal": points, "error": repr(exc),
-                    }, ensure_ascii=False), flush=True)
+                for kind in args.kinds:
+                    try:
+                        print(json.dumps(
+                            run_case(
+                                app, count, points, mode, args.repeats, kind
+                            ),
+                            ensure_ascii=False,
+                        ), flush=True)
+                    except Exception as exc:
+                        print(json.dumps({
+                            "mode": mode, "signal_kind": kind,
+                            "signals": count,
+                            "points_per_signal": points, "error": repr(exc),
+                        }, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

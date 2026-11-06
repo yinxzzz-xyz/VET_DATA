@@ -5463,6 +5463,23 @@ class MDFPlotter(QWidget):
             axis.setStyle(tickFont=tick_font)
         axis.setWidth(None)
 
+    @staticmethod
+    def _sample_extent(samples):
+        """Return (min, max) ignoring NaN, without allocating a boolean mask copy.
+
+        ``None`` means the slice is empty, contains no finite values, or is not
+        a numeric array.  Inf is intentionally kept: the previous mask-based
+        implementation only removed NaN from the extents.
+        """
+        values = np.asarray(samples)
+        if values.size == 0 or values.dtype.kind not in "biuf":
+            return None
+        low = np.fmin.reduce(values)
+        high = np.fmax.reduce(values)
+        if np.isnan(low) or np.isnan(high):
+            return None
+        return float(low), float(high)
+
     def _close_overlay_y_axis_managers(self, *, preserve_state=True):
         """Close managers before their PlotWidgets/scenes are destroyed."""
         found_manager = False
@@ -5628,14 +5645,11 @@ class MDFPlotter(QWidget):
                             for j, label in enumerate(item_signal.text_mapping)
                         ]])
 
-                    samples = np.asarray(item_signal.samples)
-                    valid_mask = ~np.isnan(samples)
-                    if valid_mask.any():
-                        signal_y_min = float(np.min(samples[valid_mask]))
-                        signal_y_max = float(np.max(samples[valid_mask]))
-                    else:
+                    extent = self._sample_extent(item_signal.samples)
+                    if extent is None:
                         signal_y_min, signal_y_max = 0.0, 1.0
-                    if valid_mask.any():
+                    else:
+                        signal_y_min, signal_y_max = extent
                         y_min_data = min(y_min_data, signal_y_min)
                         y_max_data = max(y_max_data, signal_y_max)
 
@@ -5677,20 +5691,51 @@ class MDFPlotter(QWidget):
                         else vb
                     )
                     if overlay_manager is None:
-                        curve = plot_widget.plot(
-                            item_signal.timestamps,
-                            item_signal.samples,
-                            pen=pg.mkPen(color, width=1.4),
-                            name=full_name,
-                        )
+                        if is_text_signal:
+                            curve = plot_widget.plot(
+                                item_signal.timestamps,
+                                item_signal.samples,
+                                pen=pg.mkPen(color, width=1.4),
+                                name=full_name,
+                            )
+                        else:
+                            # Register the curve before supplying data and pass
+                            # the downsampling options in the single setData
+                            # call.  This avoids two extra display-dataset
+                            # rebuilds caused by changing options afterwards.
+                            curve = pg.PlotDataItem(
+                                pen=pg.mkPen(color, width=1.4),
+                                name=full_name,
+                            )
+                            plot_widget.addItem(curve)
+                            curve.setData(
+                                item_signal.timestamps,
+                                item_signal.samples,
+                                autoDownsample=True,
+                                downsampleMethod="peak",
+                                clipToView=True,
+                            )
                     else:
                         curve = pg.PlotDataItem(
                             item_signal.timestamps,
                             item_signal.samples,
                             pen=pg.mkPen(color, width=1.4),
                             name=full_name,
+                            **(
+                                {}
+                                if is_text_signal
+                                else {
+                                    "autoDownsample": True,
+                                    "downsampleMethod": "peak",
+                                }
+                            ),
                         )
                         signal_view_box.addItem(curve)
+                        if not is_text_signal:
+                            # clipToView needs a ViewBox parent; applying it
+                            # after insertion avoids pyqtgraph rebuilding the
+                            # display dataset without a view during teardown.
+                            curve.setClipToView(True)
                     curve_visible = (
                         self.is_signal_curve_visible(item_key)
                         if hasattr(self, "is_signal_curve_visible") else True
@@ -5705,10 +5750,6 @@ class MDFPlotter(QWidget):
                             full_name, Qt.TextElideMode.ElideRight, 140
                         ))
                         legend_label.setToolTip(full_name)
-                    if not is_text_signal:
-                        curve.setDownsampling(auto=True, method="peak")
-                        curve.setClipToView(True)
-                        plot_widget.sigXRangeChanged.connect(self.on_x_range_changed)
 
                     spot = pg.ScatterPlotItem(
                         size=8, pen=pg.mkPen(None), brush=pg.mkBrush(color)
@@ -5725,6 +5766,13 @@ class MDFPlotter(QWidget):
                         "spot_item": spot,
                         "is_text_signal": is_text_signal,
                     })
+
+                if any(
+                    not record["is_text_signal"] for record in records
+                ):
+                    plot_widget.sigXRangeChanged.connect(
+                        self.on_x_range_changed
+                    )
 
                 if not np.isfinite(y_min_data) or not np.isfinite(y_max_data):
                     y_min_data, y_max_data = 0.0, 1.0
@@ -5842,19 +5890,7 @@ class MDFPlotter(QWidget):
 
                 # 保存对 plot_widget 的引用，用于回调
                 plot_widget._stats_update_needed = True
-
-                # 初始更新统计信息（延迟一点确保视图已渲染）
-                QTimer.singleShot(50, lambda: self._update_stats(plot_widget))
-
-                # 连接视图变化信号，使用 weak 引用避免内存泄漏
-                def make_stats_callback(widget):
-                    def callback():
-                        if widget and widget.stats_text_item is not None:
-                            self._update_stats(widget)
-
-                    return callback
-
-                vb.sigRangeChanged.connect(make_stats_callback(plot_widget))
+                plot_widget._stats_dirty = True
 
                 plot_widget.setMinimumHeight(150)
                 if (
@@ -5878,6 +5914,15 @@ class MDFPlotter(QWidget):
                 plot_widget.initial_view_range = tuple(
                     tuple(axis_range) for axis_range in vb.viewRange()
                 )
+                # Connect statistics only after the initial X range/link setup:
+                # those setup calls would otherwise trigger an immediate full
+                # data scan for every curve.  Subsequent range changes are
+                # coalesced by a token-based single-shot refresh.
+                vb.sigRangeChanged.connect(
+                    lambda _view, _ranges, changed, widget=plot_widget:
+                    self._on_plot_range_changed(widget, changed)
+                )
+                self._schedule_stats_update(plot_widget)
 
             except Exception as e:
                 print(f"警告: 无法绘制信号 '{signal_info.get('display_name')}'。错误: {e}")
@@ -6027,6 +6072,76 @@ class MDFPlotter(QWidget):
         except Exception as e:
             print(f"更新统计信息失败: {e}")
 
+    def _stats_plot_is_visible(self, plot_widget):
+        """Return whether statistics for this plot need refreshing.
+
+        The plot panel overrides this with a viewport-intersection check so
+        off-screen rows do not pay for range statistics.  The base plotter has
+        no scrollable plot area and keeps the previous behaviour.
+        """
+        return True
+
+    def _on_plot_range_changed(self, plot_widget, changed):
+        if changed is not None and not changed[0]:
+            # Vertical auto-scale does not change the data statistics; it only
+            # needs to move the existing text back to the top-right corner.
+            self._reposition_stats_text(plot_widget)
+            return
+        try:
+            plot_widget._stats_dirty = True
+        except RuntimeError:
+            return
+        self._schedule_stats_update(plot_widget)
+    def _schedule_stats_update(self, plot_widget):
+        if plot_widget is None:
+            return
+        try:
+            if getattr(plot_widget, "stats_text_item", None) is None:
+                return
+            token = getattr(plot_widget, "_stats_refresh_token", 0) + 1
+            plot_widget._stats_refresh_token = token
+            QTimer.singleShot(
+                80,
+                lambda widget=plot_widget, expected=token:
+                self._run_stats_refresh(widget, expected),
+            )
+        except RuntimeError:
+            return
+
+    def _run_stats_refresh(self, plot_widget, token):
+        try:
+            if (
+                plot_widget is None
+                or getattr(plot_widget, "_stats_refresh_token", None) != token
+                or not plot_widget.isVisible()
+                or not getattr(plot_widget, "_stats_dirty", False)
+            ):
+                return
+        except RuntimeError:
+            return
+        if self._stats_plot_is_visible(plot_widget):
+            self._update_stats(plot_widget)
+            try:
+                plot_widget._stats_dirty = False
+            except RuntimeError:
+                return
+
+    @staticmethod
+    def _reposition_stats_text(plot_widget):
+        try:
+            stats_item = getattr(plot_widget, "stats_text_item", None)
+            if stats_item is None:
+                return
+            view_box = plot_widget.getViewBox()
+            if view_box is None:
+                return
+            current = view_box.viewRange()
+            x_max = current[0][1]
+            y_min, y_max = current[1]
+            stats_item.setPos(x_max, y_max - (y_max - y_min) * 0.02)
+        except RuntimeError:
+            return
+
     def on_x_range_changed(self):
         if self.rescale_timer is None:
             self.rescale_timer = QTimer()
@@ -6049,20 +6164,18 @@ class MDFPlotter(QWidget):
                         continue
                     start = int(np.searchsorted(signal.timestamps, view_range[0]))
                     stop = int(np.searchsorted(signal.timestamps, view_range[1]))
-                    values = np.asarray(signal.samples[start:stop])
-                    if not len(values):
+                    extent = self._sample_extent(signal.samples[start:stop])
+                    if extent is None:
                         continue
-                    valid = values[~np.isnan(values)]
-                    if not len(valid):
-                        continue
-                    ymin, ymax = np.min(valid), np.max(valid)
+                    ymin, ymax = extent
                     yrange = ymax - ymin
                     padding = yrange * 0.1 if yrange > 0 else 1.0
                     y_axis_manager.set_y_range(
                         record["signal_key"], (ymin - padding, ymax + padding)
                     )
                 continue
-            visible_values = []
+            ymin = float("inf")
+            ymax = float("-inf")
             for record in getattr(pw, "signal_records", ()):
                 if not record.get("curve_visible", True):
                     continue
@@ -6071,14 +6184,12 @@ class MDFPlotter(QWidget):
                     continue
                 start = int(np.searchsorted(signal.timestamps, view_range[0]))
                 stop = int(np.searchsorted(signal.timestamps, view_range[1]))
-                values = np.asarray(signal.samples[start:stop])
-                if len(values):
-                    valid = values[~np.isnan(values)]
-                    if len(valid):
-                        visible_values.append(valid)
-            if visible_values:
-                values = np.concatenate(visible_values)
-                ymin, ymax = np.min(values), np.max(values)
+                extent = self._sample_extent(signal.samples[start:stop])
+                if extent is None:
+                    continue
+                ymin = min(ymin, extent[0])
+                ymax = max(ymax, extent[1])
+            if ymin <= ymax:
                 yrange = ymax - ymin
                 padding = yrange * 0.1 if yrange > 0 else 1.0
                 pw.setYRange(ymin - padding, ymax + padding, padding=0)

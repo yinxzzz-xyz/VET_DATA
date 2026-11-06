@@ -114,7 +114,7 @@ class MultiYAxisManager:
         elif axis_visible is not None:
             state = SignalYAxisState(state.y_range, state.axis_visible)
 
-        view_box = pg.ViewBox()
+        view_box = pg.ViewBox(enableMenu=False)
         # Keep the reference ViewBox on top for the existing cursor/drag
         # interactions; the transparent managed views only supply mapping.
         view_box.setZValue(-1)
@@ -302,7 +302,8 @@ class MultiYAxisManager:
         y_range = self._validate_range(y_range)
         state = self._states[signal_key]
         self._states[signal_key] = SignalYAxisState(y_range, state.axis_visible)
-        self._layout_axes()
+        # A Y range change cannot alter which axes are displayed or how many
+        # columns the layout needs, so no layout pass is necessary here.
 
     def _sync_one_geometry(self, view_box):
         view_box.setGeometry(self._reference_view_box.sceneBoundingRect())
@@ -338,7 +339,9 @@ class MultiYAxisManager:
         view_box.setYRange(*y_range, padding=0)
         state = self._states[signal_key]
         self._states[signal_key] = SignalYAxisState(y_range, state.axis_visible)
-        self._layout_axes()
+        # The axis strip layout depends on which axes are visible, not on their
+        # numeric ranges. Avoid rebuilding the grid for every signal during
+        # auto-scale; the axis repaints itself from the linked ViewBox.
 
     def set_axis_visible(self, signal_key, visible):
         state = self._states[signal_key]
@@ -368,11 +371,9 @@ class MultiYAxisManager:
         if signal_key not in self._view_boxes:
             raise KeyError(signal_key)
         self._current_signal_key = signal_key
+        # set_axis_visible keeps the current signal inside the scroll window
+        # and performs the single required layout pass.
         self.set_axis_visible(signal_key, True)
-        self._ensure_signal_in_scroll_window(
-            signal_key, list(self.visible_axis_keys), self.axis_capacity
-        )
-        self._layout_axes()
 
     def snapshot_state(self):
         """Return Y ranges and axis visibility keyed by stable signal ID."""

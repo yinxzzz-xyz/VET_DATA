@@ -3,7 +3,9 @@
 import math
 
 import numpy as np
-from PyQt6.QtCore import QEvent, QPointF, QSignalBlocker, QSize, QTimer, Qt
+from PyQt6.QtCore import (
+    QEvent, QPoint, QPointF, QRect, QSignalBlocker, QSize, QTimer, Qt,
+)
 from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QWidget
 
 from .legacy import baseline
@@ -21,7 +23,24 @@ class PlotPanelMixin:
         self.cursor_enabled = False
         self._shared_axis_syncing = False
         self._aligning_shared_axis_geometry = False
+        self._stats_visible_only = True
         self.plot_scroll_area.viewport().installEventFilter(self)
+        self._visible_stats_timer = QTimer(self)
+        self._visible_stats_timer.setSingleShot(True)
+        self._visible_stats_timer.setInterval(50)
+        self._visible_stats_timer.timeout.connect(
+            self._refresh_visible_plot_stats
+        )
+        self.plot_scroll_area.verticalScrollBar().valueChanged.connect(
+            self._plot_scroll_changed
+        )
+        self._interval_stats_timer = QTimer(self)
+        self._interval_stats_timer.setSingleShot(True)
+        self._interval_stats_timer.setInterval(200)
+        self._interval_stats_timer.timeout.connect(
+            self._refresh_deferred_interval_statistics
+        )
+        self._interval_stats_pending = False
         panel = next((g for g in self.findChildren(QWidget) if getattr(g, "title", lambda: "")() == "信号曲线"), None)
         if panel is None: return
         controls = QWidget(self.curve_ribbon_page)
@@ -83,6 +102,7 @@ class PlotPanelMixin:
         self.plot_empty_label.setVisible(bool(message))
 
     def plot_selected_signals(self):
+        self._cancel_interval_statistics_refresh()
         snapshot = getattr(self, "can_detection_snapshot", None)
         if snapshot is not None:
             try:
@@ -319,6 +339,7 @@ class PlotPanelMixin:
     def set_cursor_mode(self, mode):
         if mode not in {None, "single", "dual"}:
             raise ValueError(f"unknown cursor mode: {mode}")
+        self._cancel_interval_statistics_refresh()
         self._clear_cursor_drag_state()
         self.cursor_mode = mode
         self.cursor_enabled = mode is not None
@@ -418,6 +439,7 @@ class PlotPanelMixin:
         self._dragging_cursor = None
 
     def _clear_cursor_positions_for_data_change(self):
+        self._cancel_interval_statistics_refresh()
         self._clear_cursor_drag_state()
         self._single_cursor_time = None
         self._cursor_a_time = None
@@ -455,6 +477,7 @@ class PlotPanelMixin:
         if watched is self.plot_scroll_area.viewport():
             if event.type() == QEvent.Type.Resize:
                 QTimer.singleShot(0, self._align_shared_time_axis_geometry)
+                self._visible_stats_timer.start()
             return False
         plot = next((
             candidate for candidate in tuple(getattr(self, "plot_widgets", ()))
@@ -479,6 +502,7 @@ class PlotPanelMixin:
                 return True
             if event_type == QEvent.Type.MouseButtonRelease:
                 if event.button() == Qt.MouseButton.LeftButton:
+                    self._flush_interval_statistics()
                     self._clear_cursor_drag_state()
                     return True
                 return False
@@ -506,7 +530,9 @@ class PlotPanelMixin:
             self._cursor_a_time = cursor_time
         else:
             self._cursor_b_time = cursor_time
-        self._update_measurement_display()
+        self._update_measurement_display(include_interval_stats=False)
+        self._interval_stats_pending = True
+        self._interval_stats_timer.start()
         master_y = sum(self.master_viewbox.viewRange()[1]) * 0.5
         self.update_map_marker(
             self.master_viewbox.mapViewToScene(QPointF(cursor_time, master_y))
@@ -648,7 +674,25 @@ class PlotPanelMixin:
                 scene_pos = plot.mapToScene(QPointF(anchor.x(), target_y).toPoint())
                 b_label.setPos(view_box.mapSceneToView(scene_pos))
 
-    def _update_measurement_display(self):
+    def _cancel_interval_statistics_refresh(self):
+        timer = getattr(self, "_interval_stats_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._interval_stats_pending = False
+
+    def _flush_interval_statistics(self):
+        if not getattr(self, "_interval_stats_pending", False):
+            return
+        self._cancel_interval_statistics_refresh()
+        if self.cursor_mode == "dual":
+            self._update_measurement_display()
+
+    def _refresh_deferred_interval_statistics(self):
+        self._cancel_interval_statistics_refresh()
+        if self.cursor_mode == "dual":
+            self._update_measurement_display()
+
+    def _update_measurement_display(self, *, include_interval_stats=True):
         blocker = QSignalBlocker(self.selected_signal_list_widget)
         dual_enabled = self.cursor_mode == "dual"
         a_time = getattr(self, "_cursor_a_time", None) if dual_enabled else None
@@ -695,14 +739,14 @@ class PlotPanelMixin:
                         view_box=record.get("view_box"),
                     )
                 self._separate_cursor_labels(plot, name)
+        records_by_key = {}
+        for plot in tuple(getattr(self, "plot_widgets", ())):
+            for record in getattr(plot, "signal_records", ()):
+                records_by_key.setdefault(record.get("signal_key"), record)
         for row in range(self.selected_signal_list_widget.count()):
             item = self.selected_signal_list_widget.item(row)
             key = item.data(KEY_ROLE)
-            record = next((
-                record for plot in self.plot_widgets
-                for record in getattr(plot, "signal_records", ())
-                if record.get("signal_key") == key
-            ), None)
+            record = records_by_key.get(key)
             if record is None or a_time is None or b_time is None:
                 item.setData(MEASUREMENT_ROLE, None)
                 item.setData(INTERVAL_ROLE, None)
@@ -714,9 +758,13 @@ class PlotPanelMixin:
             else:
                 display = f"A {a_value if a_value is not None else '—'}  B {b_value if b_value is not None else '—'}"
             item.setData(MEASUREMENT_ROLE, display)
-            interval = self._interval_statistics(record, a_time, b_time)
-            item.setData(INTERVAL_ROLE, interval)
-            item.setSizeHint(QSize(0, 54))
+            if include_interval_stats:
+                item.setData(
+                    INTERVAL_ROLE,
+                    self._interval_statistics(record, a_time, b_time),
+                )
+            if item.sizeHint() != QSize(0, 54):
+                item.setSizeHint(QSize(0, 54))
         del blocker
 
     @staticmethod
@@ -751,6 +799,40 @@ class PlotPanelMixin:
             f"区间 min {np.min(values):.3f}  max {np.max(values):.3f}  "
             f"平均 {np.mean(values):.3f}  RMS {rms:.3f}"
         )
+
+    def _stats_plot_is_visible(self, plot):
+        """Return True when this plot occupies part of the scroll viewport."""
+        if not getattr(self, "_stats_visible_only", True):
+            return True
+        try:
+            if plot is None or not plot.isVisible():
+                return False
+            scroll_area = getattr(self, "plot_scroll_area", None)
+            if scroll_area is None:
+                return True
+            if not plot.isVisibleTo(scroll_area):
+                return False
+            viewport = scroll_area.viewport()
+            top_left = plot.mapToGlobal(QPoint(0, 0))
+            viewport_origin = viewport.mapToGlobal(QPoint(0, 0))
+            local_rect = QRect(top_left - viewport_origin, plot.size())
+            return QRect(QPoint(0, 0), viewport.size()).intersects(local_rect)
+        except RuntimeError:
+            return False
+
+    def _plot_scroll_changed(self, _value):
+        self._visible_stats_timer.start()
+
+    def _refresh_visible_plot_stats(self):
+        for plot in tuple(getattr(self, "plot_widgets", ())):
+            try:
+                if (
+                    getattr(plot, "_stats_dirty", False)
+                    and self._stats_plot_is_visible(plot)
+                ):
+                    self._schedule_stats_update(plot)
+            except RuntimeError:
+                continue
 
     def _register_plot_stats_responsiveness(self, plot):
         """Keep statistics readable using the individual plot's usable width."""

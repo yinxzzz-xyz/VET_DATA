@@ -859,6 +859,112 @@ class PlotDisplayDownsamplingTests(unittest.TestCase):
             self.window.plot_scroll_area.viewport().height() - 30,
         )
 
+    def test_stats_refresh_is_coalesced_and_skips_y_only_changes(self):
+        timestamps = np.linspace(0.0, 10.0, 1000)
+        plot = self._populate(timestamps, np.sin(timestamps))
+        QTest.qWait(200)
+        APP.processEvents()
+        calls = []
+        original = self.window._update_stats
+        self.window._update_stats = lambda widget: (
+            calls.append(widget), original(widget)
+        )
+        try:
+            plot.setXRange(1.0, 2.0, padding=0)
+            plot.setXRange(2.0, 3.0, padding=0)
+            plot.setXRange(3.0, 4.0, padding=0)
+            self.assertEqual(calls, [])
+
+            QTest.qWait(180)
+            APP.processEvents()
+            self.assertEqual(len(calls), 1)
+
+            calls.clear()
+            plot.setYRange(-2.0, 2.0, padding=0)
+            QTest.qWait(180)
+            APP.processEvents()
+            self.assertEqual(calls, [])
+        finally:
+            self.window._update_stats = original
+
+    def test_overlay_plot_connects_autoscale_once_per_plot(self):
+        timestamps = np.linspace(0.0, 10.0, 101)
+        self.window.signals = {
+            "speed": {
+                "name": "speed", "display_name": "Speed",
+                "comment": "", "bus_id": None,
+            },
+            "rpm": {
+                "name": "rpm", "display_name": "RPM",
+                "comment": "", "bus_id": None,
+            },
+        }
+        self.window.can_parsed_data = {
+            "speed": {"timestamps": timestamps, "samples": timestamps, "unit": "km/h"},
+            "rpm": {"timestamps": timestamps, "samples": timestamps * 100, "unit": "rpm"},
+        }
+        self.window.refresh_signal_list_ui()
+        for row in range(self.window.signal_list_widget.count()):
+            self.window.signal_list_widget.item(row).setCheckState(
+                Qt.CheckState.Checked
+            )
+        self.window.plot_mode_combo.setCurrentIndex(
+            self.window.plot_mode_combo.findData("overlay")
+        )
+        calls = []
+        original = self.window.on_x_range_changed
+        self.window.on_x_range_changed = lambda: (
+            calls.append(1), original()
+        )
+        try:
+            self.window.plot_selected_signals()
+            calls.clear()
+            self.window.master_viewbox.setXRange(2.0, 8.0, padding=0)
+            self.assertEqual(len(calls), 1)
+        finally:
+            self.window.on_x_range_changed = original
+
+    def test_dual_cursor_defers_interval_statistics_until_release(self):
+        timestamps = np.arange(0.0, 21.0)
+        plot = self._populate(timestamps, timestamps * 2.0)
+        self.window.dual_cursor_button.click()
+        self.window._cursor_a_time = 3.0
+        self.window._cursor_b_time = 7.0
+        self.window._update_measurement_display()
+        item = next(
+            self.window.selected_signal_list_widget.item(row)
+            for row in range(self.window.selected_signal_list_widget.count())
+            if self.window.selected_signal_list_widget.item(row).data(KEY_ROLE)
+            == "CAN_SIGNAL"
+        )
+        old_measurement = item.data(MEASUREMENT_ROLE)
+        old_interval = item.data(INTERVAL_ROLE)
+        self.assertIsNotNone(old_interval)
+        view_box = plot.getViewBox()
+        center_y = sum(view_box.viewRange()[1]) * 0.5
+        scene_position = view_box.mapViewToScene(QPointF(10.0, center_y))
+
+        self.window._move_active_cursor(plot, "A", scene_position)
+
+        self.assertTrue(self.window._interval_stats_pending)
+        self.assertNotEqual(item.data(MEASUREMENT_ROLE), old_measurement)
+        self.assertEqual(item.data(INTERVAL_ROLE), old_interval)
+
+        self.window._flush_interval_statistics()
+
+        self.assertFalse(self.window._interval_stats_pending)
+        self.assertNotEqual(item.data(INTERVAL_ROLE), old_interval)
+
+    def test_stats_visibility_helper_ignores_hidden_plots_and_supports_opt_out(self):
+        timestamps = np.linspace(0.0, 10.0, 101)
+        plot = self._populate(timestamps, np.sin(timestamps))
+
+        self.assertTrue(self.window._stats_plot_is_visible(plot))
+        plot.hide()
+        self.assertFalse(self.window._stats_plot_is_visible(plot))
+        self.window._stats_visible_only = False
+        self.assertTrue(self.window._stats_plot_is_visible(plot))
+
     def test_interval_statistics_ignore_nan_and_handle_empty_and_text_data(self):
         class Signal:
             timestamps = np.arange(5.0)

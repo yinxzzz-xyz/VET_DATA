@@ -295,6 +295,44 @@ class MultiYAxisManagerTests(unittest.TestCase):
             plot.close()
             plot.deleteLater()
             APP.processEvents()
+    def test_managed_view_boxes_skip_context_menu_construction(self):
+        view_box = self.manager.register_signal("signal-a", (-1.0, 1.0))
+
+        self.assertIsNone(view_box.menu)
+        self.assertIsNotNone(self.reference.menu)
+
+    def test_set_y_range_does_not_rebuild_axis_layout(self):
+        plot = pg.PlotWidget()
+        plot.resize(700, 420)
+        plot.show()
+        APP.processEvents()
+        manager = MultiYAxisManager(
+            plot.getViewBox(), plot.scene(),
+            plot_item=plot.getPlotItem(), plot_widget=plot,
+        )
+        try:
+            view_box = manager.register_signal("signal-a", (-1.0, 1.0))
+            view_box.addItem(pg.PlotDataItem([0.0, 1.0], [0.0, 1.0]))
+            manager.set_current_signal("signal-a")
+            manager.install_axis_layout()
+            APP.processEvents()
+            layout_calls = []
+            original_layout = manager._layout_axes
+            manager._layout_axes = lambda: (
+                layout_calls.append(1), original_layout()
+            )
+
+            manager.set_y_range("signal-a", (-5.0, 15.0))
+
+            self.assertEqual(layout_calls, [])
+            self.assertEqual(manager.y_range("signal-a"), (-5.0, 15.0))
+            self.assertIs(manager.axis_item("signal-a").linkedView(), view_box)
+        finally:
+            manager.close(preserve_state=False)
+            plot.close()
+            plot.deleteLater()
+            APP.processEvents()
+
     def test_remove_can_discard_state_and_duplicate_registration_is_rejected(self):
         self.manager.register_signal("temporary", (-1.0, 1.0))
         with self.assertRaises(ValueError):
